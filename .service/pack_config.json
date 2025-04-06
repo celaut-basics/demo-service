@@ -9,6 +9,6 @@
   },
   "dependencies_env": true,
   "include": [
-    "start.py"
+    "app.py"
   ]
 }
