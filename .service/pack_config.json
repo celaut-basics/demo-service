@@ -1,0 +1,14 @@
+{
+  "workdir": "service",
+  "service_dependencies_directory": "__services__",
+  "metadata_dependencies_directory": "__metadata__",
+  "blocks_directory": "__block__",
+  "zip": false,
+  "dependencies": {
+    "TINY": "tiny"
+  },
+  "dependencies_env": true,
+  "include": [
+    "start.py"
+  ]
+}
