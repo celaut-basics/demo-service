@@ -6,6 +6,8 @@ from google.protobuf.json_format import MessageToDict
 
 from node_controller.controller.controller import Controller
 
+DIR = "service"
+
 env_vars = {}
 with open(os.path.join(DIR, ".dependencies")) as f:
     for line in f:
