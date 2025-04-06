@@ -2,6 +2,6 @@
     "tag": "demo-service-manager",
     "api": [{"port":5000, "protocol":["http"]}],
     "architecture": "aarch64",
-    "entrypoint": "/service/start.py",
+    "entrypoint": "/service/app.py",
     "envs": []
 }
