@@ -16,6 +16,12 @@ with open(os.path.join(DIR, ".dependencies")) as f:
 
 TINY_SERVICE = env_vars.get("TINY", None)  # From .dependencies TINY
 
+logging.basicConfig(
+    filename='app.log',
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+
 # Create a new Flask app
 app = Flask(__name__)
 
