@@ -1,3 +1,7 @@
 {
-  "include": ["app"]
+  "workdir": "tiny-service",
+  "include": [
+    "src",
+    "Cargo.toml"
+  ]
 }
