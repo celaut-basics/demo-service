@@ -1,6 +1,6 @@
 #!/usr/bin/env python3.11
 
-import os, logging, requests
+import os, logging, requests, threading
 from flask import Flask, jsonify, request, render_template_string
 from google.protobuf.json_format import MessageToDict
 
@@ -22,24 +22,28 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 
-# Create a new Flask app
+# Create the Flask application
 app = Flask(__name__)
 
-# Read the service configuration file. The service configuration file is written by the node when it builds the container and contains information such as the initial resources or the node URL.
+# Load service configuration (e.g., initial resources, node URL, etc.)
 controller = Controller(debug=lambda s: logging.info('Node Controller: %s', s))
 node_url: str = controller.get_node_url()
 mem_limit: int = controller.get_mem_limit_at_start()
 
-# Set values
+# Global variables for resources and gas
 resources = {
     "mem_limit": mem_limit
 }
 gas_amount = 0
-tiny_service = controller.add_service(service_hash=TINY_SERVICE)  # Generates the instance obj on the library. It will start instances, stop and check if they are alive in background.
+
+# Global variables for service
+tiny_service = None
+service_ready = False  # Flag indicating if the service has been added
 services = []
+
 logging.info('Gateway main directory: %s', node_url)
 
-# HTML template for the page
+# HTML Templates
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
@@ -209,37 +213,97 @@ HTML_TEMPLATE = """
                 const result = await response.json();
                 console.log('Services used:', result);
 
-                loadServices();  // Reload the services to update their results.
+                loadServices();  // Reload services to update results
             } catch (error) {
                 console.error('Error using services:', error);
             }
         }
 
+        // Check every 3 seconds if the service is ready, and reload the page if it is
+        async function checkServiceReady() {
+            try {
+                const response = await fetch('/service_status');
+                const data = await response.json();
+                if (data.ready) {
+                    window.location.reload();
+                } else {
+                    setTimeout(checkServiceReady, 3000);
+                }
+            } catch (error) {
+                console.error('Error checking service status:', error);
+                setTimeout(checkServiceReady, 3000);
+            }
+        }
+
         updateDisplay();
         loadServices();
+        // Start service readiness check
+        checkServiceReady();
     </script>
 </body>
 </html>
 """
 
-# Define the home route to serve the HTML page
+SPLASH_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta http-equiv="refresh" content="3">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Loading Service</title>
+    <style>
+        body { font-family: Arial, sans-serif; background: #f4f4f4; display: flex; justify-content: center; align-items: center; height: 100vh; }
+        .splash { text-align: center; }
+    </style>
+</head>
+<body>
+    <div class="splash">
+        <h1>Loading service...</h1>
+        <p>Please wait while the service is being initialized.</p>
+    </div>
+</body>
+</html>
+"""
+
+# Function to initialize the tiny service in background
+def init_tiny_service():
+    global tiny_service, service_ready
+    try:
+        logging.info("Starting to add the tiny service...")
+        tiny_service = controller.add_service(service_hash=TINY_SERVICE)
+        service_ready = True
+        logging.info("Tiny service initialized successfully.")
+    except Exception as e:
+        logging.error("Error initializing the tiny service: %s", str(e))
+
+# Start background thread to avoid blocking the first web response
+service_thread = threading.Thread(target=init_tiny_service, daemon=True)
+service_thread.start()
+
+@app.route('/service_status', methods=['GET'])
+def service_status():
+    return jsonify({"ready": service_ready})
+
 @app.route('/')
 def home():
-    logging.info('Serving the home page.')
-    return render_template_string(HTML_TEMPLATE)
+    if not service_ready:
+        logging.info('Service not ready yet. Showing splash screen.')
+        return render_template_string(SPLASH_TEMPLATE)
+    else:
+        logging.info('Service is ready. Showing main page.')
+        return render_template_string(HTML_TEMPLATE)
 
-# Endpoint to modify memory limit
 @app.route('/modify_max_memory', methods=['POST'])
 def modify_mem_limit():
     try:
         max_mem_limit = request.json.get('max_mem_limit')
-        logging.info('Memory limit updating to %s', max_mem_limit)
+        logging.info('Updating memory limit to %s', max_mem_limit)
         if max_mem_limit is None:
-            logging.warning('Received request without max_mem_limit.')
+            logging.warning('Request missing "max_mem_limit".')
             return jsonify({"error": "Missing 'max_mem_limit' in request body"}), 400
         
         max_mem_limit = int(max_mem_limit * (1024 * 1024))
-
         _resources, _gas_amount = controller.modify_resources(
             resources={'max': max_mem_limit, 'min': 0}
         )
@@ -254,28 +318,25 @@ def modify_mem_limit():
         logging.info('Memory limit updated to %s', resources['mem_limit'])
         return jsonify({"status": "Memory limit updated"})
     except Exception as e:
-        logging.error('Error while modifying memory limit: %s', str(e))
+        logging.error('Error updating memory limit: %s', str(e))
         return jsonify({"error": str(e)}), 500
 
-# Endpoint to retrieve services data
 @app.route('/services', methods=['GET'])
 def get_services():
     return jsonify([{"ip_port": service[0], "result": service[1]} for service in services])
 
-# Endpoint to generate a new service
 @app.route('/generate_service', methods=['POST'])
 def generate_service():
     try:
         service_uri = tiny_service.get_instance().uri
-
         new_service = (service_uri, "--")
         services.append(new_service)
-        logging.info('Generated new service: %s', new_service)
+        logging.info('New service generated: %s', new_service)
         return jsonify({"status": "Service generated", "service": new_service})
     except Exception as e:
-        logging.error('Error while generating service: %s', str(e))
+        logging.error('Error generating service: %s', str(e))
         return jsonify({"error": str(e)}), 500
-    
+
 @app.route('/use_services', methods=['POST'])
 def use_services():
     try:
@@ -283,28 +344,23 @@ def use_services():
             ip_port = service[0]
             try:
                 response = requests.get(f"http://{ip_port}")
-                result = response.text  # Extract the text from the response.
+                result = response.text
             except requests.exceptions.RequestException as e:
                 logging.error('Error contacting service at %s: %s', ip_port, str(e))
                 result = 'Error'
-
-            # Update the result in the services list.
             services[idx] = (ip_port, result)
-            logging.info('Updated service result for %s: %s', ip_port, result)
-        
+            logging.info('Service updated at %s: %s', ip_port, result)
         return jsonify({"status": "Services used successfully", "services": services})
     except Exception as e:
-        logging.error('Error while using services: %s', str(e))
+        logging.error('Error using services: %s', str(e))
         return jsonify({"error": str(e)}), 500
 
-# Endpoint to view the current gas amount in scientific notation
 @app.route('/current_gas', methods=['GET'])
 def current_gas():
     gas_scientific = "{:.2e}".format(gas_amount)
     logging.info('Current gas amount: %s', gas_scientific)
     return jsonify({"gas_amount": gas_scientific})
 
-# Endpoint to view memory usage (in MB, avoiding long zero sequences)
 @app.route('/memory_usage', methods=['GET'])
 def memory_usage():
     memory_used_bytes = resources.get('mem_limit', 0)
@@ -313,7 +369,6 @@ def memory_usage():
     logging.info('Current memory usage: %s MB', memory_used_formatted)
     return jsonify({"memory_used": memory_used_formatted})
 
-# Run the app on the local server
 if __name__ == '__main__':
-    logging.info('Starting the Flask application.')
+    logging.info('Starting Flask application.')
     app.run(host='0.0.0.0', port=5000, debug=True)
