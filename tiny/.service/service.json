@@ -1,7 +1,7 @@
 {
     "tag": "random-name",
     "api": [{"port":3030, "protocol":["http","tls"]}],
-    "architecture": "linux/arm64",
+    "architecture": "linux/amd64",
     "entrypoint": "/app",
     "envs": []
 }
