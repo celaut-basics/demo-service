@@ -1,2 +1,2 @@
-FROM alpine:3.21.3
+FROM gcr.io/distroless/cc
 COPY service/app /app
