@@ -26,7 +26,7 @@ logging.basicConfig(
 app = Flask(__name__)
 
 # Read the service configuration file. The service configuration file is written by the node when it builds the container and contains information such as the initial resources or the node URL.
-controller = Controller(debug=lambda s: logging.info('Node Controller: %s', s))
+controller = Controller(debug=lambda s: logging.info('Node Controller: %s', s), app_dir="service")
 node_url: str = controller.get_node_url()
 mem_limit: int = controller.get_mem_limit_at_start()
 
