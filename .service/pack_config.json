@@ -5,7 +5,8 @@
   "blocks_directory": "__block__",
   "zip": false,
   "dependencies": {
-    "TINY": "tiny"
+    "TINY": "tiny",
+    "HEAVY": "heavy"
   },
   "dependencies_env": true,
   "include": [
