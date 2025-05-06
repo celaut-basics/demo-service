@@ -104,7 +104,8 @@ HTML_TEMPLATE = """
             <!-- Card 2: Services Table -->
             <div class="card">
                 <h2>Services</h2>
-                <button class="btn btn-success" onclick="generateService()">Generate New Service</button>
+                <button class="btn btn-success" onclick="generateService()">Generate New Tiny Service</button>
+                <button class="btn btn-danger" onclick="generateHeavyService()">Generate New Heavy Service</button>
                 <button class="btn btn-primary" onclick="useServices()">Use Services</button>
                 <table>
                     <thead>
@@ -212,6 +213,26 @@ HTML_TEMPLATE = """
                 console.error('Error generating service:', error);
             }
         }
+
+        async function generateHeavyService() {
+            try {
+                const response = await fetch('/generate_heavy_service', {
+                    method: 'POST'
+                });
+
+                if (!response.ok) {
+                    const errorText = await response.text();
+                    throw new Error('Server error: ' + errorText);
+                }
+
+                const result = await response.json();
+                console.log('New service generated:', result);
+
+                loadServices();
+            } catch (error) {
+                console.error('Error generating service:', error);
+            }
+        }
         
         async function useServices() {
             try {
@@ -285,6 +306,20 @@ def get_services():
 def generate_service():
     try:
         service_uri = tiny_service.get_instance().uri
+
+        new_service = (service_uri, "--")
+        services.append(new_service)
+        logging.info('Generated new service: %s', new_service)
+        return jsonify({"status": "Service generated", "service": new_service})
+    except Exception as e:
+        logging.error('Error while generating service: %s', str(e))
+        return jsonify({"error": str(e)}), 500
+    
+# Endpoint to generate a new service
+@app.route('/generate_heavy_service', methods=['POST'])
+def generate_heavy_service():
+    try:
+        service_uri = heavy_service.get_instance().uri
 
         new_service = (service_uri, "--")
         services.append(new_service)
