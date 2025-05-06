@@ -1,8 +1,8 @@
 FROM rust:latest AS builder
-COPY service /tiny-service
-WORKDIR tiny-service
+COPY service /heavy-service
+WORKDIR heavy-service
 RUN cargo build --release
 
 FROM gcr.io/distroless/cc
-COPY --from=builder /tiny-service/target/release/tiny-service /tiny-service
+COPY --from=builder /heavy-service/target/release/heavy-service /heavy-service
 
