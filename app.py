@@ -305,7 +305,7 @@ def get_services():
 @app.route('/generate_service', methods=['POST'])
 def generate_service():
     try:
-        service_uri = tiny_service.get_instance().uri
+        service_uri = tiny_service.get_instance(max_attempts=1).uri
 
         new_service = (service_uri, "--")
         services.append(new_service)
@@ -319,7 +319,7 @@ def generate_service():
 @app.route('/generate_heavy_service', methods=['POST'])
 def generate_heavy_service():
     try:
-        service_uri = heavy_service.get_instance().uri
+        service_uri = heavy_service.get_instance(max_attempts=1).uri
 
         new_service = (service_uri, "--")
         services.append(new_service)
