@@ -46,11 +46,11 @@ heavy_service = controller.add_service(  # Tiny service, but configured to rent 
                 resources=gateway_pb2.CombinationResources(clause={
                     1: gateway_pb2.CombinationResources.Clause(
                         min_sysreq=celaut_pb2.Sysresources(
-                            mem_limit=pow(10, 8)  # 667.57 MB
+                            mem_limit=pow(10, 8)  # 100 MB
                         )
                     )
                 }),
-                initial_gas_amount=to_gas_amount(pow(10, 20))
+                initial_gas_amount=to_gas_amount(pow(10, 8))
             )
 )  
 
