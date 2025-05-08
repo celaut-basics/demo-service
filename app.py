@@ -18,6 +18,7 @@ with open(os.path.join(DIR, ".dependencies")) as f:
 
 TINY_SERVICE = env_vars.get("TINY", None)  # From .dependencies TINY
 HEAVY_SERVICE = env_vars.get("HEAVY", None)
+PING_SERVICE = env_vars.get("PING", None)
 
 logging.basicConfig(
     filename='app.log',
@@ -38,8 +39,10 @@ resources = {
     "mem_limit": mem_limit
 }
 gas_amount = 0
+
 tiny_service = controller.add_service(service_hash=TINY_SERVICE)  # Generates the instance obj on the library. It will start instances, stop and check if they are alive in background.
-heavy_service = controller.add_service(  # Tiny service, but configured to rent more resources.
+
+heavy_service = controller.add_service(
     service_hash=HEAVY_SERVICE,
     config=gateway_pb2.Configuration(
                 config=celaut_pb2.Configuration(),
@@ -52,7 +55,9 @@ heavy_service = controller.add_service(  # Tiny service, but configured to rent 
                 }),
                 initial_gas_amount=to_gas_amount(pow(10, 8))
             )
-)  
+)
+
+ping_service = controller.add_service(service_hash=PING_SERVICE)
 
 services = []
 logging.info('Gateway main directory: %s', node_url)
@@ -96,15 +101,16 @@ HTML_TEMPLATE = """
                 <div id="gasDisplay">Gas Amount: Loading...</div>
                 <div id="memoryDisplay">Memory Used: Loading...</div>
                 <div id="adjustmentDisplay">Memory Adjustment: 0 MB</div>
-                <button class="btn btn-primary" onclick="adjustMemory(10)">Increase Memory Limit</button>
+                <button class="btn btn-secondary" onclick="adjustMemory(10)">Increase Memory Limit</button>
                 <button class="btn btn-secondary" onclick="adjustMemory(-10)">Decrease Memory Limit</button>
-                <button class="btn btn-danger" onclick="sendAdjustment()">Send</button>
+                <button class="btn btn-primary" onclick="sendAdjustment()">Send</button>
             </div>
 
             <!-- Card 2: Services Table -->
             <div class="card">
                 <h2>Services</h2>
                 <button class="btn btn-success" onclick="generateService()">Generate New Tiny Service</button>
+                <button class="btn btn-warning" onclick="generatePingService()">Generate New Ping Service</button>
                 <button class="btn btn-danger" onclick="generateHeavyService()">Generate New Heavy Service</button>
                 <button class="btn btn-primary" onclick="useServices()">Use Services</button>
                 <table>
@@ -233,6 +239,26 @@ HTML_TEMPLATE = """
                 console.error('Error generating service:', error);
             }
         }
+
+        async function generatePingService() {
+            try {
+                const response = await fetch('/generate_ping_service', {
+                    method: 'POST'
+                });
+
+                if (!response.ok) {
+                    const errorText = await response.text();
+                    throw new Error('Server error: ' + errorText);
+                }
+
+                const result = await response.json();
+                console.log('New service generated:', result);
+
+                loadServices();
+            } catch (error) {
+                console.error('Error generating service:', error);
+            }
+        }
         
         async function useServices() {
             try {
@@ -320,6 +346,20 @@ def generate_service():
 def generate_heavy_service():
     try:
         service_uri = heavy_service.get_instance(max_attempts=1).uri
+
+        new_service = (service_uri, "--")
+        services.append(new_service)
+        logging.info('Generated new service: %s', new_service)
+        return jsonify({"status": "Service generated", "service": new_service})
+    except Exception as e:
+        logging.error('Error while generating service: %s', str(e))
+        return jsonify({"error": str(e)}), 500
+
+# Endpoint to generate a new service
+@app.route('/generate_ping_service', methods=['POST'])
+def generate_ping_service():
+    try:
+        service_uri = ping_service.get_instance(max_attempts=1).uri
 
         new_service = (service_uri, "--")
         services.append(new_service)
