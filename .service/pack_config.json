@@ -6,7 +6,8 @@
   "zip": false,
   "dependencies": {
     "TINY": "tiny",
-    "HEAVY": "heavy"
+    "HEAVY": "heavy",
+    "PING": "ping"
   },
   "dependencies_env": true,
   "include": [
