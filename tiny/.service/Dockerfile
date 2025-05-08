@@ -1,4 +1,4 @@
-FROM rust:latest AS builder
+FROM rust:1.86.0-bookworm AS builder
 COPY service /tiny-service
 WORKDIR tiny-service
 RUN cargo build --release
