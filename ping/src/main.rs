@@ -5,7 +5,7 @@ use std::convert::Infallible;
 async fn check_google_connection() -> Result<impl Reply, Rejection> {
     let client = Client::new();
 
-    let result_string = match client.get("https://www.google.es").send().await {
+    let result_string = match client.get("https://8.8.8.8").send().await {
         Ok(response) => {
             if response.status().is_success() {
                 "Connection to google.es successful".to_string()

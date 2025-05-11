@@ -6,8 +6,8 @@
     "envs": [],
     "network": [
         {
-            "tags": ["Google", "google.com", "*.google.com"],
-            "prose": "Connection to all Google infrastructure."
+            "tags": ["dns.google", "dns.google", "8.8.8.8"],
+            "prose": "Connection to Google Public DNS."
         }
     ]
 }
