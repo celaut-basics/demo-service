@@ -6,8 +6,12 @@
     "envs": [],
     "network": [
         {
-            "tags": ["dns.google", "dns.google", "8.8.8.8"],
+            "tags": ["dns.google"],
             "prose": "Connection to Google Public DNS."
+        },
+        {
+            "tags": ["google.com"],
+            "prose": "Connection to Google Search Engine."
         }
     ]
 }
