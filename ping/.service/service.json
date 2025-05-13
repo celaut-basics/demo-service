@@ -6,7 +6,7 @@
     "envs": [],
     "network": [
         {
-            "tags": ["google.com"],
+            "tags": ["google.com", "www.google.com"],
             "prose": "Connection to Google Search Engine."
         }
     ]
