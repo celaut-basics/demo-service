@@ -1,7 +1,17 @@
 {
-    "tag": "demo-service-manager",
+    "tag": "demo",
     "api": [{"port":5000, "protocol":["http"]}],
     "architecture": "aarch64",
     "entrypoint": "/service/app.py",
-    "envs": []
+    "envs": [],
+    "network": [
+        {
+            "tags": ["google.com", "www.google.com"],
+            "prose": "Connection to Google Search Engine."
+        },
+        {
+            "tags": ["amazon.com", "www.amazon.com"],
+            "prose": "Connection to Amazon."
+        }
+    ]
 }
