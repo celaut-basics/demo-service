@@ -4,6 +4,16 @@
     "architecture": "aarch64",
     "entrypoint": "/service/app.py",
     "envs": [],
+    "resources": {
+        "at_init": {
+            "mem_limit": 100000000,
+            "disk_space": 5000000000
+        },
+        "at_most": {
+            "mem_limit": 100000000,
+            "disk_space": 5000000000
+        }
+    },
     "network": [
         {
             "tags": ["google.com", "www.google.com"],
