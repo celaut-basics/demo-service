@@ -45,14 +45,6 @@ tiny_service = controller.add_service(service_hash=TINY_SERVICE)  # Generates th
 heavy_service = controller.add_service(
     service_hash=HEAVY_SERVICE,
     config=gateway_pb2.Configuration(
-                config=celaut_pb2.Configuration(),
-                resources=gateway_pb2.CombinationResources(clause={
-                    1: gateway_pb2.CombinationResources.Clause(
-                        min_sysreq=celaut_pb2.Sysresources(
-                            mem_limit=pow(10, 8)  # 100 MB
-                        )
-                    )
-                }),
                 initial_gas_amount=to_gas_amount(pow(10, 8))
             )
 )
