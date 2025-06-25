@@ -5,7 +5,7 @@ from flask import Flask, jsonify, request, render_template_string
 from google.protobuf.json_format import MessageToDict
 
 from node_controller.controller.controller import Controller
-from node_controller.gateway.protos import gateway_pb2, celaut_pb2
+from node_controller.gateway.protos import celaut_pb2
 from node_controller.gateway.utils import to_gas_amount
 
 DIR = "service"
@@ -44,7 +44,7 @@ tiny_service = controller.add_service(service_hash=TINY_SERVICE)  # Generates th
 
 heavy_service = controller.add_service(
     service_hash=HEAVY_SERVICE,
-    config=gateway_pb2.Configuration(
+    config=celaut_pb2.Configuration(
                 initial_gas_amount=to_gas_amount(pow(10, 8))
             )
 )
