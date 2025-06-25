@@ -8,7 +8,17 @@ from node_controller.controller.controller import Controller
 from node_controller.gateway.protos import celaut_pb2
 from node_controller.gateway.utils import to_gas_amount
 
+
 DIR = "service"
+CONFIG_FILE = "/__config__"
+
+# Development mode: If you want to run the app in development mode, set this to True.
+if False:  
+    # In development mode, the app will run in the current directory.
+    # This is useful for testing and debugging.
+    DIR = "."
+    CONFIG_FILE = "__config__"
+# End of development mode
 
 env_vars = {}
 with open(os.path.join(DIR, ".dependencies")) as f:
@@ -30,7 +40,7 @@ logging.basicConfig(
 app = Flask(__name__)
 
 # Read the service configuration file. The service configuration file is written by the node when it builds the container and contains information such as the initial resources or the node URL.
-controller = Controller(debug=lambda s: logging.info('Node Controller: %s', s), app_dir="service")
+controller = Controller(debug=lambda s: logging.info('Node Controller: %s', s), app_dir="service", config_file=CONFIG_FILE)
 node_url: str = controller.get_node_url()
 mem_limit: int = controller.get_mem_limit_at_start()
 
