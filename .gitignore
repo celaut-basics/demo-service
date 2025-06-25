@@ -2,7 +2,7 @@ __config__
 .dependencies
 __metadata__
 __services__
-__blocks__
+__block__
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
