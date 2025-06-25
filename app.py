@@ -13,7 +13,7 @@ DIR = "service"
 CONFIG_FILE = "/__config__"
 
 # Development mode: If you want to run the app in development mode, set this to True.
-if False:  
+if os.path.exists(os.path.join("__config__")): # In that case, we automatically consider that the app is running in development mode.  
     # In development mode, the app will run in the current directory.
     # This is useful for testing and debugging.
     DIR = "."
@@ -40,7 +40,7 @@ logging.basicConfig(
 app = Flask(__name__)
 
 # Read the service configuration file. The service configuration file is written by the node when it builds the container and contains information such as the initial resources or the node URL.
-controller = Controller(debug=lambda s: logging.info('Node Controller: %s', s), app_dir="service", config_file=CONFIG_FILE)
+controller = Controller(debug=lambda s: logging.info('Node Controller: %s', s), app_dir=DIR, config_file=CONFIG_FILE)
 node_url: str = controller.get_node_url()
 mem_limit: int = controller.get_mem_limit_at_start()
 
