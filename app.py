@@ -13,7 +13,7 @@ DIR = "service"
 CONFIG_FILE = "/__config__"
 
 # Development mode: If you want to run the app in development mode, set this to True.
-if os.path.exists(os.path.join("__config__")): # In that case, we automatically consider that the app is running in development mode.  
+if False: # In that case, we automatically consider that the app is running in development mode.  
     # In development mode, the app will run in the current directory.
     # This is useful for testing and debugging.
     DIR = "."
