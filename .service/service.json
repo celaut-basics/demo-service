@@ -6,11 +6,11 @@
     "envs": [],
     "resources": {
         "at_init": {
-            "mem_limit": 100000000,
+            "mem_limit": 1000000000,
             "disk_space": 5000000000
         },
         "at_most": {
-            "mem_limit": 100000000,
+            "mem_limit": 1000000000,
             "disk_space": 5000000000
         }
     },
