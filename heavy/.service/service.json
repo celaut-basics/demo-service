@@ -1,7 +1,15 @@
 {
     "tag": "heavy",
-    "api": [{"port":3030, "protocol":["http","tls"]}],
-    "architecture": "linux/arm64",
+    "api": [
+        {
+            "port": 3030,
+            "protocol": [
+                "http",
+                "tls"
+            ]
+        }
+    ],
+    "architecture": "linux/x86",
     "entrypoint": "/heavy-service",
     "envs": []
 }

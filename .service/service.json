@@ -1,7 +1,14 @@
 {
     "tag": "demo",
-    "api": [{"port":5000, "protocol":["http"]}],
-    "architecture": "aarch64",
+    "api": [
+        {
+            "port": 5000,
+            "protocol": [
+                "http"
+            ]
+        }
+    ],
+    "architecture": "x86",
     "entrypoint": "/service/app.py",
     "envs": [],
     "resources": {
@@ -16,11 +23,17 @@
     },
     "network": [
         {
-            "tags": ["google.com", "www.google.com"],
+            "tags": [
+                "google.com",
+                "www.google.com"
+            ],
             "prose": "Connection to Google Search Engine."
         },
         {
-            "tags": ["amazon.com", "www.amazon.com"],
+            "tags": [
+                "amazon.com",
+                "www.amazon.com"
+            ],
             "prose": "Connection to Amazon."
         }
     ]

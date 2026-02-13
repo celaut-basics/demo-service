@@ -1,7 +1,20 @@
 {
     "tag": "tiny",
-    "api": [{"port":3030, "protocol":["http","tls"]}],
-    "architecture": "linux/arm64",
+    "api": [
+        {
+            "port": 3030,
+            "protocol": [
+                "http",
+                "tls"
+            ]
+        }
+    ],
+    "architecture": "linux/x86",
     "entrypoint": "/tiny-service",
-    "envs": []
+    "envs": [],
+    "resources": {
+        "at_init": {
+            "mem_limit": 50000000
+        }
+    }
 }

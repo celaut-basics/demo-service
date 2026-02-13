@@ -1,13 +1,29 @@
 {
     "tag": "ping",
-    "api": [{"port":3030, "protocol":["http","tls"]}],
-    "architecture": "linux/arm64",
+    "api": [
+        {
+            "port": 3030,
+            "protocol": [
+                "http",
+                "tls"
+            ]
+        }
+    ],
+    "architecture": "linux/x86",
     "entrypoint": "/ping-service",
     "envs": [],
     "network": [
         {
-            "tags": ["google.com", "www.google.com"],
+            "tags": [
+                "google.com",
+                "www.google.com"
+            ],
             "prose": "Connection to Google Search Engine."
         }
-    ]
+    ],
+    "resources": {
+        "at_init": {
+            "mem_limit": 50000000
+        }
+    }
 }
