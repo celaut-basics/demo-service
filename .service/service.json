@@ -8,7 +8,7 @@
             ]
         }
     ],
-    "architecture": "x86",
+    "architecture": "linux/amd64",
     "entrypoint": "/service/app.py",
     "envs": [],
     "resources": {
