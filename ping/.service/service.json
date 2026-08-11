@@ -23,7 +23,12 @@
     ],
     "resources": {
         "at_init": {
-            "mem_limit": 50000000
+            "mem_limit": 50000000,
+            "disk_space": 500000000
+        },
+        "at_most": {
+            "mem_limit": 50000000,
+            "disk_space": 500000000
         }
     }
 }

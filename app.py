@@ -6,7 +6,7 @@ from google.protobuf.json_format import MessageToDict
 
 from node_controller.controller.controller import Controller
 from node_controller.gateway.protos import celaut_pb2
-from node_controller.gateway.utils import to_gas_amount
+from node_controller.gateway.utils import to_amount
 
 
 DIR = "service"
@@ -48,14 +48,14 @@ mem_limit: int = controller.get_mem_limit_at_start()
 resources = {
     "mem_limit": mem_limit
 }
-gas_amount = 0
+balance_mu = 0
 
 tiny_service = controller.add_service(service_hash=TINY_SERVICE)  # Generates the instance obj on the library. It will start instances, stop and check if they are alive in background.
 
 heavy_service = controller.add_service(
     service_hash=HEAVY_SERVICE,
     config=celaut_pb2.Configuration(
-                initial_gas_amount=to_gas_amount(pow(10, 8))
+                initial_mu=to_amount(pow(10, 8))
             )
 )
 
@@ -97,10 +97,10 @@ HTML_TEMPLATE = """
         <h1>Celaut node interaction demo</h1>
         
         <div class="flex-container">
-            <!-- Card 1: Gas and Memory -->
+            <!-- Card 1: Balance and Memory -->
             <div class="card">
                 <h2>Resource Management</h2>
-                <div id="gasDisplay">Gas Amount: Loading...</div>
+                <div id="balanceDisplay">Balance: Loading... MU</div>
                 <div id="memoryDisplay">Memory Used: Loading...</div>
                 <div id="adjustmentDisplay">Memory Adjustment: 0 MB</div>
                 <button class="btn btn-secondary" onclick="adjustMemory(10)">Increase Memory Limit</button>
@@ -139,9 +139,9 @@ HTML_TEMPLATE = """
                 const memoryData = await memoryResponse.json();
                 document.getElementById('memoryDisplay').innerText = 'Memory Used: ' + memoryData.memory_used + ' MB';
                 
-                const gasResponse = await fetch('/current_gas');
-                const gasData = await gasResponse.json();
-                document.getElementById('gasDisplay').innerText = 'Gas Amount: ' + gasData.gas_amount;
+                const balanceResponse = await fetch('/current_balance');
+                const balanceData = await balanceResponse.json();
+                document.getElementById('balanceDisplay').innerText = 'Balance: ' + balanceData.balance_mu + ' MU';
 
                 return memoryData.memory_used;
             } catch (error) {
@@ -307,16 +307,16 @@ def modify_mem_limit():
         
         max_mem_limit = int(max_mem_limit * (1024 * 1024))
 
-        _resources, _gas_amount = controller.modify_resources(
+        _resources, _balance_mu = controller.modify_resources(
             resources={'max': max_mem_limit, 'min': 0}
         )
         
         _resources = MessageToDict(_resources)
-        global resources, gas_amount
+        global resources, balance_mu
         resources = {
             "mem_limit": int(_resources["memLimit"])
         }
-        gas_amount = int(_gas_amount)
+        balance_mu = int(_balance_mu)
         
         logging.info('Memory limit updated to %s', resources['mem_limit'])
         return jsonify({"status": "Memory limit updated"})
@@ -392,12 +392,12 @@ def use_services():
         logging.error('Error while using services: %s', str(e))
         return jsonify({"error": str(e)}), 500
 
-# Endpoint to view the current gas amount in scientific notation
-@app.route('/current_gas', methods=['GET'])
-def current_gas():
-    gas_scientific = "{:.2e}".format(gas_amount)
-    logging.info('Current gas amount: %s', gas_scientific)
-    return jsonify({"gas_amount": gas_scientific})
+# Endpoint to view the instance's remaining balance, in MU (the node's unit of account).
+@app.route('/current_balance', methods=['GET'])
+def current_balance():
+    balance_scientific = "{:.2e}".format(balance_mu)
+    logging.info('Current balance: %s MU', balance_scientific)
+    return jsonify({"balance_mu": balance_scientific})
 
 # Endpoint to view memory usage (in MB, avoiding long zero sequences)
 @app.route('/memory_usage', methods=['GET'])

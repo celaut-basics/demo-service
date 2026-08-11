@@ -11,5 +11,15 @@
     ],
     "architecture": "linux/amd64",
     "entrypoint": "/heavy-service",
-    "envs": []
+    "envs": [],
+    "resources": {
+        "at_init": {
+            "mem_limit": 268435456,
+            "disk_space": 200000000
+        },
+        "at_most": {
+            "mem_limit": 268435456,
+            "disk_space": 200000000
+        }
+    }
 }
