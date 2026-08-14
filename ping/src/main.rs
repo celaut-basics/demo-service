@@ -90,7 +90,16 @@ async fn main() {
     // Start the in-container DNS server that serves the node-granted tags.
     task::spawn_blocking(|| { dns::main(); });
 
-    let route = warp::path::end().and_then(network_isolation_probe);
+    // Identity endpoint — lets the orchestrator confirm the requested dependency
+    // (PING) is the one that actually executed.
+    let whoami = warp::path("whoami").map(|| {
+        warp::reply::with_header(
+            "{\"service\":\"ping\",\"identity\":\"celaut-demo-ping\",\"role\":\"network-isolation-probe\"}",
+            "content-type", "application/json",
+        )
+    });
+
+    let route = whoami.or(warp::path::end().and_then(network_isolation_probe));
 
     println!("PING network-isolation probe on http://0.0.0.0:3030");
     println!("GET / -> asserts declared egress (google) succeeds and undeclared (amazon) is blocked.");

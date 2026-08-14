@@ -20,9 +20,9 @@ attestation report card:
                                         EGO reputation opinion on-chain.
 """
 
-import os, json, logging, hashlib, datetime
+import os, json, logging, hashlib, datetime, threading
 import requests
-from flask import Flask, jsonify, render_template_string
+from flask import Flask, jsonify, render_template_string, request
 from google.protobuf.json_format import MessageToDict
 
 from node_controller.controller.controller import Controller
@@ -241,11 +241,97 @@ def probe_resource_provisioning():
 
 
 # ----------------------------------------------------------------------------
-# Probe 4 — attestation report card (JSON + content hash)
+# Probe 4 — dependency execution identity
+# (the dependency requested must be the dependency that actually runs)
+# ----------------------------------------------------------------------------
+# Each child exposes GET /whoami returning a fixed, service-specific signature.
+# We request each dependency by its own service hash and assert that the
+# instance that comes back self-identifies as the very service we asked for —
+# a node that silently substituted or misrouted a dependency is caught here.
+DEP_IDENTITY = [
+    ("tiny", tiny_service, "celaut-demo-tiny"),
+    ("heavy", heavy_service, "celaut-demo-heavy"),
+    ("ping", ping_service, "celaut-demo-ping"),
+]
+
+
+def probe_dependency_identity():
+    ev = {"probe": "dependency_identity", "checks": []}
+    all_ok = True
+    for tag, iface, expected_identity in DEP_IDENTITY:
+        c = {"requested": tag, "expected_identity": expected_identity}
+        try:
+            uri = _spin_child(iface, tag)
+            r = requests.get(f"http://{uri}/whoami", timeout=45)
+            data = r.json()
+            c["executed"] = data.get("service")
+            c["identity"] = data.get("identity")
+            c["match"] = (data.get("service") == tag and data.get("identity") == expected_identity)
+            if not c["match"]:
+                all_ok = False
+        except Exception as e:
+            c["match"] = False
+            c["error"] = str(e)[:160]
+            all_ok = False
+        ev["checks"].append(c)
+    ev["verdict"] = "PASS" if all_ok else "FAIL"
+    ev["reason"] = ("every requested dependency executed and self-identified correctly"
+                    if all_ok else
+                    "a requested dependency did not run or returned the wrong identity")
+    return ev
+
+
+# ----------------------------------------------------------------------------
+# Startup automation-test harness
+# (runs on boot; executes every dependency and records the verdicts)
+# ----------------------------------------------------------------------------
+STARTUP_TESTS = {"status": "pending", "started_at": None, "finished_at": None, "results": None}
+_startup_lock = threading.Lock()
+
+
+def run_startup_tests():
+    with _startup_lock:
+        if STARTUP_TESTS["status"] == "running":
+            return STARTUP_TESTS
+        STARTUP_TESTS["status"] = "running"
+        STARTUP_TESTS["started_at"] = datetime.datetime.utcnow().isoformat() + "Z"
+    try:
+        # resource modification (provisioning) + dependency identity +
+        # network isolation (real ping child) + memory ceiling.
+        results = {
+            "resource_provisioning": probe_resource_provisioning(),
+            "dependency_identity": probe_dependency_identity(),
+            "network_isolation": probe_network_isolation(),
+            "memory_ceiling": probe_memory_ceiling(),
+        }
+        summary = {
+            "pass": sum(1 for p in results.values() if p.get("verdict") == "PASS"),
+            "fail": sum(1 for p in results.values() if p.get("verdict") == "FAIL"),
+            "other": sum(1 for p in results.values() if p.get("verdict") not in ("PASS", "FAIL")),
+            "total": len(results),
+        }
+        summary["all_passed"] = summary["fail"] == 0 and summary["other"] == 0
+        STARTUP_TESTS["results"] = {"summary": summary, "probes": results}
+        STARTUP_TESTS["status"] = "done"
+    except Exception as e:
+        STARTUP_TESTS["status"] = "error"
+        STARTUP_TESTS["error"] = str(e)
+    STARTUP_TESTS["finished_at"] = datetime.datetime.utcnow().isoformat() + "Z"
+    logging.info("Startup automation tests finished: status=%s", STARTUP_TESTS.get("status"))
+    return STARTUP_TESTS
+
+
+def start_startup_tests_async():
+    threading.Thread(target=run_startup_tests, name="startup-tests", daemon=True).start()
+
+
+# ----------------------------------------------------------------------------
+# Probe 5 — attestation report card (JSON + content hash)
 # ----------------------------------------------------------------------------
 def build_attestation():
     probes = [
         probe_resource_provisioning(),
+        probe_dependency_identity(),
         probe_network_isolation(),
         probe_memory_ceiling(),
     ]
@@ -308,6 +394,110 @@ def route_probe_resources():
     return jsonify(probe_resource_provisioning())
 
 
+@app.route('/probe/dependency_identity', methods=['GET', 'POST'])
+def route_probe_dep_identity():
+    return jsonify(probe_dependency_identity())
+
+
+# ----------------------------------------------------------------------------
+# Startup automation-test results
+# ----------------------------------------------------------------------------
+@app.route('/startup_tests', methods=['GET'])
+def route_startup_tests():
+    return jsonify(STARTUP_TESTS)
+
+
+@app.route('/startup_tests/rerun', methods=['POST'])
+def route_startup_tests_rerun():
+    STARTUP_TESTS["status"] = "pending"
+    start_startup_tests_async()
+    return jsonify({"status": "rerun scheduled"})
+
+
+# ----------------------------------------------------------------------------
+# MCP interface — self-contained JSON-RPC 2.0 over HTTP (Streamable-HTTP style).
+# Exposes the verifier's probes/attestation as MCP tools with no extra deps.
+# ----------------------------------------------------------------------------
+MCP_PROTOCOL_VERSION = "2024-11-05"
+_EMPTY_SCHEMA = {"type": "object", "properties": {}}
+MCP_TOOLS = [
+    {"name": "run_attestation",
+     "description": "Run all node-honesty probes and return the attestation report card with content hash.",
+     "inputSchema": _EMPTY_SCHEMA},
+    {"name": "get_startup_tests",
+     "description": "Return the results of the automation tests that run when the service starts.",
+     "inputSchema": _EMPTY_SCHEMA},
+    {"name": "probe_dependency_identity",
+     "description": "Execute each dependency and assert the requested dependency is the one that actually ran.",
+     "inputSchema": _EMPTY_SCHEMA},
+    {"name": "probe_network_isolation",
+     "description": "Run the ping child and assert declared egress is reachable and undeclared egress is blocked.",
+     "inputSchema": _EMPTY_SCHEMA},
+    {"name": "probe_memory_ceiling",
+     "description": "Ramp the heavy child toward/past its declared memory ceiling and check enforcement.",
+     "inputSchema": _EMPTY_SCHEMA},
+    {"name": "probe_resource_provisioning",
+     "description": "Compare declared/charged resources against the container's real cgroup limits.",
+     "inputSchema": _EMPTY_SCHEMA},
+]
+
+
+def _mcp_call_tool(name):
+    if name == "run_attestation":
+        return build_attestation()
+    if name == "get_startup_tests":
+        return STARTUP_TESTS
+    if name == "probe_dependency_identity":
+        return probe_dependency_identity()
+    if name == "probe_network_isolation":
+        return probe_network_isolation()
+    if name == "probe_memory_ceiling":
+        return probe_memory_ceiling()
+    if name == "probe_resource_provisioning":
+        return probe_resource_provisioning()
+    raise ValueError(f"unknown tool: {name}")
+
+
+@app.route('/mcp', methods=['GET', 'POST'])
+def mcp_endpoint():
+    if request.method == 'GET':
+        # Discovery convenience for humans / health checks.
+        return jsonify({"service": "celaut-node-honesty-verifier",
+                        "mcp": "json-rpc-2.0", "protocolVersion": MCP_PROTOCOL_VERSION,
+                        "tools": [t["name"] for t in MCP_TOOLS]})
+
+    req = request.get_json(force=True, silent=True) or {}
+    rid = req.get("id")
+    method = req.get("method")
+
+    def _result(res):
+        return jsonify({"jsonrpc": "2.0", "id": rid, "result": res})
+
+    def _error(code, msg):
+        return jsonify({"jsonrpc": "2.0", "id": rid, "error": {"code": code, "message": msg}})
+
+    if method == "initialize":
+        return _result({"protocolVersion": MCP_PROTOCOL_VERSION,
+                        "capabilities": {"tools": {}},
+                        "serverInfo": {"name": "celaut-node-honesty-verifier",
+                                       "version": VERIFIER_VERSION}})
+    if method in ("notifications/initialized", "initialized"):
+        return ("", 204)
+    if method == "tools/list":
+        return _result({"tools": MCP_TOOLS})
+    if method == "tools/call":
+        params = req.get("params") or {}
+        name = params.get("name")
+        try:
+            out = _mcp_call_tool(name)
+            return _result({"content": [{"type": "text", "text": json.dumps(out)}],
+                            "isError": False})
+        except Exception as e:
+            return _result({"content": [{"type": "text", "text": f"error: {e}"}],
+                            "isError": True})
+    return _error(-32601, f"method not found: {method}")
+
+
 REPORT_HTML = """
 <!DOCTYPE html>
 <html lang="en">
@@ -331,6 +521,8 @@ REPORT_HTML = """
 <p>Actively probes the node under test for resource, memory-ceiling and network-isolation honesty.</p>
 <div id="overall">Running probes… (this launches child microVMs and can take ~1 minute)</div>
 <button class="btn btn-primary" onclick="run()">Re-run attestation</button>
+<h3>Startup automation tests</h3>
+<div id="startup">Loading startup test results…</div>
 <div id="cards"></div>
 <h3>Content hash (EGO-opinion-ready)</h3>
 <div class="hash" id="hash">—</div>
@@ -359,6 +551,20 @@ async function run(){
     document.getElementById('raw').innerText=JSON.stringify(rep,null,2);
   }catch(e){document.getElementById('overall').innerText='Error running attestation: '+e;}
 }
+async function loadStartup(){
+  try{
+    const res=await fetch('/startup_tests');const st=await res.json();
+    const el=document.getElementById('startup');
+    if(st.status!=='done'){el.innerHTML='<em>status: '+st.status+'</em> (tests run on boot; refresh in a moment)';return;}
+    const s=st.results.summary;let h='<div class="card '+(s.all_passed?'PASS':'FAIL')+'">'+
+      '<b>'+(s.all_passed?'ALL PASSED':'NOT ALL PASSED')+'</b> — '+s.pass+' pass / '+s.fail+' fail / '+s.total+' tests</div>';
+    Object.values(st.results.probes).forEach(p=>{const v=p.verdict||'ERROR';
+      h+='<div class="card '+v+'"><h4>'+p.probe+' <span class="badge b-'+v+'">'+v+'</span></h4>'+
+         '<p>'+(p.reason||'')+'</p><pre>'+JSON.stringify(p,null,2)+'</pre></div>';});
+    el.innerHTML=h;
+  }catch(e){document.getElementById('startup').innerText='Error loading startup tests: '+e;}
+}
+loadStartup();
 run();
 </script>
 </body></html>
@@ -440,4 +646,10 @@ def memory_usage():
 
 if __name__ == '__main__':
     logging.info('Starting the node-honesty verifier.')
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    # Kick off the automation test suite as soon as the service starts; it runs
+    # in the background so Flask still binds immediately. Results are served at
+    # /startup_tests, in the report card, and via the MCP get_startup_tests tool.
+    start_startup_tests_async()
+    # use_reloader=False: the reloader would fork a second process and spin the
+    # child services (and the startup tests) twice.
+    app.run(host='0.0.0.0', port=5000, debug=True, use_reloader=False)

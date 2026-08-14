@@ -102,7 +102,16 @@ async fn main() {
         )
     });
 
-    let routes = alloc_route.or(introspect_route).or(controlled_heavy_route);
+    // Identity endpoint — lets the orchestrator confirm the requested dependency
+    // (HEAVY) is the one that actually executed.
+    let whoami_route = warp::path("whoami").map(|| {
+        warp::reply::with_header(
+            "{\"service\":\"heavy\",\"identity\":\"celaut-demo-heavy\",\"role\":\"memory-ceiling-probe\"}",
+            "content-type", "application/json",
+        )
+    });
+
+    let routes = whoami_route.or(alloc_route).or(introspect_route).or(controlled_heavy_route);
 
     let port = 3030;
     println!("HEAVY Service listening on http://0.0.0.0:{}", port);
