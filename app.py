@@ -20,7 +20,7 @@ attestation report card:
                                         EGO reputation opinion on-chain.
 """
 
-import os, json, logging, hashlib, datetime, threading
+import os, json, logging, hashlib, datetime, threading, time
 import requests
 from flask import Flask, jsonify, render_template_string, request
 from google.protobuf.json_format import MessageToDict
@@ -241,6 +241,82 @@ def probe_resource_provisioning():
 
 
 # ----------------------------------------------------------------------------
+# Probe — MU accounting honesty
+# (the node must spend the service's MUs in line with the resources it uses)
+# ----------------------------------------------------------------------------
+# The node meters usage in MU. `controller.modify_resources({min,max})` settles
+# the account and returns the service's *current* MU balance, so we can measure
+# how many MU the node actually deducts over a fixed window. To check that the
+# spend tracks USAGE (not a flat or arbitrary drain) we run two equal-length
+# windows: one holding a LOW resource ceiling and one holding a HIGH ceiling
+# (up to the manifest at_most). An honest node must (a) actually charge — the
+# balance must fall while resources are held — (b) charge MORE when it provisions
+# more, and (c) not drain the whole balance in a single window.
+MU_WINDOW_SECONDS = int(os.environ.get("MU_WINDOW_SECONDS", "30"))
+MU_LOW_CEILING = 64 * 1024 * 1024                      # 64 MiB
+MU_HIGH_CEILING = SELF_DECLARED_MEM_BYTES              # this service's declared at_most
+
+
+def _sample_mu_balance(min_b, max_b):
+    """Settle the account at the given ceiling and return (balance_mu, sysreq)."""
+    sysreq, balance = controller.modify_resources({"min": min_b, "max": max_b})
+    return balance, sysreq
+
+
+def probe_mu_accounting():
+    ev = {"probe": "mu_accounting", "window_seconds": MU_WINDOW_SECONDS,
+          "low_ceiling_bytes": MU_LOW_CEILING, "high_ceiling_bytes": MU_HIGH_CEILING}
+    try:
+        # Window 1 — hold a LOW ceiling, measure MU spent.
+        b0_low, _ = _sample_mu_balance(MU_LOW_CEILING, MU_LOW_CEILING)
+        time.sleep(MU_WINDOW_SECONDS)
+        b1_low, _ = _sample_mu_balance(MU_LOW_CEILING, MU_LOW_CEILING)
+        spent_low = b0_low - b1_low
+
+        # Window 2 — hold a HIGH ceiling, measure MU spent over the same interval.
+        b0_high, _ = _sample_mu_balance(MU_HIGH_CEILING, MU_HIGH_CEILING)
+        time.sleep(MU_WINDOW_SECONDS)
+        b1_high, _ = _sample_mu_balance(MU_HIGH_CEILING, MU_HIGH_CEILING)
+        spent_high = b0_high - b1_high
+
+        ev["balance_low"] = [b0_low, b1_low]
+        ev["spent_low_mu"] = spent_low
+        ev["balance_high"] = [b0_high, b1_high]
+        ev["spent_high_mu"] = spent_high
+
+        charging = (spent_low > 0) or (spent_high > 0)
+        drained = (b1_low is not None and b1_low <= 0) or (b1_high is not None and b1_high <= 0)
+        scales = spent_high >= spent_low
+
+        if not charging:
+            ev["verdict"] = "FAIL"
+            ev["reason"] = ("node deducted 0 MU while holding resources over the window — "
+                            "usage is not being accounted (free ride / broken metering)")
+        elif drained:
+            ev["verdict"] = "FAIL"
+            ev["reason"] = ("node drained the balance to <= 0 within a single window — "
+                            "spending MU far in excess of usage (overcharging)")
+        elif not scales:
+            ev["verdict"] = "FAIL"
+            ev["reason"] = (f"MU spend does not track resource usage: low ceiling spent {spent_low} MU "
+                            f"but high ceiling spent only {spent_high} MU over {MU_WINDOW_SECONDS}s")
+        else:
+            ev["verdict"] = "PASS"
+            ev["reason"] = (f"node spent MU in line with usage: {spent_low} MU at low ceiling <= "
+                            f"{spent_high} MU at high ceiling over {MU_WINDOW_SECONDS}s, balance never drained")
+    except Exception as e:
+        ev["verdict"] = "INCONCLUSIVE"
+        ev["reason"] = f"could not sample MU balances via modify_resources: {str(e)[:180]}"
+    finally:
+        # Restore the declared ceiling so the probe doesn't leave the service pinned.
+        try:
+            controller.modify_resources({"min": mem_limit or MU_HIGH_CEILING, "max": MU_HIGH_CEILING})
+        except Exception:
+            pass
+    return ev
+
+
+# ----------------------------------------------------------------------------
 # Probe 4 — dependency execution identity
 # (the dependency requested must be the dependency that actually runs)
 # ----------------------------------------------------------------------------
@@ -303,6 +379,7 @@ def run_startup_tests():
             "dependency_identity": probe_dependency_identity(),
             "network_isolation": probe_network_isolation(),
             "memory_ceiling": probe_memory_ceiling(),
+            "mu_accounting": probe_mu_accounting(),
         }
         summary = {
             "pass": sum(1 for p in results.values() if p.get("verdict") == "PASS"),
@@ -334,6 +411,7 @@ def build_attestation():
         probe_dependency_identity(),
         probe_network_isolation(),
         probe_memory_ceiling(),
+        probe_mu_accounting(),
     ]
     passes = [p for p in probes if p.get("verdict") == "PASS"]
     fails = [p for p in probes if p.get("verdict") == "FAIL"]
@@ -399,6 +477,11 @@ def route_probe_dep_identity():
     return jsonify(probe_dependency_identity())
 
 
+@app.route('/probe/mu_accounting', methods=['GET', 'POST'])
+def route_probe_mu():
+    return jsonify(probe_mu_accounting())
+
+
 # ----------------------------------------------------------------------------
 # Startup automation-test results
 # ----------------------------------------------------------------------------
@@ -439,6 +522,9 @@ MCP_TOOLS = [
     {"name": "probe_resource_provisioning",
      "description": "Compare declared/charged resources against the container's real cgroup limits.",
      "inputSchema": _EMPTY_SCHEMA},
+    {"name": "probe_mu_accounting",
+     "description": "Verify the node spends the service's MUs in line with the resources it provisions (charges, scales with usage, does not drain).",
+     "inputSchema": _EMPTY_SCHEMA},
 ]
 
 
@@ -455,6 +541,8 @@ def _mcp_call_tool(name):
         return probe_memory_ceiling()
     if name == "probe_resource_provisioning":
         return probe_resource_provisioning()
+    if name == "probe_mu_accounting":
+        return probe_mu_accounting()
     raise ValueError(f"unknown tool: {name}")
 
 
