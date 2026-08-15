@@ -473,6 +473,27 @@ def probe_dependency_observe():
 STARTUP_TESTS = {"status": "pending", "started_at": None, "finished_at": None, "results": None}
 _startup_lock = threading.Lock()
 
+# Registry of all probes: (key, callable). Used by the startup harness and the
+# attestation so both stay in sync and a single misbehaving probe can never take
+# down the whole run.
+PROBES = [
+    ("resource_provisioning", probe_resource_provisioning),
+    ("dependency_identity", probe_dependency_identity),
+    ("network_isolation", probe_network_isolation),
+    ("dependency_observe", probe_dependency_observe),
+    ("memory_ceiling", probe_memory_ceiling),
+    ("mu_accounting", probe_mu_accounting),
+]
+
+
+def _safe_probe(name, fn):
+    """Run one probe; never propagate — a crash becomes an ERROR verdict so the
+    rest of the suite still completes (e.g. when the node can't launch a child)."""
+    try:
+        return fn()
+    except Exception as e:
+        return {"probe": name, "verdict": "ERROR", "reason": f"probe crashed: {str(e)[:180]}"}
+
 
 def run_startup_tests():
     with _startup_lock:
@@ -483,14 +504,7 @@ def run_startup_tests():
     try:
         # resource modification (provisioning) + dependency identity +
         # network isolation (real ping child) + memory ceiling.
-        results = {
-            "resource_provisioning": probe_resource_provisioning(),
-            "dependency_identity": probe_dependency_identity(),
-            "network_isolation": probe_network_isolation(),
-            "dependency_observe": probe_dependency_observe(),
-            "memory_ceiling": probe_memory_ceiling(),
-            "mu_accounting": probe_mu_accounting(),
-        }
+        results = {name: _safe_probe(name, fn) for name, fn in PROBES}
         summary = {
             "pass": sum(1 for p in results.values() if p.get("verdict") == "PASS"),
             "fail": sum(1 for p in results.values() if p.get("verdict") == "FAIL"),
@@ -516,14 +530,7 @@ def start_startup_tests_async():
 # Probe 5 — attestation report card (JSON + content hash)
 # ----------------------------------------------------------------------------
 def build_attestation():
-    probes = [
-        probe_resource_provisioning(),
-        probe_dependency_identity(),
-        probe_network_isolation(),
-        probe_dependency_observe(),
-        probe_memory_ceiling(),
-        probe_mu_accounting(),
-    ]
+    probes = [_safe_probe(name, fn) for name, fn in PROBES]
     passes = [p for p in probes if p.get("verdict") == "PASS"]
     fails = [p for p in probes if p.get("verdict") == "FAIL"]
     others = [p for p in probes if p.get("verdict") not in ("PASS", "FAIL")]
