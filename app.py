@@ -358,6 +358,115 @@ def probe_dependency_identity():
 
 
 # ----------------------------------------------------------------------------
+# Probe — dependency connectivity is not fraudulent (node Observe cross-check)
+# ----------------------------------------------------------------------------
+# A dishonest node could fabricate a dependency's network behaviour (claim it
+# reached a declared peer, or hide a leak). The node exposes an Observe RPC that
+# streams a running instance's REAL packets/sessions. We independently Observe
+# the dependency's traffic and cross-check it against what the dependency itself
+# reports: if the dep claims connectivity the node's Observe stream cannot
+# corroborate, or Observe reveals traffic to undeclared peers, the node's
+# connectivity picture is fraudulent.
+OBSERVE_SECONDS = int(os.environ.get("OBSERVE_SECONDS", "12"))
+OBSERVE_MAX_EVENTS = 60
+
+
+def _collect_observe_events(instance_id, out, stop_flag):
+    try:
+        from node_controller.gateway.communication import generate_gateway_stub
+        from bee_rpc.client import client_grpc
+        stub = generate_gateway_stub(node_url)
+        for evt in client_grpc(
+            method=stub.Observe,
+            input=celaut_pb2.ObserveRequest(instance_id=instance_id, include_packets=True),
+            indices_parser=celaut_pb2.ObserveEvent,
+            partitions_message_mode_parser=True,
+            indices_serializer=celaut_pb2.ObserveRequest,
+        ):
+            out.append(evt)
+            if len(out) >= OBSERVE_MAX_EVENTS or stop_flag[0]:
+                break
+    except Exception as e:
+        out.append(("__error__", str(e)[:200]))
+
+
+def probe_dependency_observe():
+    ev = {"probe": "dependency_observe"}
+    try:
+        # The network dependency (ping) is where connectivity fraud matters most.
+        inst = ping_service.get_instance(max_attempts=2)
+        instance_id = getattr(inst, "token", None)
+        ev["dependency"] = "ping"
+        ev["instance_id_used"] = instance_id
+
+        # 1) Drive the dependency so it produces real traffic and capture its
+        #    own account of what it connected to.
+        try:
+            self_report = requests.get(f"http://{inst.uri}", timeout=30).json()
+        except Exception as e:
+            self_report = {"error": str(e)[:160]}
+        ev["dependency_self_report"] = self_report
+
+        # 2) Independently Observe the dependency's real packets via the node.
+        events, stop_flag = [], [False]
+        t = threading.Thread(target=_collect_observe_events,
+                             args=(instance_id, events, stop_flag), daemon=True)
+        t.start()
+        t.join(timeout=OBSERVE_SECONDS)
+        stop_flag[0] = True
+
+        packets, sessions, obs_err = [], [], None
+        for e in events:
+            if isinstance(e, tuple) and e and e[0] == "__error__":
+                obs_err = e[1]
+                continue
+            try:
+                if e.HasField("packet"):
+                    p = e.packet
+                    packets.append({"direction": p.direction, "protocol": p.protocol,
+                                    "dst": p.dst, "peer_kind": p.peer_kind,
+                                    "peer_tag": p.peer_tag,
+                                    "peer_relationship": p.peer_relationship,
+                                    "peer_host": p.peer_host})
+                elif e.HasField("session"):
+                    sessions.append({"instance_id": e.session.instance_id, "tag": e.session.tag})
+            except Exception:
+                pass
+
+        ev["observe_error"] = obs_err
+        ev["packet_count"] = len(packets)
+        ev["packets"] = packets[:20]
+        ev["sessions"] = sessions[:5]
+
+        claims_connectivity = isinstance(self_report, dict) and (
+            self_report.get("honest") is not None or self_report.get("targets"))
+        undeclared = [p for p in packets
+                      if str(p.get("peer_relationship", "")).lower() in ("undeclared", "unauthorized", "leak")]
+
+        if obs_err and not packets:
+            ev["verdict"] = "INCONCLUSIVE"
+            ev["reason"] = f"node Observe RPC unavailable/unsupported: {obs_err}"
+        elif undeclared:
+            ev["verdict"] = "FAIL"
+            ev["reason"] = f"Observe revealed traffic to undeclared/unauthorized peers: {undeclared[:3]}"
+        elif not packets and claims_connectivity:
+            ev["verdict"] = "FAIL"
+            ev["reason"] = ("dependency self-reports connectivity but the node's Observe stream shows no "
+                            "corresponding traffic — the connectivity picture may be fabricated")
+        elif packets:
+            ev["verdict"] = "PASS"
+            ev["reason"] = (f"node exposed {len(packets)} real packet event(s) for the dependency and none to "
+                            "undeclared peers — connectivity is independently corroborated, not fabricated")
+        else:
+            ev["verdict"] = "INCONCLUSIVE"
+            ev["reason"] = "no packets observed and no connectivity claim to corroborate"
+    except Exception as e:
+        ev["verdict"] = "INCONCLUSIVE"
+        ev["reason"] = f"observe probe could not run: {str(e)[:180]}"
+    return ev
+
+
+# ----------------------------------------------------------------------------
 # Startup automation-test harness
 # (runs on boot; executes every dependency and records the verdicts)
 # ----------------------------------------------------------------------------
@@ -378,6 +487,7 @@ def run_startup_tests():
             "resource_provisioning": probe_resource_provisioning(),
             "dependency_identity": probe_dependency_identity(),
             "network_isolation": probe_network_isolation(),
+            "dependency_observe": probe_dependency_observe(),
             "memory_ceiling": probe_memory_ceiling(),
             "mu_accounting": probe_mu_accounting(),
         }
@@ -410,6 +520,7 @@ def build_attestation():
         probe_resource_provisioning(),
         probe_dependency_identity(),
         probe_network_isolation(),
+        probe_dependency_observe(),
         probe_memory_ceiling(),
         probe_mu_accounting(),
     ]
@@ -482,6 +593,11 @@ def route_probe_mu():
     return jsonify(probe_mu_accounting())
 
 
+@app.route('/probe/dependency_observe', methods=['GET', 'POST'])
+def route_probe_observe():
+    return jsonify(probe_dependency_observe())
+
+
 # ----------------------------------------------------------------------------
 # Startup automation-test results
 # ----------------------------------------------------------------------------
@@ -525,6 +641,9 @@ MCP_TOOLS = [
     {"name": "probe_mu_accounting",
      "description": "Verify the node spends the service's MUs in line with the resources it provisions (charges, scales with usage, does not drain).",
      "inputSchema": _EMPTY_SCHEMA},
+    {"name": "probe_dependency_observe",
+     "description": "Use the node Observe RPC to independently watch a dependency's real packets and confirm its connectivity is genuine, not fabricated by the node.",
+     "inputSchema": _EMPTY_SCHEMA},
 ]
 
 
@@ -543,6 +662,8 @@ def _mcp_call_tool(name):
         return probe_resource_provisioning()
     if name == "probe_mu_accounting":
         return probe_mu_accounting()
+    if name == "probe_dependency_observe":
+        return probe_dependency_observe()
     raise ValueError(f"unknown tool: {name}")
 
 
