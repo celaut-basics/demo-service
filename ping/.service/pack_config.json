@@ -2,6 +2,7 @@
   "workdir": "ping-service",
   "include": [
     "src",
-    "Cargo.toml"
+    "Cargo.toml",
+    "Cargo.lock"
   ]
 }

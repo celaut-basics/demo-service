@@ -2,6 +2,7 @@
   "workdir": "heavy-service",
   "include": [
     "src",
-    "Cargo.toml"
+    "Cargo.toml",
+    "Cargo.lock"
   ]
 }
