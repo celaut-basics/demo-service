@@ -767,3 +767,27 @@ pub fn main() {
         std::process::exit(1); // Exit on critical server error
     }
 }
+
+// ---------------
+// Verifier helper: expose the network tags the NODE actually resolved for us.
+// The node writes the granted egress allow-list into /__config__ as
+// NetworkResolution entries. Reusing the protobuf parser above, we return the
+// set of tags the node provisioned, so the isolation probe compares against the
+// node-provided allow-list instead of a hardcoded one.
+// ---------------
+pub fn resolved_tags() -> std::collections::HashSet<String> {
+    let mut set = std::collections::HashSet::new();
+    let bytes = match std::fs::read("/__config__") {
+        Ok(b) => b,
+        Err(_) => return set,
+    };
+    if let Ok(list) = parse_configuration_file_proto(&bytes) {
+        for info in list {
+            for t in info.tags {
+                let norm = t.strip_suffix('.').unwrap_or(&t).to_lowercase();
+                set.insert(norm);
+            }
+        }
+    }
+    set
+}

@@ -9,7 +9,7 @@
             ]
         }
     ],
-    "architecture": "linux/amd64",
+    "architecture": "linux/arm64",
     "entrypoint": "/ping-service",
     "envs": [],
     "network": [

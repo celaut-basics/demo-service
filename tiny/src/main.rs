@@ -25,6 +25,17 @@ async fn main() {
         format!("{}-{}", adjective, name)
     });
 
+    // Identity endpoint — lets an orchestrator verify that the dependency it
+    // requested (TINY) is the dependency that actually ran, via a fixed,
+    // service-specific signature.
+    let whoami = warp::path("whoami").map(|| {
+        warp::reply::with_header(
+            "{\"service\":\"tiny\",\"identity\":\"celaut-demo-tiny\",\"role\":\"random-name-generator\"}",
+            "content-type", "application/json",
+        )
+    });
+
     // Inicia el servidor en el puerto 3030
-    warp::serve(random_name).run(([0, 0, 0, 0], 3030)).await;
+    let routes = whoami.or(random_name);
+    warp::serve(routes).run(([0, 0, 0, 0], 3030)).await;
 }
