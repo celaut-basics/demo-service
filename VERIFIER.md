@@ -123,3 +123,21 @@ Example assembled report card:
     "value": "b5b22156fcb28125e480e98b7dcd8d3f42f8f5118de4aa70d9a7a9bb62520915"}
 }
 ```
+
+## First run against a real nodo node (2026-08-22)
+
+The validation above was done by running the packed child images **directly**, not
+through a nodo node. The first end-to-end run on a real node — cloud-hypervisor
+microVMs, arm64 — behaved very differently, and the probes drew conclusions the
+evidence did not support: with the node's gateway unreachable, so that **no probe
+observed anything at all**, the battery still returned two `FAIL` verdicts and
+minted an EGO-opinion-ready `content_hash` over them.
+
+An honest node would have been permanently marked dishonest by a network fault
+the verifier never actually saw. The `resource_provisioning` claim above (real
+`cgroup memory.max` matched, ratio 1.0) also does not hold inside a microVM,
+where no cgroup exists at all.
+
+See [`FINDINGS-2026-08-22.md`](FINDINGS-2026-08-22.md) for the full evidence, the
+eight defects behind it, and the proposed patches. Treat the "Live validation"
+section above as container-only until those are applied.
