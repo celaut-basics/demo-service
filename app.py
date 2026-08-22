@@ -20,7 +20,7 @@ attestation report card:
                                         EGO reputation opinion on-chain.
 """
 
-import os, json, logging, hashlib, datetime, threading, time
+import os, json, logging, hashlib, datetime, threading, time, socket
 import requests
 from flask import Flask, jsonify, render_template_string, request
 from google.protobuf.json_format import MessageToDict
@@ -37,7 +37,26 @@ if False:  # development mode toggle (unchanged from the original demo)
     DIR = "."
     CONFIG_FILE = "__config__"
 
-VERIFIER_VERSION = "1.0.0"
+VERIFIER_VERSION = "1.1.0"
+
+# ---------------------------------------------------------------------------
+# Verdict taxonomy
+# ---------------------------------------------------------------------------
+# This verifier's output is meant to become an EGO reputation opinion on-chain:
+# permanent, public and non-retractable. So the one distinction that must never
+# blur is *observed misbehaviour* vs *failure to observe*. Absence of evidence
+# is not evidence of dishonesty: a verifier that cannot measure must declare
+# itself blind, never accuse.
+VERDICT_PASS = "PASS"                      # observed, correct
+VERDICT_DISHONEST = "DISHONEST"            # observed, incorrect -> the only accusation
+VERDICT_INFRA_ERROR = "INFRA_ERROR"        # could not observe (node/network fault)
+VERDICT_NOT_APPLICABLE = "NOT_APPLICABLE"  # probe does not apply to this environment
+VERDICT_INCONCLUSIVE = "INCONCLUSIVE"      # ran, undecidable
+
+# Only these two mean "we actually observed the node's behaviour".
+CONCLUSIVE_VERDICTS = (VERDICT_PASS, VERDICT_DISHONEST)
+# Only these may ever be published as an accusation.
+ACCUSING_VERDICTS = (VERDICT_DISHONEST,)
 
 # Declared ceilings from the child manifests (.service/service.json at_most).
 HEAVY_DECLARED_MEM_BYTES = 268435456   # 256 MiB
@@ -117,9 +136,77 @@ def read_container_limits():
     }
 
 
+def detect_isolation_model():
+    """Which mechanism enforces our memory ceiling: a cgroup, or the VM's own size?
+
+    The node runs services either in containers (docker) or in microVMs
+    (cloud-hypervisor / qemu). In a microVM there is no cgroup to read at all:
+    the hypervisor sizes the guest's RAM, so /proc/meminfo IS the ceiling.
+    Reading only cgroup files makes this probe blind on half the node's
+    virtualizers, which is how an honestly-provisioned microVM ends up
+    INCONCLUSIVE.
+    """
+    if os.path.exists("/sys/fs/cgroup/memory.max") or os.path.exists(
+            "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
+        return "container"
+    # Sanity-check that we really are in a VM rather than on a host with an
+    # exotic cgroup layout, so we never silently rebase the ceiling.
+    for path in ("/sys/devices/virtual/dmi/id/product_name", "/sys/hypervisor/type"):
+        try:
+            with open(path) as fh:
+                blob = fh.read().strip().lower()
+            if any(k in blob for k in ("cloud hypervisor", "kvm", "qemu", "xen")):
+                return "microvm"
+        except Exception:
+            pass
+    if os.path.exists("/dev/vda") or os.path.exists("/sys/class/virtio-ports"):
+        return "microvm"
+    return "unknown"
+
+
+class ChildLaunchError(RuntimeError):
+    """The node could not give us a child instance.
+
+    This is an INFRASTRUCTURE failure, never evidence of node dishonesty: we did
+    not get to observe anything. Probes must map it to INFRA_ERROR, not to an
+    accusation.
+    """
+
+    def __init__(self, label, original):
+        self.label = label
+        self.original = original
+        super().__init__(f"could not launch child '{label}': {_describe_launch_failure(original)}")
+
+
+def _describe_launch_failure(exc):
+    """Recover a usable message even when the client library loses the real error.
+
+    node_controller's launch_instance() swallows every grpc.RpcError into debug()
+    and then trips over `return instance` with the name unbound, so an
+    UnboundLocalError is all that reaches us. Translate that into what it
+    actually means instead of propagating a meaningless Python detail.
+    """
+    if isinstance(exc, UnboundLocalError) and "instance" in str(exc):
+        return (f"every StartService attempt to the node gateway at {node_url} failed; "
+                "the client library discarded the gRPC status (see app.log for "
+                "'GRPC ERROR LAUNCHING INSTANCE')")
+    last = getattr(exc, "last_error", None)
+    if last is not None:
+        return f"{type(last).__name__}: {str(last)[:200]}"
+    return f"{type(exc).__name__}: {str(exc)[:200]}"
+
+
 def _spin_child(service_iface, label):
-    """Launch one child instance and return its ip:port uri (or raise)."""
-    inst = service_iface.get_instance(max_attempts=2)
+    """Launch one child instance and return its ip:port uri.
+
+    Any launch failure is raised as ChildLaunchError so callers can tell
+    "the child never ran" apart from "the child ran and misbehaved".
+    """
+    try:
+        inst = service_iface.get_instance(max_attempts=2)
+    except Exception as e:
+        logging.error('Could not spin %s child: %s', label, _describe_launch_failure(e))
+        raise ChildLaunchError(label, e) from e
     logging.info('Spun %s child at %s', label, inst.uri)
     return inst.uri
 
@@ -137,14 +224,19 @@ def probe_network_isolation():
         honest = bool(data.get("honest", False))
         # Extra guard: even if the child says honest, fail if any target verdict is bad.
         bad = [t for t in data.get("targets", []) if t.get("verdict") in ("DISHONEST_LEAK", "BROKEN_DENIED")]
-        verdict = "PASS" if honest and not bad else "FAIL"
+        verdict = VERDICT_PASS if honest and not bad else VERDICT_DISHONEST
         ev["verdict"] = verdict
         ev["reason"] = ("declared egress reachable and undeclared egress blocked"
-                        if verdict == "PASS"
+                        if verdict == VERDICT_PASS
                         else f"isolation violated: {[t.get('target')+':'+t.get('verdict') for t in bad]}")
+    except ChildLaunchError as e:
+        # The ping child never ran: we observed nothing about egress isolation.
+        ev["verdict"] = VERDICT_INFRA_ERROR
+        ev["reason"] = (f"could not observe network isolation: {e}. "
+                        "No claim about the node's isolation is made.")
     except Exception as e:
-        ev["verdict"] = "ERROR"
-        ev["reason"] = f"probe could not run: {e}"
+        ev["verdict"] = VERDICT_INFRA_ERROR
+        ev["reason"] = f"probe could not run: {type(e).__name__}: {str(e)[:200]}"
     return ev
 
 
@@ -158,21 +250,38 @@ def probe_memory_ceiling():
     ev = {"probe": "memory_ceiling", "declared_ceiling_mb": declared_mb, "attempts": []}
     highest_ok = 0
     first_kill = None
+    launch_failures = []
+    observed_rungs = 0  # rungs where the child actually existed and answered (or died)
     for mb in ladder:
         rung = {"requested_mb": mb}
         try:
             uri = _spin_child(heavy_service, f"heavy({mb}MB)")
+        except ChildLaunchError as e:
+            # The child never ran: this rung observed NOTHING. It is not a kill,
+            # and it must never feed first_kill (that is what turned a network
+            # fault into a "shortchanged" accusation).
+            rung["ok"] = False
+            rung["launch_failed"] = True
+            rung["error"] = str(e)[:200]
+            launch_failures.append(rung)
+            ev["attempts"].append(rung)
+            continue
+        try:
             r = requests.get(f"http://{uri}/alloc/{mb}", timeout=60)
             ok = (r.status_code == 200 and r.json().get("ok") is True)
             rung["ok"] = ok
             rung["cgroup_mem_current"] = r.json().get("cgroup_mem_current") if ok else None
+            observed_rungs += 1
             if ok:
                 highest_ok = max(highest_ok, mb)
             elif first_kill is None:
                 first_kill = mb
         except Exception as e:
+            # The child WAS running and the request died: a genuine kill signal.
             rung["ok"] = False
+            rung["killed"] = True
             rung["error"] = str(e)[:160]
+            observed_rungs += 1
             if first_kill is None:
                 first_kill = mb
         ev["attempts"].append(rung)
@@ -182,19 +291,32 @@ def probe_memory_ceiling():
 
     ev["observed_ceiling_mb"] = highest_ok
     ev["first_kill_mb"] = first_kill
+    ev["launch_failure_count"] = len(launch_failures)
+
+    # No rung ever produced a running child -> we observed nothing at all.
+    # Reporting an accusation here would blame the node for a ceiling we never
+    # measured.
+    if observed_rungs == 0:
+        ev["verdict"] = VERDICT_INFRA_ERROR
+        ev["reason"] = (f"could not measure the ceiling: none of the {len(ev['attempts'])} heavy "
+                        f"children could be launched "
+                        f"({launch_failures[0]['error'] if launch_failures else 'unknown'}). "
+                        "No claim about the node's memory enforcement is made.")
+        return ev
+
     tol = 0.20  # 20% tolerance around the declared boundary
     low = declared_mb * (1 - tol)
     if first_kill is None:
         # nothing was ever killed, even well above the ceiling
-        ev["verdict"] = "FAIL"
+        ev["verdict"] = VERDICT_DISHONEST
         ev["reason"] = (f"ceiling NOT enforced: allocated up to {highest_ok} MiB with no OOM "
                         f"(declared at_most {declared_mb} MiB)")
     elif highest_ok < low:
-        ev["verdict"] = "FAIL"
+        ev["verdict"] = VERDICT_DISHONEST
         ev["reason"] = (f"shortchanged: killed at {first_kill} MiB, well below declared {declared_mb} MiB "
                         f"(highest success {highest_ok} MiB)")
     else:
-        ev["verdict"] = "PASS"
+        ev["verdict"] = VERDICT_PASS
         ev["reason"] = (f"enforced near declared boundary: highest success {highest_ok} MiB, "
                         f"first kill {first_kill} MiB vs declared {declared_mb} MiB")
     return ev
@@ -206,37 +328,53 @@ def probe_memory_ceiling():
 def probe_resource_provisioning():
     ev = {"probe": "resource_provisioning"}
     limits = read_container_limits()
+    model = detect_isolation_model()
     ev["declared_manifest_mem_bytes"] = SELF_DECLARED_MEM_BYTES
     ev["node_reported_mem_limit_at_start"] = mem_limit
     ev["heavy_child_initial_mu_charged"] = HEAVY_INITIAL_MU
     ev["container_actual"] = limits
+    ev["isolation_model"] = model
 
-    actual = limits.get("cgroup_memory_max")
-    try:
-        actual_bytes = int(actual) if actual not in (None, "max") else None
-    except Exception:
-        actual_bytes = None
+    # Pick the authority for "what we actually got" from the isolation model.
+    actual_bytes, source = None, None
+    raw_cgroup = limits.get("cgroup_memory_max")
+    if raw_cgroup not in (None, "max"):
+        try:
+            actual_bytes, source = int(raw_cgroup), "cgroup.memory.max"
+        except (TypeError, ValueError):
+            actual_bytes = None
+    if actual_bytes is None and model in ("microvm", "unknown"):
+        # No cgroup: the guest's total RAM is the ceiling the hypervisor imposed.
+        # Note: under a microVM MemTotal is always slightly BELOW the assigned
+        # RAM (the guest kernel reserves structures). The 0.95 threshold below
+        # already absorbs that margin.
+        memtotal = limits.get("proc_meminfo_memtotal_bytes")
+        if memtotal:
+            actual_bytes, source = int(memtotal), "proc.meminfo.MemTotal"
+    ev["ceiling_source"] = source
 
     # The node must deliver at least what it told us it provisioned
     # (get_mem_limit_at_start) and what the manifest declared.
     baseline = max(mem_limit or 0, 0)
     if actual_bytes is None:
-        ev["verdict"] = "INCONCLUSIVE"
-        ev["reason"] = f"could not read a numeric cgroup memory.max (got {actual!r})"
+        ev["verdict"] = VERDICT_INCONCLUSIVE
+        ev["reason"] = (f"no readable memory ceiling under isolation model {model!r} "
+                        f"(cgroup={raw_cgroup!r}, MemTotal="
+                        f"{limits.get('proc_meminfo_memtotal_bytes')!r})")
     elif baseline == 0:
-        ev["verdict"] = "INCONCLUSIVE"
+        ev["verdict"] = VERDICT_INCONCLUSIVE
         ev["reason"] = "node did not report initial_sysresources.mem_limit"
     else:
         ratio = actual_bytes / baseline
         ev["actual_vs_reported_ratio"] = round(ratio, 3)
         if ratio >= 0.95:
-            ev["verdict"] = "PASS"
-            ev["reason"] = (f"node delivered {actual_bytes} B >= reported {baseline} B "
-                            f"(ratio {ratio:.2f})")
+            ev["verdict"] = VERDICT_PASS
+            ev["reason"] = (f"node delivered {actual_bytes} B (via {source}) >= reported "
+                            f"{baseline} B (ratio {ratio:.3f})")
         else:
-            ev["verdict"] = "FAIL"
-            ev["reason"] = (f"shortchanged: container sees {actual_bytes} B but node reported/charged "
-                            f"{baseline} B (ratio {ratio:.2f})")
+            ev["verdict"] = VERDICT_DISHONEST
+            ev["reason"] = (f"shortchanged: guest sees {actual_bytes} B but node reported/charged "
+                            f"{baseline} B via {source} (ratio {ratio:.3f})")
     return ev
 
 
@@ -253,6 +391,9 @@ def probe_resource_provisioning():
 # balance must fall while resources are held — (b) charge MORE when it provisions
 # more, and (c) not drain the whole balance in a single window.
 MU_WINDOW_SECONDS = int(os.environ.get("MU_WINDOW_SECONDS", "30"))
+# Below this window length a zero MU delta is indistinguishable from an honest
+# node rounding a small charge down to zero, so it cannot support an accusation.
+MU_MIN_DECISIVE_WINDOW_SECONDS = int(os.environ.get("MU_MIN_DECISIVE_WINDOW_SECONDS", "60"))
 MU_LOW_CEILING = 64 * 1024 * 1024                      # 64 MiB
 MU_HIGH_CEILING = SELF_DECLARED_MEM_BYTES              # this service's declared at_most
 
@@ -289,24 +430,40 @@ def probe_mu_accounting():
         scales = spent_high >= spent_low
 
         if not charging:
-            ev["verdict"] = "FAIL"
-            ev["reason"] = ("node deducted 0 MU while holding resources over the window — "
-                            "usage is not being accounted (free ride / broken metering)")
+            # A zero spend is NOT proof of a free ride: with a short window and a
+            # low rate an honest node can legitimately round the charge down to
+            # zero. Only accuse when the window is long enough that a genuine
+            # charge had to be visible; otherwise say the measurement was too
+            # coarse to decide.
+            if MU_WINDOW_SECONDS >= MU_MIN_DECISIVE_WINDOW_SECONDS:
+                ev["verdict"] = VERDICT_DISHONEST
+                ev["reason"] = (f"node deducted 0 MU while holding resources for "
+                                f"{MU_WINDOW_SECONDS}s at both ceilings — usage is not being "
+                                "accounted (free ride / broken metering)")
+            else:
+                ev["verdict"] = VERDICT_INCONCLUSIVE
+                ev["reason"] = (f"no MU movement over a {MU_WINDOW_SECONDS}s window; that is below "
+                                f"the {MU_MIN_DECISIVE_WINDOW_SECONDS}s needed for a charge to be "
+                                "reliably distinguishable from rounding. No accounting claim is "
+                                "made (raise MU_WINDOW_SECONDS to decide).")
         elif drained:
-            ev["verdict"] = "FAIL"
+            ev["verdict"] = VERDICT_DISHONEST
             ev["reason"] = ("node drained the balance to <= 0 within a single window — "
                             "spending MU far in excess of usage (overcharging)")
         elif not scales:
-            ev["verdict"] = "FAIL"
+            ev["verdict"] = VERDICT_DISHONEST
             ev["reason"] = (f"MU spend does not track resource usage: low ceiling spent {spent_low} MU "
                             f"but high ceiling spent only {spent_high} MU over {MU_WINDOW_SECONDS}s")
         else:
-            ev["verdict"] = "PASS"
+            ev["verdict"] = VERDICT_PASS
             ev["reason"] = (f"node spent MU in line with usage: {spent_low} MU at low ceiling <= "
                             f"{spent_high} MU at high ceiling over {MU_WINDOW_SECONDS}s, balance never drained")
     except Exception as e:
-        ev["verdict"] = "INCONCLUSIVE"
-        ev["reason"] = f"could not sample MU balances via modify_resources: {str(e)[:180]}"
+        # modify_resources is the one call that propagates the real gRPC status,
+        # so an exception here means the node was unreachable, not dishonest.
+        ev["verdict"] = VERDICT_INFRA_ERROR
+        ev["reason"] = (f"could not sample MU balances via modify_resources: "
+                        f"{type(e).__name__}: {str(e)[:180]}")
     finally:
         # Restore the declared ceiling so the probe doesn't leave the service pinned.
         try:
@@ -333,7 +490,7 @@ DEP_IDENTITY = [
 
 def probe_dependency_identity():
     ev = {"probe": "dependency_identity", "checks": []}
-    all_ok = True
+    mismatches, not_observed, verified = [], [], 0
     for tag, iface, expected_identity in DEP_IDENTITY:
         c = {"requested": tag, "expected_identity": expected_identity}
         try:
@@ -343,17 +500,40 @@ def probe_dependency_identity():
             c["executed"] = data.get("service")
             c["identity"] = data.get("identity")
             c["match"] = (data.get("service") == tag and data.get("identity") == expected_identity)
+            verified += 1
             if not c["match"]:
-                all_ok = False
+                mismatches.append(tag)
+        except ChildLaunchError as e:
+            # Never ran -> nothing was observed about its identity.
+            c["match"] = None
+            c["launch_failed"] = True
+            c["error"] = str(e)[:200]
+            not_observed.append(tag)
         except Exception as e:
-            c["match"] = False
+            # Ran but we could not read its identity: still not a substitution.
+            c["match"] = None
+            c["unreachable"] = True
             c["error"] = str(e)[:160]
-            all_ok = False
+            not_observed.append(tag)
         ev["checks"].append(c)
-    ev["verdict"] = "PASS" if all_ok else "FAIL"
-    ev["reason"] = ("every requested dependency executed and self-identified correctly"
-                    if all_ok else
-                    "a requested dependency did not run or returned the wrong identity")
+
+    ev["verified_count"] = verified
+    ev["mismatched"] = mismatches
+    ev["not_observed"] = not_observed
+
+    if mismatches:
+        # A dependency that DID run and self-identified as something else is real
+        # dishonesty, and it outranks a partial infrastructure failure.
+        ev["verdict"] = VERDICT_DISHONEST
+        ev["reason"] = (f"the node ran a different service than requested for: {mismatches} "
+                        "(substituted or misrouted dependency)")
+    elif not_observed:
+        ev["verdict"] = VERDICT_INFRA_ERROR
+        ev["reason"] = (f"could not observe the identity of {not_observed}: the dependencies "
+                        "never ran or could not be reached. No substitution claim is made.")
+    else:
+        ev["verdict"] = VERDICT_PASS
+        ev["reason"] = "every requested dependency executed and self-identified correctly"
     return ev
 
 
@@ -394,7 +574,10 @@ def probe_dependency_observe():
     ev = {"probe": "dependency_observe"}
     try:
         # The network dependency (ping) is where connectivity fraud matters most.
-        inst = ping_service.get_instance(max_attempts=2)
+        try:
+            inst = ping_service.get_instance(max_attempts=2)
+        except Exception as e:
+            raise ChildLaunchError("ping", e) from e
         instance_id = getattr(inst, "token", None)
         ev["dependency"] = "ping"
         ev["instance_id_used"] = instance_id
@@ -438,31 +621,53 @@ def probe_dependency_observe():
         ev["packets"] = packets[:20]
         ev["sessions"] = sessions[:5]
 
+        # Proof of life for the Observe RPC itself: silence only means something
+        # if we know the stream was working. Any event at all (a session record
+        # counts) shows the node was really streaming during the window.
+        stream_alive = bool(packets or sessions)
+        ev["observe_stream_alive"] = stream_alive
+
         claims_connectivity = isinstance(self_report, dict) and (
             self_report.get("honest") is not None or self_report.get("targets"))
         undeclared = [p for p in packets
                       if str(p.get("peer_relationship", "")).lower() in ("undeclared", "unauthorized", "leak")]
 
         if obs_err and not packets:
-            ev["verdict"] = "INCONCLUSIVE"
+            ev["verdict"] = VERDICT_INFRA_ERROR
             ev["reason"] = f"node Observe RPC unavailable/unsupported: {obs_err}"
         elif undeclared:
-            ev["verdict"] = "FAIL"
+            ev["verdict"] = VERDICT_DISHONEST
             ev["reason"] = f"Observe revealed traffic to undeclared/unauthorized peers: {undeclared[:3]}"
+        elif not packets and claims_connectivity and stream_alive:
+            # Only accusable because the stream demonstrably worked and still
+            # showed nothing for a dependency that claims it connected.
+            ev["verdict"] = VERDICT_DISHONEST
+            ev["reason"] = ("dependency self-reports connectivity but the node's Observe stream — which "
+                            f"was demonstrably live ({len(sessions)} session event(s) in the same "
+                            "window) — shows no corresponding traffic; the connectivity picture is "
+                            "fabricated")
         elif not packets and claims_connectivity:
-            ev["verdict"] = "FAIL"
-            ev["reason"] = ("dependency self-reports connectivity but the node's Observe stream shows no "
-                            "corresponding traffic — the connectivity picture may be fabricated")
+            # The stream produced nothing at all, so we cannot tell a fabricated
+            # connectivity claim from an Observe window that was simply too short
+            # or a stream that never started.
+            ev["verdict"] = VERDICT_INCONCLUSIVE
+            ev["reason"] = (f"dependency claims connectivity but the Observe stream produced no events "
+                            f"whatsoever in {OBSERVE_SECONDS}s, so it never proved it was live; "
+                            "cannot distinguish fabrication from an unproductive stream "
+                            "(raise OBSERVE_SECONDS to decide)")
         elif packets:
-            ev["verdict"] = "PASS"
+            ev["verdict"] = VERDICT_PASS
             ev["reason"] = (f"node exposed {len(packets)} real packet event(s) for the dependency and none to "
                             "undeclared peers — connectivity is independently corroborated, not fabricated")
         else:
-            ev["verdict"] = "INCONCLUSIVE"
+            ev["verdict"] = VERDICT_INCONCLUSIVE
             ev["reason"] = "no packets observed and no connectivity claim to corroborate"
+    except ChildLaunchError as e:
+        ev["verdict"] = VERDICT_INFRA_ERROR
+        ev["reason"] = f"observe probe could not run: {e}"
     except Exception as e:
-        ev["verdict"] = "INCONCLUSIVE"
-        ev["reason"] = f"observe probe could not run: {str(e)[:180]}"
+        ev["verdict"] = VERDICT_INFRA_ERROR
+        ev["reason"] = f"observe probe could not run: {type(e).__name__}: {str(e)[:180]}"
     return ev
 
 
@@ -476,7 +681,53 @@ _startup_lock = threading.Lock()
 # Registry of all probes: (key, callable). Used by the startup harness and the
 # attestation so both stay in sync and a single misbehaving probe can never take
 # down the whole run.
+# ---------------------------------------------------------------------------
+# Preflight — can we talk to the node at all?
+# ---------------------------------------------------------------------------
+# Every probe below needs the node's gRPC gateway. When it is unreachable the
+# honest answer is "I could not verify this node", said once — not six probes
+# each inventing its own conclusion from the same silence.
+def probe_gateway_reachability():
+    ev = {"probe": "gateway_reachability", "node_url": node_url}
+    host, _, port = node_url.rpartition(":")
+    ev["host"], ev["port"] = host, port
+
+    # L4 first: it separates "nothing is listening / packets are dropped" from
+    # "the gateway is up but the RPC misbehaves".
+    t0 = time.time()
+    try:
+        with socket.create_connection((host, int(port)), timeout=5):
+            ev["tcp_connect"] = "ok"
+    except Exception as e:
+        ev["tcp_connect"] = f"{type(e).__name__}: {e}"
+        ev["verdict"] = VERDICT_INFRA_ERROR
+        ev["reason"] = (f"cannot open a TCP connection to the node gateway at {node_url} "
+                        f"({type(e).__name__}: {e}). Nothing about this node can be verified; "
+                        "this is a node/network fault, NOT evidence of dishonesty.")
+        ev["operator_hint"] = ("From the host, check that the gateway port is reachable from the "
+                               "guest subnet: the node must allow guest -> gateway traffic on this "
+                               "port in whichever firewall layer the host actually enforces.")
+        return ev
+
+    # L7: a real RPC round-trip. modify_resources is the cheapest call that both
+    # settles the account and echoes state back, and it is the only one that does
+    # not go through launch_instance's error-swallowing retry loop.
+    try:
+        sysreq, balance = controller.modify_resources(
+            {"min": mem_limit or MU_HIGH_CEILING, "max": MU_HIGH_CEILING})
+        ev["rpc_roundtrip_ms"] = int((time.time() - t0) * 1000)
+        ev["balance_mu"] = balance
+        ev["verdict"] = VERDICT_PASS
+        ev["reason"] = f"node gateway reachable and answering RPCs at {node_url}"
+    except Exception as e:
+        ev["verdict"] = VERDICT_INFRA_ERROR
+        ev["reason"] = (f"TCP reachable but the gateway did not answer ModifyServiceSystemResources: "
+                        f"{type(e).__name__}: {str(e)[:200]}")
+    return ev
+
+
 PROBES = [
+    ("gateway_reachability", probe_gateway_reachability),
     ("resource_provisioning", probe_resource_provisioning),
     ("dependency_identity", probe_dependency_identity),
     ("network_isolation", probe_network_isolation),
@@ -485,14 +736,46 @@ PROBES = [
     ("mu_accounting", probe_mu_accounting),
 ]
 
+# Probes that cannot produce any observation without the gateway. When the
+# preflight fails they are reported as INFRA_ERROR instead of being run, so the
+# report says "could not verify" once rather than six times in six dialects.
+# resource_provisioning is deliberately NOT here: it only reads /proc and
+# /__config__, so it stays valid (and can legitimately PASS) with the gateway down.
+GATEWAY_DEPENDENT = ("dependency_identity", "network_isolation",
+                     "dependency_observe", "memory_ceiling", "mu_accounting")
+
 
 def _safe_probe(name, fn):
-    """Run one probe; never propagate — a crash becomes an ERROR verdict so the
-    rest of the suite still completes (e.g. when the node can't launch a child)."""
+    """Run one probe; never propagate — a crash becomes an INFRA_ERROR verdict so
+    the rest of the suite still completes. A crashed probe observed nothing, so
+    it must never be counted as an accusation."""
     try:
         return fn()
     except Exception as e:
-        return {"probe": name, "verdict": "ERROR", "reason": f"probe crashed: {str(e)[:180]}"}
+        return {"probe": name, "verdict": VERDICT_INFRA_ERROR,
+                "reason": f"probe crashed: {type(e).__name__}: {str(e)[:180]}"}
+
+
+def _run_probe_suite():
+    """Run the preflight, then every probe, short-circuiting the gateway-dependent
+    ones when the node is unreachable. Returns an ordered {name: evidence} dict."""
+    results = {}
+    preflight = _safe_probe("gateway_reachability", probe_gateway_reachability)
+    results["gateway_reachability"] = preflight
+    gateway_ok = preflight.get("verdict") == VERDICT_PASS
+    for name, fn in PROBES:
+        if name == "gateway_reachability":
+            continue
+        if not gateway_ok and name in GATEWAY_DEPENDENT:
+            results[name] = {
+                "probe": name,
+                "verdict": VERDICT_INFRA_ERROR,
+                "reason": f"skipped: the node gateway is unreachable ({preflight.get('reason')})",
+                "skipped": True,
+            }
+            continue
+        results[name] = _safe_probe(name, fn)
+    return results
 
 
 def run_startup_tests():
@@ -502,16 +785,19 @@ def run_startup_tests():
         STARTUP_TESTS["status"] = "running"
         STARTUP_TESTS["started_at"] = datetime.datetime.utcnow().isoformat() + "Z"
     try:
-        # resource modification (provisioning) + dependency identity +
-        # network isolation (real ping child) + memory ceiling.
-        results = {name: _safe_probe(name, fn) for name, fn in PROBES}
+        # gateway preflight + resource provisioning + dependency identity +
+        # network isolation (real ping child) + observe + memory ceiling + MU.
+        results = _run_probe_suite()
+        unobserved = [p for p in results.values() if p.get("verdict") not in CONCLUSIVE_VERDICTS]
         summary = {
-            "pass": sum(1 for p in results.values() if p.get("verdict") == "PASS"),
-            "fail": sum(1 for p in results.values() if p.get("verdict") == "FAIL"),
-            "other": sum(1 for p in results.values() if p.get("verdict") not in ("PASS", "FAIL")),
+            "pass": sum(1 for p in results.values() if p.get("verdict") == VERDICT_PASS),
+            "dishonest": sum(1 for p in results.values() if p.get("verdict") in ACCUSING_VERDICTS),
+            "unobserved": len(unobserved),
+            "unobserved_probes": [p.get("probe") for p in unobserved],
             "total": len(results),
         }
-        summary["all_passed"] = summary["fail"] == 0 and summary["other"] == 0
+        summary["observation_complete"] = not unobserved
+        summary["all_passed"] = summary["dishonest"] == 0 and summary["unobserved"] == 0
         STARTUP_TESTS["results"] = {"summary": summary, "probes": results}
         STARTUP_TESTS["status"] = "done"
     except Exception as e:
@@ -530,30 +816,55 @@ def start_startup_tests_async():
 # Probe 5 — attestation report card (JSON + content hash)
 # ----------------------------------------------------------------------------
 def build_attestation():
-    probes = [_safe_probe(name, fn) for name, fn in PROBES]
-    passes = [p for p in probes if p.get("verdict") == "PASS"]
-    fails = [p for p in probes if p.get("verdict") == "FAIL"]
-    others = [p for p in probes if p.get("verdict") not in ("PASS", "FAIL")]
+    probes = list(_run_probe_suite().values())
+    passes = [p for p in probes if p.get("verdict") == VERDICT_PASS]
+    dishonest = [p for p in probes if p.get("verdict") in ACCUSING_VERDICTS]
+    unobserved = [p for p in probes if p.get("verdict") not in CONCLUSIVE_VERDICTS]
+
+    # An attestation is only mintable when EVERY probe reached a conclusive
+    # verdict. Otherwise we did not measure the node — we measured our own
+    # inability to reach it — and no opinion may be committed on-chain.
+    complete = not unobserved
 
     summary = {
-        "node_honest": len(fails) == 0 and len(others) == 0,
+        # Tri-state on purpose: True / False / None (unknown). Never collapse
+        # "proven honest" and "could not verify" into the same boolean.
+        "node_honest": (len(dishonest) == 0) if complete else None,
+        "observation_complete": complete,
+        "attestable": complete,
         "pass": len(passes),
-        "fail": len(fails),
-        "inconclusive_or_error": len(others),
+        "dishonest": len(dishonest),
+        "unobserved": len(unobserved),
+        "unobserved_probes": [p.get("probe") for p in unobserved],
         "total": len(probes),
     }
 
-    # Deterministic content hash over the verdict-bearing payload (no timestamps),
-    # so the same observed behaviour always hashes identically — this digest is
-    # what an EGO reputation opinion would commit to on-chain.
-    hashable = {
-        "verifier": "celaut-node-honesty-verifier",
-        "version": VERIFIER_VERSION,
-        "probes": [{"probe": p.get("probe"), "verdict": p.get("verdict")} for p in probes],
-        "summary": {k: summary[k] for k in ("node_honest", "pass", "fail", "total")},
-    }
-    canonical = json.dumps(hashable, sort_keys=True, separators=(",", ":"))
-    content_hash = hashlib.sha3_256(canonical.encode()).hexdigest()
+    if complete:
+        # Deterministic content hash over the verdict-bearing payload (no
+        # timestamps), so the same observed behaviour always hashes identically
+        # — this digest is what an EGO reputation opinion would commit to on-chain.
+        hashable = {
+            "verifier": "celaut-node-honesty-verifier",
+            "version": VERIFIER_VERSION,
+            "probes": [{"probe": p.get("probe"), "verdict": p.get("verdict")} for p in probes],
+            "summary": {k: summary[k] for k in ("node_honest", "pass", "dishonest", "total")},
+        }
+        canonical = json.dumps(hashable, sort_keys=True, separators=(",", ":"))
+        content_hash = {
+            "alg": "sha3_256",
+            "value": hashlib.sha3_256(canonical.encode()).hexdigest(),
+            "note": "EGO-opinion-ready digest of {probe:verdict} + summary",
+        }
+    else:
+        content_hash = {
+            "alg": "sha3_256",
+            "value": None,
+            "note": ("NOT ATTESTABLE: "
+                     f"{len(unobserved)} of {len(probes)} probes could not observe the node "
+                     f"({', '.join(p.get('probe') for p in unobserved)}). "
+                     "Publishing an opinion from an incomplete observation would accuse a node "
+                     "of behaviour that was never measured."),
+        }
 
     return {
         "verifier": "celaut-node-honesty-verifier",
@@ -562,8 +873,7 @@ def build_attestation():
         "generated_at": datetime.datetime.utcnow().isoformat() + "Z",
         "probes": probes,
         "summary": summary,
-        "content_hash": {"alg": "sha3_256", "value": content_hash,
-                         "note": "EGO-opinion-ready digest of {probe:verdict} + summary"},
+        "content_hash": content_hash,
     }
 
 
@@ -605,6 +915,11 @@ def route_probe_observe():
     return jsonify(probe_dependency_observe())
 
 
+@app.route('/probe/gateway', methods=['GET', 'POST'])
+def route_probe_gateway():
+    return jsonify(probe_gateway_reachability())
+
+
 # ----------------------------------------------------------------------------
 # Startup automation-test results
 # ----------------------------------------------------------------------------
@@ -627,8 +942,15 @@ def route_startup_tests_rerun():
 MCP_PROTOCOL_VERSION = "2024-11-05"
 _EMPTY_SCHEMA = {"type": "object", "properties": {}}
 MCP_TOOLS = [
+    {"name": "probe_gateway_reachability",
+     "description": ("Preflight: check whether this service can reach the node's gRPC gateway at "
+                     "all. Run this FIRST when other probes report INFRA_ERROR — it distinguishes "
+                     "a node/network fault from actual node dishonesty."),
+     "inputSchema": _EMPTY_SCHEMA},
     {"name": "run_attestation",
-     "description": "Run all node-honesty probes and return the attestation report card with content hash.",
+     "description": ("Run all node-honesty probes and return the attestation report card. The "
+                     "content hash is only minted when every probe reached a conclusive verdict; "
+                     "otherwise the report is explicitly NOT attestable."),
      "inputSchema": _EMPTY_SCHEMA},
     {"name": "get_startup_tests",
      "description": "Return the results of the automation tests that run when the service starts.",
@@ -655,6 +977,8 @@ MCP_TOOLS = [
 
 
 def _mcp_call_tool(name):
+    if name == "probe_gateway_reachability":
+        return probe_gateway_reachability()
     if name == "run_attestation":
         return build_attestation()
     if name == "get_startup_tests":
@@ -724,10 +1048,11 @@ REPORT_HTML = """
 <style>
  body{font-family:Arial,sans-serif;margin:40px;max-width:1000px}
  .card{padding:16px 20px;margin:14px 0;box-shadow:0 4px 8px rgba(0,0,0,.1);border-radius:6px}
- .PASS{border-left:8px solid #2e7d32}.FAIL{border-left:8px solid #c62828}
- .ERROR,.INCONCLUSIVE{border-left:8px solid #f9a825}
+ .PASS{border-left:8px solid #2e7d32}.DISHONEST{border-left:8px solid #c62828}
+ .INFRA_ERROR,.INCONCLUSIVE,.NOT_APPLICABLE,.UNVERIFIED{border-left:8px solid #6c7a89}
  .badge{font-weight:bold;padding:2px 10px;border-radius:12px;color:#fff}
- .b-PASS{background:#2e7d32}.b-FAIL{background:#c62828}.b-ERROR,.b-INCONCLUSIVE{background:#f9a825}
+ .b-PASS{background:#2e7d32}.b-DISHONEST{background:#c62828}
+ .b-INFRA_ERROR,.b-INCONCLUSIVE,.b-NOT_APPLICABLE,.b-UNVERIFIED{background:#6c7a89}
  pre{background:#f6f6f6;padding:10px;border-radius:4px;overflow:auto;font-size:12px}
  .hash{font-family:monospace;word-break:break-all;font-size:12px}
  #overall{font-size:1.3em;font-weight:bold}
@@ -735,6 +1060,9 @@ REPORT_HTML = """
 <body>
 <h1>Celaut Node-Honesty Verifier</h1>
 <p>Actively probes the node under test for resource, memory-ceiling and network-isolation honesty.</p>
+<p><small>Absence of evidence is not evidence of dishonesty: probes that could not observe the node
+report <b>INFRA_ERROR</b>, and no attestation hash is minted unless every probe reached a
+conclusive verdict.</small></p>
 <div id="overall">Running probes… (this launches child microVMs and can take ~1 minute)</div>
 <button class="btn btn-primary" onclick="run()">Re-run attestation</button>
 <h3>Startup automation tests</h3>
@@ -751,19 +1079,26 @@ async function run(){
     const res=await fetch('/attestation.json',{method:'POST'});
     const rep=await res.json();
     const s=rep.summary;
+    // Tri-state: honest / dishonest / unverified. "Unverified" is NOT guilt, so
+    // it must never be painted with the dishonest colour.
+    const state = (s.node_honest===true) ? 'PASS'
+                : (s.dishonest>0) ? 'DISHONEST' : 'UNVERIFIED';
+    const label = (state==='PASS') ? 'HONEST'
+                : (state==='DISHONEST') ? 'DISHONEST' : 'UNVERIFIED (could not observe)';
     document.getElementById('overall').innerHTML =
-      'Node verdict: <span class="badge '+(s.node_honest?'b-PASS':'b-FAIL')+'">'+
-      (s.node_honest?'HONEST':'DISHONEST / UNVERIFIED')+'</span> &nbsp; ('+
-      s.pass+' pass / '+s.fail+' fail / '+s.total+' probes)';
+      'Node verdict: <span class="badge b-'+state+'">'+label+'</span> &nbsp; ('+
+      s.pass+' pass / '+s.dishonest+' dishonest / '+s.unobserved+' unobserved / '+s.total+' probes)';
     const cards=document.getElementById('cards');cards.innerHTML='';
     rep.probes.forEach(p=>{
-      const v=p.verdict||'ERROR';
+      const v=p.verdict||'INFRA_ERROR';
       const d=document.createElement('div');d.className='card '+v;
       d.innerHTML='<h3>'+p.probe+' <span class="badge b-'+v+'">'+v+'</span></h3>'+
                   '<p>'+(p.reason||'')+'</p><pre>'+JSON.stringify(p,null,2)+'</pre>';
       cards.appendChild(d);
     });
-    document.getElementById('hash').innerText=rep.content_hash.alg+':'+rep.content_hash.value;
+    document.getElementById('hash').innerText = rep.content_hash.value
+      ? (rep.content_hash.alg+':'+rep.content_hash.value)
+      : rep.content_hash.note;
     document.getElementById('raw').innerText=JSON.stringify(rep,null,2);
   }catch(e){document.getElementById('overall').innerText='Error running attestation: '+e;}
 }
@@ -772,9 +1107,12 @@ async function loadStartup(){
     const res=await fetch('/startup_tests');const st=await res.json();
     const el=document.getElementById('startup');
     if(st.status!=='done'){el.innerHTML='<em>status: '+st.status+'</em> (tests run on boot; refresh in a moment)';return;}
-    const s=st.results.summary;let h='<div class="card '+(s.all_passed?'PASS':'FAIL')+'">'+
-      '<b>'+(s.all_passed?'ALL PASSED':'NOT ALL PASSED')+'</b> — '+s.pass+' pass / '+s.fail+' fail / '+s.total+' tests</div>';
-    Object.values(st.results.probes).forEach(p=>{const v=p.verdict||'ERROR';
+    const s=st.results.summary;
+    const cls = s.all_passed?'PASS':(s.dishonest>0?'DISHONEST':'UNVERIFIED');
+    const txt = s.all_passed?'ALL PASSED':(s.dishonest>0?'DISHONESTY OBSERVED':'INCOMPLETE OBSERVATION');
+    let h='<div class="card '+cls+'"><b>'+txt+'</b> — '+s.pass+' pass / '+s.dishonest+
+      ' dishonest / '+s.unobserved+' unobserved / '+s.total+' tests</div>';
+    Object.values(st.results.probes).forEach(p=>{const v=p.verdict||'INFRA_ERROR';
       h+='<div class="card '+v+'"><h4>'+p.probe+' <span class="badge b-'+v+'">'+v+'</span></h4>'+
          '<p>'+(p.reason||'')+'</p><pre>'+JSON.stringify(p,null,2)+'</pre></div>';});
     el.innerHTML=h;

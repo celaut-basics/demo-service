@@ -52,6 +52,27 @@ fn meminfo_total_kb() -> String {
         .unwrap_or_else(|| "unavailable".to_string())
 }
 
+// Effective memory ceiling: a cgroup when we run in a container, the guest's own
+// RAM when we run in a microVM (cloud-hypervisor/qemu expose no cgroup at all,
+// so reporting only cgroup values leaves the orchestrator blind on half the
+// node's virtualizers). Returns (bytes, source) so the caller never has to guess
+// which mechanism actually enforced the limit.
+fn effective_mem_ceiling() -> (String, &'static str) {
+    pick_mem_ceiling(&cgroup_mem_max(), &meminfo_total_kb())
+}
+
+// Split out from effective_mem_ceiling() so the decision can be unit-tested
+// without a cgroup filesystem or a microVM to run inside.
+fn pick_mem_ceiling(cgroup_max: &str, meminfo_kb: &str) -> (String, &'static str) {
+    if cgroup_max != "unavailable" && !cgroup_max.is_empty() && cgroup_max != "max" {
+        return (cgroup_max.to_string(), "cgroup.memory.max");
+    }
+    match meminfo_kb.parse::<u64>() {
+        Ok(k) => ((k * 1024).to_string(), "proc.meminfo.MemTotal"),
+        Err(_) => ("unavailable".to_string(), "unavailable"),
+    }
+}
+
 #[tokio::main]
 async fn main() {
     println!("Starting the HEAVY service (verifier-extended version)...");
@@ -96,9 +117,11 @@ async fn main() {
 
     // /introspect — what the container actually sees.
     let introspect_route = warp::path("introspect").map(|| {
+        let (ceiling_bytes, ceiling_source) = effective_mem_ceiling();
         format!(
-            "{{\"service\":\"heavy\",\"cgroup_mem_max\":\"{}\",\"cgroup_mem_current\":\"{}\",\"proc_meminfo_memtotal_kb\":\"{}\"}}",
-            cgroup_mem_max(), cgroup_mem_current(), meminfo_total_kb()
+            "{{\"service\":\"heavy\",\"cgroup_mem_max\":\"{}\",\"cgroup_mem_current\":\"{}\",\"proc_meminfo_memtotal_kb\":\"{}\",\"ceiling_bytes\":\"{}\",\"ceiling_source\":\"{}\"}}",
+            cgroup_mem_max(), cgroup_mem_current(), meminfo_total_kb(),
+            ceiling_bytes, ceiling_source
         )
     });
 
@@ -116,4 +139,39 @@ async fn main() {
     let port = 3030;
     println!("HEAVY Service listening on http://0.0.0.0:{}", port);
     warp::serve(routes).run(([0, 0, 0, 0], port)).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pick_mem_ceiling;
+
+    #[test]
+    fn container_prefers_the_cgroup() {
+        let (bytes, source) = pick_mem_ceiling("268435456", "8000000");
+        assert_eq!(bytes, "268435456");
+        assert_eq!(source, "cgroup.memory.max");
+    }
+
+    #[test]
+    fn microvm_falls_back_to_meminfo() {
+        // A cloud-hypervisor/qemu guest exposes no cgroup at all, so reading only
+        // cgroup files leaves the orchestrator blind on this virtualizer.
+        let (bytes, source) = pick_mem_ceiling("unavailable", "938896");
+        assert_eq!(bytes, "961429504"); // the live `witty-panda` figure
+        assert_eq!(source, "proc.meminfo.MemTotal");
+    }
+
+    #[test]
+    fn unlimited_cgroup_is_not_a_ceiling() {
+        let (bytes, source) = pick_mem_ceiling("max", "938896");
+        assert_eq!(bytes, "961429504");
+        assert_eq!(source, "proc.meminfo.MemTotal");
+    }
+
+    #[test]
+    fn nothing_readable_reports_unavailable_rather_than_guessing() {
+        let (bytes, source) = pick_mem_ceiling("unavailable", "unavailable");
+        assert_eq!(bytes, "unavailable");
+        assert_eq!(source, "unavailable");
+    }
 }
