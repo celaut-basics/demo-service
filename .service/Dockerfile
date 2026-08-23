@@ -8,6 +8,6 @@ RUN apt-get update --fix-missing && \
     pip3 install --no-cache-dir \
         requests==2.32.3 \
         Flask==3.0.3 \
-        "celaut-service-libraries @ git+https://github.com/bee-rpc-protocol/celaut-service-libraries@c0005546127caa5110da1e30d4416954984984fc"
+        git+https://github.com/bee-rpc-protocol/celaut-service-libraries
 COPY service /service
 RUN chmod +x /service/app.py
