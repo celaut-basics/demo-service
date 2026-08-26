@@ -20,7 +20,7 @@ attestation report card:
                                         EGO reputation opinion on-chain.
 """
 
-import os, json, logging, hashlib, datetime, threading, time, socket
+import os, json, logging, hashlib, datetime, re, threading, time, socket
 import requests
 from flask import Flask, jsonify, render_template_string, request
 from google.protobuf.json_format import MessageToDict
@@ -57,6 +57,107 @@ VERDICT_INCONCLUSIVE = "INCONCLUSIVE"      # ran, undecidable
 CONCLUSIVE_VERDICTS = (VERDICT_PASS, VERDICT_DISHONEST)
 # Only these may ever be published as an accusation.
 ACCUSING_VERDICTS = (VERDICT_DISHONEST,)
+
+# ---------------------------------------------------------------------------
+# Fault attribution for a failed gateway RPC
+# ---------------------------------------------------------------------------
+# A failed RPC is INFRA_ERROR either way -- it observed nothing, so it may never
+# accuse -- but "nobody answered" and "the node answered with an error" are not
+# the same finding, and reporting both with one sentence ("the gateway did not
+# answer") sent an operator hunting through firewall rules for a bug that was in
+# the node's own charging path. The gateway's error reply is itself proof that the
+# port is open.
+#
+#   FAULT_TRANSPORT  nothing answered: no route, closed port, RST, timeout. The
+#                    gateway is unreachable and nothing here is observable.
+#   FAULT_NODE_RPC   the gateway ANSWERED, with an error status of its own. The
+#                    port is reachable; the fault is inside the node.
+#   FAULT_UNKNOWN    no gRPC status anywhere in the exception, so which of the two
+#                    it was cannot be told. Claim neither.
+FAULT_TRANSPORT = "transport"
+FAULT_NODE_RPC = "node_rpc"
+FAULT_UNKNOWN = "unknown"
+
+# The only statuses gRPC produces when the call never reached a server. Every
+# other status travelled back FROM one, which is what makes it evidence of
+# reachability.
+TRANSPORT_STATUS_CODES = ("UNAVAILABLE", "DEADLINE_EXCEEDED")
+
+_STATUS_CODE_RE = re.compile(r"StatusCode\.([A-Z_]+)")
+_STATUS_DETAILS_RE = re.compile(r'details\s*=\s*"(.*?)"', re.DOTALL)
+
+
+def classify_rpc_failure(exc):
+    """Attribute a failed gateway RPC to the transport or to the node.
+
+    Handles both shapes this service actually sees: a real ``grpc.RpcError``
+    (which carries ``.code()``) and the exceptions node_controller re-raises,
+    where the status survives only in the text -- so the classification never
+    depends on grpc being importable here.
+
+    Returns the evidence fields to merge into a probe result, including the
+    node's own ``details = "..."`` text when it sent one: that string names the
+    failing RPC path, and it is the one thing worth reading first.
+    """
+    text = str(exc)
+
+    code = None
+    code_getter = getattr(exc, "code", None)
+    if callable(code_getter):
+        try:
+            code = getattr(code_getter(), "name", None) or str(code_getter())
+        except Exception:
+            code = None
+    if not code:
+        match = _STATUS_CODE_RE.search(text)
+        code = match.group(1) if match else None
+
+    detail_match = _STATUS_DETAILS_RE.search(text)
+
+    if not code:
+        fault = FAULT_UNKNOWN
+    elif code in TRANSPORT_STATUS_CODES:
+        fault = FAULT_TRANSPORT
+    else:
+        fault = FAULT_NODE_RPC
+
+    return {
+        "fault": fault,
+        "node_answered": fault == FAULT_NODE_RPC,
+        "grpc_code": code,
+        "node_detail": detail_match.group(1) if detail_match else None,
+        "error": f"{type(exc).__name__}: {text[:200]}",
+    }
+
+
+def describe_rpc_failure(failure, rpc, node_url):
+    """One sentence that says which side failed, and where to look next."""
+    status = f"grpc {failure['grpc_code']}" if failure["grpc_code"] else "no grpc status"
+    said = f' It answered: "{failure["node_detail"]}".' if failure["node_detail"] else ""
+
+    if failure["fault"] == FAULT_NODE_RPC:
+        return (
+            f"the gateway at {node_url} ANSWERED and rejected {rpc} ({status}), so the port IS "
+            f"reachable and this is a fault INSIDE THE NODE, not a connectivity problem.{said} "
+            f"{failure['error']}",
+            f"Do not touch the firewall: the node replied. Look for {rpc} in the node's log "
+            "(the node's app.log) -- the text above is the node's own error.",
+        )
+    if failure["fault"] == FAULT_TRANSPORT:
+        return (
+            f"TCP connected but {rpc} got no answer from {node_url} ({status}): the gateway is "
+            f"not serving this call. {failure['error']}",
+            "The port accepts a connection but the gRPC service behind it did not respond; check "
+            "that the node process is up and that the guest -> gateway path is not being dropped "
+            "mid-stream.",
+        )
+    return (
+        f"{rpc} failed against {node_url} with no gRPC status to attribute it ({status}), so it "
+        f"cannot be told whether the node answered. {failure['error']}",
+        "Neither the node nor the network can be blamed from this evidence; re-run with the node's "
+        "log open to see whether the call ever arrived.",
+    )
+
 
 # Declared ceilings from the child manifests (.service/service.json at_most).
 HEAVY_DECLARED_MEM_BYTES = 268435456   # 256 MiB
@@ -459,11 +560,16 @@ def probe_mu_accounting():
             ev["reason"] = (f"node spent MU in line with usage: {spent_low} MU at low ceiling <= "
                             f"{spent_high} MU at high ceiling over {MU_WINDOW_SECONDS}s, balance never drained")
     except Exception as e:
-        # modify_resources is the one call that propagates the real gRPC status,
-        # so an exception here means the node was unreachable, not dishonest.
+        # modify_resources is the one call that propagates the real gRPC status, so
+        # an exception here is never an accusation -- but it is not automatically an
+        # unreachable node either: the node rejecting the call looks identical from
+        # here until the status is read. Attribute it.
+        failure = classify_rpc_failure(e)
+        ev.update(failure)
         ev["verdict"] = VERDICT_INFRA_ERROR
-        ev["reason"] = (f"could not sample MU balances via modify_resources: "
-                        f"{type(e).__name__}: {str(e)[:180]}")
+        reason, ev["operator_hint"] = describe_rpc_failure(
+            failure, "ModifyServiceSystemResources", node_url)
+        ev["reason"] = f"could not sample MU balances: {reason}"
     finally:
         # Restore the declared ceiling so the probe doesn't leave the service pinned.
         try:
@@ -720,9 +826,13 @@ def probe_gateway_reachability():
         ev["verdict"] = VERDICT_PASS
         ev["reason"] = f"node gateway reachable and answering RPCs at {node_url}"
     except Exception as e:
+        # The old message said "the gateway did not answer" for every failure here,
+        # including the ones where it demonstrably did. Attribute the fault instead.
+        failure = classify_rpc_failure(e)
+        ev.update(failure)
         ev["verdict"] = VERDICT_INFRA_ERROR
-        ev["reason"] = (f"TCP reachable but the gateway did not answer ModifyServiceSystemResources: "
-                        f"{type(e).__name__}: {str(e)[:200]}")
+        ev["reason"], ev["operator_hint"] = describe_rpc_failure(
+            failure, "ModifyServiceSystemResources", node_url)
     return ev
 
 
@@ -767,10 +877,18 @@ def _run_probe_suite():
         if name == "gateway_reachability":
             continue
         if not gateway_ok and name in GATEWAY_DEPENDENT:
+            # Say WHY they were skipped. "The node gateway is unreachable" was
+            # asserted here regardless of what the preflight actually found, so a
+            # node-side error was reported to the operator as a network problem.
+            headline = {
+                FAULT_NODE_RPC: "the node gateway is reachable but rejected the preflight RPC",
+                FAULT_TRANSPORT: "the node gateway is unreachable",
+            }.get(preflight.get("fault"), "the node gateway could not be exercised")
             results[name] = {
                 "probe": name,
                 "verdict": VERDICT_INFRA_ERROR,
-                "reason": f"skipped: the node gateway is unreachable ({preflight.get('reason')})",
+                "reason": f"skipped: {headline} ({preflight.get('reason')})",
+                "fault": preflight.get("fault"),
                 "skipped": True,
             }
             continue

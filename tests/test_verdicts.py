@@ -77,6 +77,15 @@ def _install_stubs(tmpdir):
         def modify_resources(self, spec):
             if FakeController.rpc_mode == "ok":
                 return ({"mem_limit": 1000000000}, 10 ** 8)
+            if FakeController.rpc_mode == "node_error":
+                # Verbatim shape of the live failure the node returns when it
+                # cannot charge the caller: the gateway ANSWERED, with a status
+                # and its own details string. Reachability is not in question.
+                raise RuntimeError(
+                    "_MultiThreadedRendezvous: <_MultiThreadedRendezvous of RPC that "
+                    "terminated with:\n\tstatus = StatusCode.UNKNOWN\n\tdetails = "
+                    '"Exception iterating responses: Error charging for the resource '
+                    'change of ipv4:192.168.200.38:49254"\n>')
             raise RuntimeError(
                 "StatusCode.UNAVAILABLE failed to connect to all addresses; "
                 "last error: UNKNOWN: ipv4:192.168.200.1:58443: Failed to connect")
@@ -457,6 +466,81 @@ class TaxonomyInvariantTests(unittest.TestCase):
     def test_preflight_is_exposed_over_mcp(self):
         names = [t["name"] for t in app.MCP_TOOLS]
         self.assertIn("probe_gateway_reachability", names)
+
+
+class FaultAttributionTests(unittest.TestCase):
+    """An error reply from the gateway must never be reported as unreachability.
+
+    The live confusion this pins down: the node rejected
+    ModifyServiceSystemResources with `StatusCode.UNKNOWN ... Error charging for
+    the resource change of ...`, and the preflight reported "the node gateway is
+    unreachable", which sent the operator into the host firewall. The gateway had
+    answered -- an answer only a reachable gateway can send.
+    """
+
+    def setUp(self):
+        FakeController.rpc_mode = "node_error"
+        # Let the L4 leg pass so the L7 leg is the one under test.
+        self._tcp = mock.patch.object(app.socket, "create_connection")
+        self._tcp.start()
+
+    def tearDown(self):
+        self._tcp.stop()
+        FakeController.rpc_mode = "unavailable"
+
+    def test_a_status_reply_is_attributed_to_the_node_not_the_network(self):
+        ev = app.probe_gateway_reachability()
+        self.assertEqual(ev["verdict"], app.VERDICT_INFRA_ERROR)
+        self.assertEqual(ev["fault"], app.FAULT_NODE_RPC)
+        self.assertTrue(ev["node_answered"])
+        self.assertEqual(ev["grpc_code"], "UNKNOWN")
+        self.assertIn("Error charging for the resource change", ev["node_detail"])
+        self.assertIn("INSIDE THE NODE", ev["reason"])
+        self.assertNotIn("unreachable", ev["reason"])
+        self.assertNotIn("did not answer", ev["reason"])
+        self.assertNotIn(ev["verdict"], app.ACCUSING_VERDICTS)
+
+    def test_the_firewall_is_not_suggested_when_the_node_replied(self):
+        ev = app.probe_gateway_reachability()
+        self.assertIn("Do not touch the firewall", ev["operator_hint"])
+
+    def test_skipped_probes_say_the_gateway_was_reachable(self):
+        results = app._run_probe_suite()
+        for name in app.GATEWAY_DEPENDENT:
+            reason = results[name]["reason"]
+            self.assertTrue(results[name]["skipped"])
+            self.assertIn("reachable but rejected the preflight RPC", reason)
+            self.assertNotIn("gateway is unreachable", reason)
+
+    def test_a_transport_failure_is_still_called_unreachable(self):
+        FakeController.rpc_mode = "unavailable"
+        ev = app.probe_gateway_reachability()
+        self.assertEqual(ev["fault"], app.FAULT_TRANSPORT)
+        self.assertFalse(ev["node_answered"])
+        self.assertEqual(ev["grpc_code"], "UNAVAILABLE")
+        results = app._run_probe_suite()
+        self.assertIn("gateway is unreachable", results["mu_accounting"]["reason"])
+
+    def test_an_exception_with_no_status_blames_neither_side(self):
+        class _Blank(Exception):
+            pass
+
+        failure = app.classify_rpc_failure(_Blank("connection died mid-stream"))
+        self.assertEqual(failure["fault"], app.FAULT_UNKNOWN)
+        self.assertFalse(failure["node_answered"])
+        reason, _hint = app.describe_rpc_failure(failure, "SomeRpc", "1.2.3.4:5000")
+        self.assertIn("cannot be told whether the node answered", reason)
+
+    def test_a_real_grpc_error_is_read_from_its_status_code(self):
+        class _RpcError(Exception):
+            def code(self):
+                class _Code:
+                    name = "RESOURCE_EXHAUSTED"
+                return _Code()
+
+        failure = app.classify_rpc_failure(_RpcError("no text status here"))
+        self.assertEqual(failure["grpc_code"], "RESOURCE_EXHAUSTED")
+        self.assertEqual(failure["fault"], app.FAULT_NODE_RPC)
 
 
 if __name__ == "__main__":
