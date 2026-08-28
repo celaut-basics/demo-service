@@ -147,7 +147,15 @@ The `heavy` child's `/introspect` reports the same pair (`ceiling_bytes`,
 
 ### 4. Attestation report card
 
-`GET /attestation.json` runs all probes and returns:
+A full run drives every probe — including the memory-ceiling ladder and the two
+`MU_WINDOW_SECONDS` MU-accounting windows — and can take minutes, so it runs as
+a background job rather than inside one HTTP request:
+
+- `POST /attestation.json` schedules a run (a no-op if one is already in
+  flight) and returns immediately with the job status.
+- `GET /attestation.json` polls that job: `{"status":"idle|running|done|error",
+  "started_at":…, "finished_at":…, "result":…, "error":…}`. The report below is
+  `result` once `status` is `"done"`:
 
 ```json
 {"summary":{"node_honest":true,"observation_complete":true,"attestable":true,

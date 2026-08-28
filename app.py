@@ -784,6 +784,44 @@ def probe_dependency_observe():
 STARTUP_TESTS = {"status": "pending", "started_at": None, "finished_at": None, "results": None}
 _startup_lock = threading.Lock()
 
+# ----------------------------------------------------------------------------
+# Attestation job — run in the background, polled by the UI
+# ----------------------------------------------------------------------------
+# A full attestation run drives every probe (memory ceiling ladder, two
+# MU-accounting windows, several child launches) and can legitimately take
+# minutes. Blocking one HTTP request for that long is what a proxy/tunnel
+# sitting in front of this service will eventually kill mid-flight, which the
+# browser reports as a bare "NetworkError" with no HTTP status to explain it.
+# So attestation runs the same way STARTUP_TESTS already does: kicked off in a
+# background thread, polled from a short-lived request.
+ATTESTATION_JOB = {"status": "idle", "started_at": None, "finished_at": None,
+                    "result": None, "error": None}
+_attestation_lock = threading.Lock()
+
+
+def run_attestation_job():
+    with _attestation_lock:
+        if ATTESTATION_JOB["status"] == "running":
+            return ATTESTATION_JOB
+        ATTESTATION_JOB["status"] = "running"
+        ATTESTATION_JOB["started_at"] = datetime.datetime.utcnow().isoformat() + "Z"
+        ATTESTATION_JOB["finished_at"] = None
+        ATTESTATION_JOB["result"] = None
+        ATTESTATION_JOB["error"] = None
+    try:
+        ATTESTATION_JOB["result"] = build_attestation()
+        ATTESTATION_JOB["status"] = "done"
+    except Exception as e:
+        ATTESTATION_JOB["status"] = "error"
+        ATTESTATION_JOB["error"] = f"{type(e).__name__}: {str(e)[:200]}"
+    ATTESTATION_JOB["finished_at"] = datetime.datetime.utcnow().isoformat() + "Z"
+    logging.info("Attestation job finished: status=%s", ATTESTATION_JOB.get("status"))
+    return ATTESTATION_JOB
+
+
+def start_attestation_async():
+    threading.Thread(target=run_attestation_job, name="attestation-run", daemon=True).start()
+
 # Registry of all probes: (key, callable). Used by the startup harness and the
 # attestation so both stay in sync and a single misbehaving probe can never take
 # down the whole run.
@@ -998,9 +1036,21 @@ def build_attestation():
 # ----------------------------------------------------------------------------
 # Routes — attestation
 # ----------------------------------------------------------------------------
-@app.route('/attestation.json', methods=['GET', 'POST'])
+@app.route('/attestation.json', methods=['GET'])
 def attestation_json():
-    return jsonify(build_attestation())
+    """Poll the current attestation job (idle / running / done / error)."""
+    return jsonify(ATTESTATION_JOB)
+
+
+@app.route('/attestation.json', methods=['POST'])
+def attestation_json_run():
+    """Schedule an attestation run if one isn't already in flight, and return
+    immediately -- the caller polls GET /attestation.json for the result."""
+    with _attestation_lock:
+        already_running = ATTESTATION_JOB["status"] == "running"
+    if not already_running:
+        start_attestation_async()
+    return jsonify(ATTESTATION_JOB), 202
 
 
 @app.route('/probe/network', methods=['GET', 'POST'])
@@ -1191,34 +1241,52 @@ conclusive verdict.</small></p>
 <h3>Raw report</h3>
 <pre id="raw">—</pre>
 <script>
+function renderAttestation(rep){
+  const s=rep.summary;
+  // Tri-state: honest / dishonest / unverified. "Unverified" is NOT guilt, so
+  // it must never be painted with the dishonest colour.
+  const state = (s.node_honest===true) ? 'PASS'
+              : (s.dishonest>0) ? 'DISHONEST' : 'UNVERIFIED';
+  const label = (state==='PASS') ? 'HONEST'
+              : (state==='DISHONEST') ? 'DISHONEST' : 'UNVERIFIED (could not observe)';
+  document.getElementById('overall').innerHTML =
+    'Node verdict: <span class="badge b-'+state+'">'+label+'</span> &nbsp; ('+
+    s.pass+' pass / '+s.dishonest+' dishonest / '+s.unobserved+' unobserved / '+s.total+' probes)';
+  const cards=document.getElementById('cards');cards.innerHTML='';
+  rep.probes.forEach(p=>{
+    const v=p.verdict||'INFRA_ERROR';
+    const d=document.createElement('div');d.className='card '+v;
+    d.innerHTML='<h3>'+p.probe+' <span class="badge b-'+v+'">'+v+'</span></h3>'+
+                '<p>'+(p.reason||'')+'</p><pre>'+JSON.stringify(p,null,2)+'</pre>';
+    cards.appendChild(d);
+  });
+  document.getElementById('hash').innerText = rep.content_hash.value
+    ? (rep.content_hash.alg+':'+rep.content_hash.value)
+    : rep.content_hash.note;
+  document.getElementById('raw').innerText=JSON.stringify(rep,null,2);
+}
+
+// A full run drives every probe (memory ladder, MU-accounting windows, several
+// child launches) and can take minutes, so the job runs in the background and
+// this polls a short-lived status endpoint instead of awaiting one long fetch
+// that a proxy/tunnel in front of this service could kill mid-flight.
 async function run(){
   document.getElementById('overall').innerText='Running probes… please wait.';
   try{
-    const res=await fetch('/attestation.json',{method:'POST'});
-    const rep=await res.json();
-    const s=rep.summary;
-    // Tri-state: honest / dishonest / unverified. "Unverified" is NOT guilt, so
-    // it must never be painted with the dishonest colour.
-    const state = (s.node_honest===true) ? 'PASS'
-                : (s.dishonest>0) ? 'DISHONEST' : 'UNVERIFIED';
-    const label = (state==='PASS') ? 'HONEST'
-                : (state==='DISHONEST') ? 'DISHONEST' : 'UNVERIFIED (could not observe)';
-    document.getElementById('overall').innerHTML =
-      'Node verdict: <span class="badge b-'+state+'">'+label+'</span> &nbsp; ('+
-      s.pass+' pass / '+s.dishonest+' dishonest / '+s.unobserved+' unobserved / '+s.total+' probes)';
-    const cards=document.getElementById('cards');cards.innerHTML='';
-    rep.probes.forEach(p=>{
-      const v=p.verdict||'INFRA_ERROR';
-      const d=document.createElement('div');d.className='card '+v;
-      d.innerHTML='<h3>'+p.probe+' <span class="badge b-'+v+'">'+v+'</span></h3>'+
-                  '<p>'+(p.reason||'')+'</p><pre>'+JSON.stringify(p,null,2)+'</pre>';
-      cards.appendChild(d);
-    });
-    document.getElementById('hash').innerText = rep.content_hash.value
-      ? (rep.content_hash.alg+':'+rep.content_hash.value)
-      : rep.content_hash.note;
-    document.getElementById('raw').innerText=JSON.stringify(rep,null,2);
+    await fetch('/attestation.json',{method:'POST'});
+    await pollAttestation();
   }catch(e){document.getElementById('overall').innerText='Error running attestation: '+e;}
+}
+
+async function pollAttestation(){
+  for(;;){
+    const res=await fetch('/attestation.json');
+    const job=await res.json();
+    if(job.status==='done'){ renderAttestation(job.result); return; }
+    if(job.status==='error'){ document.getElementById('overall').innerText='Attestation failed: '+job.error; return; }
+    document.getElementById('overall').innerText='Running probes… ('+job.status+')';
+    await new Promise(r=>setTimeout(r,3000));
+  }
 }
 async function loadStartup(){
   try{
