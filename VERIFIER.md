@@ -72,6 +72,22 @@ same silence. The preflight checks L4 (`socket.create_connection`) first, so it
 can separate "nothing is listening / packets dropped" from "gateway up but the
 RPC misbehaves", then does one real `ModifyServiceSystemResources` round-trip.
 
+A failed round-trip is `INFRA_ERROR` either way, but the report always says
+**which side failed**, because the two send an operator to opposite places:
+
+| `fault` | what happened | where to look |
+|---|---|---|
+| `transport` | nothing answered: no route, closed port, RST, `UNAVAILABLE`, `DEADLINE_EXCEEDED` | the host firewall / the guest → gateway path |
+| `node_rpc` | the gateway **answered**, with an error status of its own (any other `StatusCode`) | the node's own log for that RPC — the port is proven reachable |
+| `unknown` | no gRPC status in the exception at all | neither side can be blamed from this evidence |
+
+An error reply is proof of reachability: only a reachable gateway can send one.
+So a `node_rpc` fault is never reported as an unreachable gateway, and the node's
+own `details = "..."` text is surfaced verbatim as `node_detail` — that string
+names the RPC path that broke. `classify_rpc_failure` reads the status from a real
+`grpc.RpcError` (`.code()`) or from the exception text, so it works with whatever
+node_controller re-raises.
+
 `resource_provisioning` is deliberately **not** gateway-dependent: it only reads
 `/proc` and `/__config__`, so it stays valid — and can legitimately `PASS` — even
 with the gateway down. A report saying *"gateway unreachable; the only thing I
