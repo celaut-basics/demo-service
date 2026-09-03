@@ -10,9 +10,9 @@ An honest node must:
 1. **Isolate networks** — a child may only reach the egress it *declared*; an
    undeclared destination must be blocked.
 2. **Enforce the memory ceiling it charged for** — a child may use up to the
-   `at_most.mem_limit` it declared, and the node must OOM-kill it *at* that
-   boundary (not before → shortchanging, not far beyond → the ceiling it billed
-   is a lie).
+   `at_most.mem_limit` it declared, and past that boundary the allocation must
+   fail (not before → shortchanging, not far beyond → the ceiling it billed is a
+   lie). *How* it fails depends on the isolation model — see probe 2.
 3. **Provision what it billed** — what the manifest declared and the node
    charged (`initial_mu`, `get_mem_limit_at_start()`) must match what the
    container actually gets (cgroup + `/proc/meminfo`).
@@ -62,6 +62,43 @@ Two consequences follow:
 | 5 | `dependency_observe` | `ping` | the node's `Observe` stream independently corroborates the dependency's connectivity |
 | 6 | `mu_accounting` | orchestrator (self) | the node spends MUs in line with the resources it provisions |
 | 7 | `attestation` | orchestrator | per-probe verdict + `sha3_256` content hash, as JSON and HTML |
+
+### Child readiness — the node's "ready" is not the service's "ready"
+
+Every probe that drives a child waits for that child's port to accept a TCP
+connection before it asserts anything.
+
+The node reports an instance ready once the **guest network** answers, which it
+learns by pinging the guest IP. Under a microVM the guest kernel brings that IP
+up during boot, seconds before the service inside it binds its port; the node's
+own log names the gap: `instance registered before the guest could call in`. A
+request sent into that gap is refused by a guest that is perfectly healthy, and
+the refusal is indistinguishable from a dead child unless someone waits.
+
+`_spin_child` therefore returns only once `_wait_until_ready` has seen the port
+open, and raises `ChildNotReadyError` — mapped to `INFRA_ERROR`, never to an
+accusation — if it never does. A bare `connect` is the right probe for this: the
+port opens exactly when the service binds it, and it costs no application work,
+so it cannot perturb what the probe goes on to measure.
+
+That wait is also what makes later failures readable. Once the port is proven
+open, a request that dies is a child that died **in flight** — which is the
+genuine kill signal the memory-ceiling ladder needs. Without it, the ladder
+cannot tell an OOM from a boot.
+
+`CHILD_READY_TIMEOUT_S` (default 120) and `CHILD_READY_POLL_S` (0.5) tune the
+wait.
+
+### Children are stopped, not abandoned
+
+Each probe hands every child it spins to `_release_child` in a `finally`.
+
+node_controller's contract is that a taken instance is either returned to its
+queue or stopped — its own source says a leaked one "remain[s] as zombies on the
+network until the service is removed". Beyond the leak, an abandoned child keeps
+drawing MU from *this* service's balance, and that balance is what
+`mu_accounting` measures: enough abandoned children swamp the difference its two
+windows exist to compare. A verifier that leaks children measures its own litter.
 
 ### 0. Gateway reachability (preflight)
 
@@ -120,12 +157,43 @@ The orchestrator ramps the request toward and past the declared 256 MiB. The
 highest success and the first OOM-kill locate the *observed* ceiling, compared to
 the declared one. `GET /introspect` reports the container's real cgroup limits.
 
-The ladder distinguishes three states per rung: `ok` (the child answered),
-`killed` (the child existed and died — genuine ceiling evidence) and
-`launch_failed` (the child never existed — evidence of *nothing*). Only the
-first two can decide a verdict; if no rung ever produced a running child the
-probe returns `INFRA_ERROR`, because a ceiling that was never measured cannot be
-called a lie.
+The ladder distinguishes four states per rung:
+
+| rung state | what it means | decides a verdict? |
+|---|---|---|
+| `ok` | the child answered | yes |
+| `killed` | the child's port was open and the request then died — it died in flight | yes |
+| `launch_failed` | the child never existed | no |
+| `never_ready` | it launched but never opened its port, so it was never seen allocating anything | no |
+
+Only the first two can decide anything; if no rung ever produced a child that
+answered, the probe returns `INFRA_ERROR`, because a ceiling that was never
+measured cannot be called a lie. `never_ready` exists because the two failure
+modes look identical at the socket: the readiness wait is what separates a guest
+still booting from a child the node killed, and only the latter is evidence.
+
+A ladder is also checked for **coherence** before any verdict: a `first_kill`
+below a rung that succeeded does not locate a ceiling, since nothing can be
+enforced below a request that went through. That combination yields
+`INCONCLUSIVE` — the `PASS` branch reads only the highest success, and would
+otherwise call an incoherent ladder correct.
+
+#### What "kill" means under a microVM
+
+`enforcement_mechanism` in the evidence records which mechanism was at work,
+because the two are not the same event:
+
+- container → `cgroup_oom_kill`: the cgroup's OOM killer reaps the offending
+  process and the container survives.
+- microVM → `guest_kernel_panic_no_oom_kill`: the child's entrypoint **is PID 1**,
+  so the guest kernel has no killable process when an allocation exceeds the RAM
+  the hypervisor assigned. It panics — `Attempted to kill init!` — and the whole
+  guest goes down.
+
+The ceiling is genuinely enforced either way: the allocation fails, and the child
+never gets memory it did not pay for. But "the node OOM-kills the child at the
+boundary" describes the container model only, and the evidence should not imply a
+mechanism that was not the one at work.
 
 ### 3. Resource provisioning (orchestrator)
 
@@ -144,6 +212,45 @@ RAM (the guest kernel reserves structures) — the 0.95 threshold already absorb
 that margin. `ceiling_source` in the evidence records which mechanism was read.
 The `heavy` child's `/introspect` reports the same pair (`ceiling_bytes`,
 `ceiling_source`) so the orchestrator never has to guess.
+
+### MU accounting (orchestrator)
+
+`controller.modify_resources({min,max})` settles the account and returns this
+service's current MU balance, so holding a ceiling across a fixed window and
+sampling the balance at both ends measures what the node actually deducted. Two
+equal windows are run — one at a LOW ceiling (64 MiB), one at the HIGH ceiling
+this service declared — so the spend can be checked against *usage* rather than
+merely against zero. An honest node must:
+
+- **charge at all** — a zero spend at both ceilings is a free ride or broken
+  metering;
+- **charge more when it provisions more** — `spent_high >= spent_low`;
+- **not take a funded balance to nothing inside one window**.
+
+Three details keep each of those from misfiring:
+
+**Debt is not overcharging.** The drain test is a *crossing*: `b0 > 0 >= b1`. A
+balance that was already at or below zero when the window opened was not spent by
+the node during it. Operators run nodes with `costs.ALLOW_DEBT` enabled, where a
+negative balance is the configured policy and says nothing about what was
+charged; testing only the closing balance accuses every node in debt for a drain
+that predates the measurement. `started_in_debt` records the condition so a
+reader can see it was considered and dismissed.
+
+**A window too short to read cannot accuse.** `MU_MIN_DECISIVE_WINDOW_SECONDS`
+(60) gates *every* accusing branch, not just the zero-spend one: a window too
+coarse to tell a real charge from rounding is equally too coarse to price one
+ceiling against another. Below it the probe returns `INCONCLUSIVE` and says to
+raise `MU_WINDOW_SECONDS`. That default is 60 to match — a shipped window that
+cannot decide makes every unconfigured run pay for two windows and then decline
+to read them.
+
+**Only this service's own ceiling may vary between the windows.** Which is why
+every probe stops its children: each one left running keeps drawing MU from this
+same balance, and enough of them swamp the difference the two windows exist to
+measure. On the run that motivated this, the parent's balance fell by ~1.2e9 MU
+during the suite — 12 abandoned `heavy` children at `initial_mu` 1e8 each, all
+of them spun by the verifier itself.
 
 ### 4. Attestation report card
 
@@ -181,15 +288,44 @@ painted in the dishonest colour: an unverified node is not a guilty node.
 ## Files changed
 
 - `app.py` — probe battery (`probe_network_isolation`, `probe_memory_ceiling`,
-  `probe_resource_provisioning`), `build_attestation()` + content hash, the
-  `/attestation.json`, `/probe/*` routes, and a report-card UI replacing the old
-  prose HTML. Legacy demo endpoints are preserved.
+  `probe_resource_provisioning`), child lifecycle (`_spin_child`,
+  `_wait_until_ready`, `_release_child`), `build_attestation()` + content hash,
+  the `/attestation.json`, `/probe/*` routes, and a report-card UI replacing the
+  old prose HTML. Legacy demo endpoints are preserved.
 - `heavy/src/main.rs` — `GET /alloc/<mb>` (touch-to-resident) and
   `GET /introspect`; the classic burst on `/` now returns JSON.
 - `ping/src/main.rs` — reworked into the isolation probe; structured JSON
   verdicts derived from the node-provided allow-list.
 - `ping/src/dns.rs` — `pub fn resolved_tags()` reusing the existing protobuf
   parser to surface the node-granted egress tags.
+
+## Live validation against a real node
+
+The first end-to-end run through a real nodo (`qemu` microVMs, arm64 guests) is
+what the readiness wait, the child release, the ladder coherence check and the
+debt-crossing rule all come from. Two instances of this service ran on the *same*
+node and reported different verdicts — which is by itself proof that what was
+being measured was the verifier, since two observers of one node cannot honestly
+disagree about it. That run reported:
+
+```json
+{"summary": {"node_honest": null, "pass": 3, "dishonest": 1, "unobserved": 3,
+             "total": 7, "attestable": false}}
+```
+
+Every one of those four non-`PASS` verdicts was the verifier's own:
+
+| probe | reported | what was actually true |
+|---|---|---|
+| `mu_accounting` | `DISHONEST` | balance was already at −1.317e9 before the window opened (`ALLOW_DEBT`), and both windows were dominated by 20 children the run had abandoned |
+| `network_isolation` | `INFRA_ERROR` | the `ping` child was still booting; it answered fine minutes later |
+| `dependency_identity` | `INFRA_ERROR` | same, for all three dependencies |
+| `dependency_observe` | `INCONCLUSIVE` | same, for `ping` |
+| `memory_ceiling` | `PASS` | on self-contradictory evidence: `first_kill 64 MiB` with `observed_ceiling 240 MiB` |
+
+The node's own log recorded no failure at all across the 32 microVMs the run
+launched — only `instance registered before the guest could call in`, once per
+VM, which is the race in one line.
 
 ## Reproducibility
 

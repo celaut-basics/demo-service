@@ -297,11 +297,48 @@ def _describe_launch_failure(exc):
     return f"{type(exc).__name__}: {str(exc)[:200]}"
 
 
-def _spin_child(service_iface, label):
-    """Launch one child instance and return its ip:port uri.
+class ChildNotReadyError(Exception):
+    """The child launched but never began answering before the deadline.
 
-    Any launch failure is raised as ChildLaunchError so callers can tell
-    "the child never ran" apart from "the child ran and misbehaved".
+    Like ChildLaunchError this is an INFRASTRUCTURE failure and never evidence
+    of dishonesty: a child that was never reachable was never observed.
+    """
+
+    def __init__(self, label, uri, waited, last_error):
+        self.label, self.uri, self.waited = label, uri, waited
+        self.last_error = last_error
+        super().__init__(f"child '{label}' at {uri} did not accept a connection "
+                         f"within {waited}s (last error: {last_error})")
+
+
+# The node calls an instance ready once the GUEST NETWORK answers, which it
+# learns from ARP/ping against the guest IP. Under a microVM the guest kernel
+# configures that IP during boot, seconds before the service inside it binds its
+# port -- the node's own log names the gap: "instance registered before the
+# guest could call in". A request sent into that gap is refused by a guest that
+# is perfectly healthy, and reading that refusal as a kill turns the node's
+# boot latency into an accusation.
+#
+# So every probe waits for the child's port to accept a connection before it
+# asserts anything. That wait is also what makes the later failures readable: a
+# request that fails AFTER the port was proven open is a child that died in
+# flight, which is the genuine kill signal the memory-ceiling ladder needs.
+CHILD_READY_TIMEOUT_S = int(os.environ.get("CHILD_READY_TIMEOUT_S", "120"))
+CHILD_READY_POLL_S = float(os.environ.get("CHILD_READY_POLL_S", "0.5"))
+
+
+def _spin_child(service_iface, label, wait_ready=True):
+    """Launch one child instance and return it, ready to take requests.
+
+    Any launch failure is raised as ChildLaunchError, and a child that never
+    starts answering as ChildNotReadyError, so callers can tell "the child never
+    ran" and "the child never became reachable" apart from "the child ran and
+    misbehaved". Only the last of those can support a verdict about the node.
+
+    The caller owns the returned instance and must hand it to _release_child;
+    node_controller's own contract is that a taken instance is either returned
+    to its queue or stopped, and a verifier that leaks one bills its parent for
+    a child it has finished measuring.
     """
     try:
         inst = service_iface.get_instance(max_attempts=2)
@@ -309,7 +346,52 @@ def _spin_child(service_iface, label):
         logging.error('Could not spin %s child: %s', label, _describe_launch_failure(e))
         raise ChildLaunchError(label, e) from e
     logging.info('Spun %s child at %s', label, inst.uri)
-    return inst.uri
+    if wait_ready:
+        _wait_until_ready(inst.uri, label)
+    return inst
+
+
+def _wait_until_ready(uri, label, timeout=None):
+    """Block until the child's port accepts a TCP connection.
+
+    A bare connect is the right test: the port opens when the service binds it,
+    which is the exact event the node's readiness signal misses. It costs no
+    application work, so it cannot itself perturb what the probe goes on to
+    measure.
+    """
+    timeout = CHILD_READY_TIMEOUT_S if timeout is None else timeout
+    host, _, port = uri.rpartition(":")
+    deadline = time.monotonic() + timeout
+    last = None
+    while True:
+        try:
+            with socket.create_connection((host, int(port)), timeout=3):
+                logging.info('Child %s at %s is accepting connections', label, uri)
+                return
+        except OSError as e:
+            last = f"{type(e).__name__}: {str(e)[:120]}"
+            if time.monotonic() >= deadline:
+                raise ChildNotReadyError(label, uri, timeout, last)
+            time.sleep(CHILD_READY_POLL_S)
+
+
+def _release_child(service_iface, inst, label):
+    """Stop a child the probe is done with.
+
+    Left running, each child keeps drawing MU from this service's balance for
+    the rest of the run. That is not only waste: it is measured by the
+    mu_accounting probe, whose two windows would otherwise be dominated by the
+    upkeep of children the verifier itself abandoned rather than by the resource
+    ceiling those windows are meant to compare.
+    """
+    if inst is None:
+        return
+    try:
+        inst.stop(service_iface.gateway_stub)
+        logging.info('Released %s child at %s', label, inst.uri)
+    except Exception as e:
+        # A child we could not stop is a leak to report, never a verdict.
+        logging.warning('Could not release %s child at %s: %s', label, inst.uri, e)
 
 
 # ----------------------------------------------------------------------------
@@ -317,9 +399,10 @@ def _spin_child(service_iface, label):
 # ----------------------------------------------------------------------------
 def probe_network_isolation():
     ev = {"probe": "network_isolation"}
+    inst = None
     try:
-        uri = _spin_child(ping_service, "ping")
-        r = requests.get(f"http://{uri}", timeout=45)
+        inst = _spin_child(ping_service, "ping")
+        r = requests.get(f"http://{inst.uri}", timeout=45)
         data = r.json()
         ev.update(data)
         honest = bool(data.get("honest", False))
@@ -335,19 +418,30 @@ def probe_network_isolation():
         ev["verdict"] = VERDICT_INFRA_ERROR
         ev["reason"] = (f"could not observe network isolation: {e}. "
                         "No claim about the node's isolation is made.")
+    except ChildNotReadyError as e:
+        # It ran but never answered: still nothing observed about egress.
+        ev["verdict"] = VERDICT_INFRA_ERROR
+        ev["reason"] = (f"could not observe network isolation: {e}. "
+                        "No claim about the node's isolation is made.")
     except Exception as e:
         ev["verdict"] = VERDICT_INFRA_ERROR
         ev["reason"] = f"probe could not run: {type(e).__name__}: {str(e)[:200]}"
+    finally:
+        _release_child(ping_service, inst, "ping")
     return ev
 
 
 # ----------------------------------------------------------------------------
 # Probe 2 — memory ceiling (heavy child ramped toward the declared at_most)
 # ----------------------------------------------------------------------------
+# Rungs below and above the declared ceiling. One per child, so the length of
+# this list is also how many children a full run of this probe spins.
+MEMORY_LADDER = [64, 128, 200, 240, 300, 400, 512]
+
+
 def probe_memory_ceiling():
     declared_mb = HEAVY_DECLARED_MEM_BYTES // (1024 * 1024)  # 256
-    # rungs below and above the declared ceiling
-    ladder = [64, 128, 200, 240, 300, 400, 512]
+    ladder = MEMORY_LADDER
     ev = {"probe": "memory_ceiling", "declared_ceiling_mb": declared_mb, "attempts": []}
     highest_ok = 0
     first_kill = None
@@ -355,8 +449,10 @@ def probe_memory_ceiling():
     observed_rungs = 0  # rungs where the child actually existed and answered (or died)
     for mb in ladder:
         rung = {"requested_mb": mb}
+        label = f"heavy({mb}MB)"
+        inst = None
         try:
-            uri = _spin_child(heavy_service, f"heavy({mb}MB)")
+            inst = _spin_child(heavy_service, label)
         except ChildLaunchError as e:
             # The child never ran: this rung observed NOTHING. It is not a kill,
             # and it must never feed first_kill (that is what turned a network
@@ -367,8 +463,18 @@ def probe_memory_ceiling():
             launch_failures.append(rung)
             ev["attempts"].append(rung)
             continue
+        except ChildNotReadyError as e:
+            # It ran but never opened its port, so it was never seen allocating
+            # anything either. Same rule: a rung that observed nothing cannot
+            # decide a ceiling, and must never feed first_kill.
+            rung["ok"] = False
+            rung["never_ready"] = True
+            rung["error"] = str(e)[:200]
+            launch_failures.append(rung)
+            ev["attempts"].append(rung)
+            continue
         try:
-            r = requests.get(f"http://{uri}/alloc/{mb}", timeout=60)
+            r = requests.get(f"http://{inst.uri}/alloc/{mb}", timeout=60)
             ok = (r.status_code == 200 and r.json().get("ok") is True)
             rung["ok"] = ok
             rung["cgroup_mem_current"] = r.json().get("cgroup_mem_current") if ok else None
@@ -378,13 +484,18 @@ def probe_memory_ceiling():
             elif first_kill is None:
                 first_kill = mb
         except Exception as e:
-            # The child WAS running and the request died: a genuine kill signal.
+            # The readiness wait already proved this child's port open, so a
+            # request that dies after that is a child that died in flight: the
+            # genuine kill signal. Without the wait, this branch also catches a
+            # connect refused by a guest still booting and calls it a kill.
             rung["ok"] = False
             rung["killed"] = True
             rung["error"] = str(e)[:160]
             observed_rungs += 1
             if first_kill is None:
                 first_kill = mb
+        finally:
+            _release_child(heavy_service, inst, label)
         ev["attempts"].append(rung)
         # Once we've seen a kill above the ceiling we have enough signal.
         if first_kill is not None and mb >= declared_mb:
@@ -404,6 +515,30 @@ def probe_memory_ceiling():
                         f"({launch_failures[0]['error'] if launch_failures else 'unknown'}). "
                         "No claim about the node's memory enforcement is made.")
         return ev
+
+    # A ceiling cannot both kill at `first_kill` and succeed above it. When the
+    # ladder reports that, the two rungs disagree about the same boundary and
+    # neither can be trusted to locate it -- whatever produced the low "kill"
+    # was not the ceiling. Say so instead of picking the reading that happens to
+    # fit: the PASS branch below looks only at highest_ok, and would call an
+    # incoherent ladder correct.
+    if first_kill is not None and first_kill < highest_ok:
+        ev["verdict"] = VERDICT_INCONCLUSIVE
+        ev["reason"] = (f"ladder is self-contradictory: reports a kill at {first_kill} MiB yet "
+                        f"{highest_ok} MiB succeeded. A ceiling cannot be enforced below a "
+                        "request that went through, so these rungs do not locate one. No claim "
+                        "about the node's memory enforcement is made.")
+        return ev
+
+    # Under a microVM the child's entrypoint is PID 1, so the guest kernel has no
+    # killable process when an allocation exceeds the RAM the hypervisor assigned:
+    # it panics ("Attempted to kill init!") instead of OOM-killing the offender.
+    # The ceiling is still enforced -- the allocation does fail -- but "the node
+    # kills the child at the boundary" describes the container model only, and the
+    # evidence should not imply a mechanism that was not the one at work.
+    ev["enforcement_mechanism"] = ("guest_kernel_panic_no_oom_kill"
+                                   if detect_isolation_model() == "microvm"
+                                   else "cgroup_oom_kill")
 
     tol = 0.20  # 20% tolerance around the declared boundary
     low = declared_mb * (1 - tol)
@@ -490,10 +625,18 @@ def probe_resource_provisioning():
 # windows: one holding a LOW resource ceiling and one holding a HIGH ceiling
 # (up to the manifest at_most). An honest node must (a) actually charge — the
 # balance must fall while resources are held — (b) charge MORE when it provisions
-# more, and (c) not drain the whole balance in a single window.
-MU_WINDOW_SECONDS = int(os.environ.get("MU_WINDOW_SECONDS", "30"))
-# Below this window length a zero MU delta is indistinguishable from an honest
-# node rounding a small charge down to zero, so it cannot support an accusation.
+# more, and (c) not take a positive balance to zero inside a single window.
+#
+# Comparing the two windows only works if this service's own ceiling is the only
+# thing that changed between them. Every probe therefore stops its children (see
+# _release_child): each one left running keeps drawing MU from this same balance,
+# and enough of them swamp the difference the two windows exist to measure.
+# Defaulted to the decisive length below, because a window shorter than that
+# yields readings this probe is not allowed to accuse on: a shorter default makes
+# every run pay for two windows it cannot read.
+MU_WINDOW_SECONDS = int(os.environ.get("MU_WINDOW_SECONDS", "60"))
+# Below this window length a small charge is indistinguishable from an honest
+# node's rounding, so no reading from it can support an accusation.
 MU_MIN_DECISIVE_WINDOW_SECONDS = int(os.environ.get("MU_MIN_DECISIVE_WINDOW_SECONDS", "60"))
 MU_LOW_CEILING = 64 * 1024 * 1024                      # 64 MiB
 MU_HIGH_CEILING = SELF_DECLARED_MEM_BYTES              # this service's declared at_most
@@ -527,38 +670,59 @@ def probe_mu_accounting():
         ev["spent_high_mu"] = spent_high
 
         charging = (spent_low > 0) or (spent_high > 0)
-        drained = (b1_low is not None and b1_low <= 0) or (b1_high is not None and b1_high <= 0)
+        # "Drained" has to mean the window did the draining. A balance that was
+        # already at or below zero when the window opened was not spent by this
+        # node during it -- operators run nodes with `costs.ALLOW_DEBT` enabled,
+        # where a negative balance is the configured policy and says nothing
+        # about how much was charged. Testing only the closing balance accuses
+        # every node in debt, for a drain that predates the measurement.
+        ev["started_in_debt"] = (b0_low <= 0) or (b0_high <= 0)
+        drained = (b0_low > 0 >= b1_low) or (b0_high > 0 >= b1_high)
         scales = spent_high >= spent_low
+        # One gate for every accusing branch. A window too short to tell a real
+        # charge from rounding is too short to price one ceiling against another
+        # as well, so the caution the zero-spend branch needs applies to all
+        # of them.
+        decisive = MU_WINDOW_SECONDS >= MU_MIN_DECISIVE_WINDOW_SECONDS
+        too_coarse = (f"a {MU_WINDOW_SECONDS}s window is below the "
+                      f"{MU_MIN_DECISIVE_WINDOW_SECONDS}s needed for MU movement to be reliably "
+                      "distinguishable from rounding. No accounting claim is made "
+                      "(raise MU_WINDOW_SECONDS to decide)")
 
         if not charging:
             # A zero spend is NOT proof of a free ride: with a short window and a
             # low rate an honest node can legitimately round the charge down to
-            # zero. Only accuse when the window is long enough that a genuine
-            # charge had to be visible; otherwise say the measurement was too
-            # coarse to decide.
-            if MU_WINDOW_SECONDS >= MU_MIN_DECISIVE_WINDOW_SECONDS:
+            # zero.
+            if decisive:
                 ev["verdict"] = VERDICT_DISHONEST
                 ev["reason"] = (f"node deducted 0 MU while holding resources for "
                                 f"{MU_WINDOW_SECONDS}s at both ceilings — usage is not being "
                                 "accounted (free ride / broken metering)")
             else:
                 ev["verdict"] = VERDICT_INCONCLUSIVE
-                ev["reason"] = (f"no MU movement over a {MU_WINDOW_SECONDS}s window; that is below "
-                                f"the {MU_MIN_DECISIVE_WINDOW_SECONDS}s needed for a charge to be "
-                                "reliably distinguishable from rounding. No accounting claim is "
-                                "made (raise MU_WINDOW_SECONDS to decide).")
+                ev["reason"] = f"no MU movement over a {MU_WINDOW_SECONDS}s window; {too_coarse}."
         elif drained:
-            ev["verdict"] = VERDICT_DISHONEST
-            ev["reason"] = ("node drained the balance to <= 0 within a single window — "
-                            "spending MU far in excess of usage (overcharging)")
+            if decisive:
+                ev["verdict"] = VERDICT_DISHONEST
+                ev["reason"] = ("node took the balance from positive to <= 0 within a single "
+                                "window — spending MU far in excess of usage (overcharging)")
+            else:
+                ev["verdict"] = VERDICT_INCONCLUSIVE
+                ev["reason"] = f"balance crossed into debt during the window, but {too_coarse}."
         elif not scales:
-            ev["verdict"] = VERDICT_DISHONEST
-            ev["reason"] = (f"MU spend does not track resource usage: low ceiling spent {spent_low} MU "
-                            f"but high ceiling spent only {spent_high} MU over {MU_WINDOW_SECONDS}s")
+            if decisive:
+                ev["verdict"] = VERDICT_DISHONEST
+                ev["reason"] = (f"MU spend does not track resource usage: low ceiling spent {spent_low} MU "
+                                f"but high ceiling spent only {spent_high} MU over {MU_WINDOW_SECONDS}s")
+            else:
+                ev["verdict"] = VERDICT_INCONCLUSIVE
+                ev["reason"] = (f"spend did not rise with the ceiling ({spent_low} MU low vs "
+                                f"{spent_high} MU high), but {too_coarse}.")
         else:
             ev["verdict"] = VERDICT_PASS
             ev["reason"] = (f"node spent MU in line with usage: {spent_low} MU at low ceiling <= "
-                            f"{spent_high} MU at high ceiling over {MU_WINDOW_SECONDS}s, balance never drained")
+                            f"{spent_high} MU at high ceiling over {MU_WINDOW_SECONDS}s, balance never "
+                            "crossed into debt during a window")
     except Exception as e:
         # modify_resources is the one call that propagates the real gRPC status, so
         # an exception here is never an accusation -- but it is not automatically an
@@ -599,9 +763,10 @@ def probe_dependency_identity():
     mismatches, not_observed, verified = [], [], 0
     for tag, iface, expected_identity in DEP_IDENTITY:
         c = {"requested": tag, "expected_identity": expected_identity}
+        inst = None
         try:
-            uri = _spin_child(iface, tag)
-            r = requests.get(f"http://{uri}/whoami", timeout=45)
+            inst = _spin_child(iface, tag)
+            r = requests.get(f"http://{inst.uri}/whoami", timeout=45)
             data = r.json()
             c["executed"] = data.get("service")
             c["identity"] = data.get("identity")
@@ -615,12 +780,20 @@ def probe_dependency_identity():
             c["launch_failed"] = True
             c["error"] = str(e)[:200]
             not_observed.append(tag)
+        except ChildNotReadyError as e:
+            # Ran but never answered -> still nothing observed about identity.
+            c["match"] = None
+            c["never_ready"] = True
+            c["error"] = str(e)[:200]
+            not_observed.append(tag)
         except Exception as e:
             # Ran but we could not read its identity: still not a substitution.
             c["match"] = None
             c["unreachable"] = True
             c["error"] = str(e)[:160]
             not_observed.append(tag)
+        finally:
+            _release_child(iface, inst, tag)
         ev["checks"].append(c)
 
     ev["verified_count"] = verified
@@ -678,12 +851,13 @@ def _collect_observe_events(instance_id, out, stop_flag):
 
 def probe_dependency_observe():
     ev = {"probe": "dependency_observe"}
+    inst = None
     try:
         # The network dependency (ping) is where connectivity fraud matters most.
-        try:
-            inst = ping_service.get_instance(max_attempts=2)
-        except Exception as e:
-            raise ChildLaunchError("ping", e) from e
+        # Spun through _spin_child so this probe gets the same readiness wait as
+        # the others: Observe can only corroborate a connectivity claim the
+        # dependency actually got far enough to make.
+        inst = _spin_child(ping_service, "ping")
         instance_id = getattr(inst, "token", None)
         ev["dependency"] = "ping"
         ev["instance_id_used"] = instance_id
@@ -768,12 +942,14 @@ def probe_dependency_observe():
         else:
             ev["verdict"] = VERDICT_INCONCLUSIVE
             ev["reason"] = "no packets observed and no connectivity claim to corroborate"
-    except ChildLaunchError as e:
+    except (ChildLaunchError, ChildNotReadyError) as e:
         ev["verdict"] = VERDICT_INFRA_ERROR
         ev["reason"] = f"observe probe could not run: {e}"
     except Exception as e:
         ev["verdict"] = VERDICT_INFRA_ERROR
         ev["reason"] = f"observe probe could not run: {type(e).__name__}: {str(e)[:180]}"
+    finally:
+        _release_child(ping_service, inst, "ping")
     return ev
 
 
