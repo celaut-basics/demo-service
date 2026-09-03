@@ -17,6 +17,7 @@ the gateway and the child services are all stubbed at import time.
 """
 import json
 import os
+import socket
 import sys
 import types
 import unittest
@@ -26,6 +27,23 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 
 
+# Every probe waits for a child's port to accept a connection before it asserts
+# anything, so the stubs need real ports to answer that wait: one that listens
+# and one that refuses. Stubbing the wait away would leave untested the very
+# distinction it exists to draw -- a child that never came up (observed nothing)
+# versus one that died mid-request (a genuine kill).
+_LISTENER = socket.socket()
+_LISTENER.bind(("127.0.0.1", 0))
+_LISTENER.listen(64)
+LISTENING_URI = "127.0.0.1:%d" % _LISTENER.getsockname()[1]
+
+_closed = socket.socket()
+_closed.bind(("127.0.0.1", 0))
+_CLOSED_PORT = _closed.getsockname()[1]
+_closed.close()
+CLOSED_URI = "127.0.0.1:%d" % _CLOSED_PORT
+
+
 # ---------------------------------------------------------------------------
 # Stub out everything app.py touches at import time.
 # ---------------------------------------------------------------------------
@@ -33,25 +51,37 @@ def _install_stubs(tmpdir):
     """Fake node_controller + bee_rpc so app.py imports with no node present."""
 
     class _Instance:
-        def __init__(self, uri="127.0.0.1:3030", token="inst-token"):
-            self.uri = uri
+        def __init__(self, uri=None, token="inst-token"):
+            self.uri = uri or LISTENING_URI
             self.token = token
+
+        def stop(self, gateway_stub):
+            FakeServiceInterface.stopped.append(self.uri)
 
     class FakeServiceInterface:
         """Mimics node_controller's ServiceInterface.
 
         launch_mode:
           "unbound_local" -> reproduce the observed library bug verbatim
-          "ok"            -> hand back a live instance
+          "ok"            -> hand back a live instance, on a port that answers
+          "never_ready"   -> hand back an instance whose port never opens: the
+                             shape of a microVM the node reports ready before the
+                             service inside it has bound anything
         """
         launch_mode = "unbound_local"
+        # Every uri handed to stop(), so tests can assert children are released.
+        stopped = []
 
         def __init__(self, service_hash=None, config=None):
             self.service_hash = service_hash
+            # Real ServiceInterfaces carry the stub _release_child stops through.
+            self.gateway_stub = object()
 
         def get_instance(self, max_attempts=1):
             if FakeServiceInterface.launch_mode == "ok":
                 return _Instance()
+            if FakeServiceInterface.launch_mode == "never_ready":
+                return _Instance(uri=CLOSED_URI)
             # Verbatim shape of the real failure: node_controller's
             # launch_instance() swallows every grpc.RpcError into debug() and
             # then executes `return instance` with the name never assigned.
@@ -408,6 +438,134 @@ class MuAccountingRoundingTests(unittest.TestCase):
             ev = app.probe_mu_accounting()
         self.assertEqual(ev["verdict"], app.VERDICT_DISHONEST)
         self.assertIn("free ride", ev["reason"])
+
+
+class DebtIsNotOverchargingTests(unittest.TestCase):
+    """The live false positive: an operator's node was called DISHONEST for a
+    balance that was already negative before the measurement began.
+
+    Numbers are the ones the `eager-jungle` instance reported. `costs.ALLOW_DEBT`
+    is a supported node setting, so a balance below zero is that node's configured
+    policy -- not evidence about what it charged during the window.
+    """
+
+    def setUp(self):
+        FakeController.rpc_mode = "ok"
+
+    @staticmethod
+    def _samples(seq):
+        """_sample_mu_balance returns the next balance on each call."""
+        it = iter(seq)
+        return lambda min_b, max_b: (next(it), {})
+
+    def test_a_balance_already_in_debt_is_not_an_accusation(self):
+        balances = [-1316921755, -1317120138, -1317130138, -1317256207]
+        with mock.patch.object(app, "MU_WINDOW_SECONDS", 0), \
+             mock.patch.object(app, "MU_MIN_DECISIVE_WINDOW_SECONDS", 0), \
+             mock.patch.object(app, "_sample_mu_balance", self._samples(balances)):
+            ev = app.probe_mu_accounting()
+        self.assertTrue(ev["started_in_debt"])
+        # It spent more at the low ceiling than the high one, so this run is not
+        # a PASS either -- but the claim it makes must be about that, never about
+        # a drain that happened before anyone was watching.
+        self.assertNotIn("drained", ev["reason"])
+        self.assertNotIn("<= 0", ev["reason"])
+
+    def test_crossing_from_positive_into_debt_is_still_dishonest(self):
+        # 10^8 down to -1 in one window: the node really did take a funded
+        # balance to nothing while holding resources.
+        balances = [10 ** 8, -1, 10 ** 8, 10 ** 8 - 1]
+        with mock.patch.object(app, "MU_WINDOW_SECONDS", 0), \
+             mock.patch.object(app, "MU_MIN_DECISIVE_WINDOW_SECONDS", 0), \
+             mock.patch.object(app, "_sample_mu_balance", self._samples(balances)):
+            ev = app.probe_mu_accounting()
+        self.assertEqual(ev["verdict"], app.VERDICT_DISHONEST)
+        self.assertIn("positive", ev["reason"])
+
+    def test_a_short_window_cannot_accuse_on_scaling_either(self):
+        # Spend that does not rise with the ceiling is the other accusing branch.
+        # Below the decisive length it must degrade, exactly as zero spend does.
+        balances = [10 ** 8, 10 ** 8 - 500, 10 ** 8, 10 ** 8 - 10]
+        with mock.patch.object(app, "MU_WINDOW_SECONDS", 0), \
+             mock.patch.object(app, "MU_MIN_DECISIVE_WINDOW_SECONDS", 60), \
+             mock.patch.object(app, "_sample_mu_balance", self._samples(balances)):
+            ev = app.probe_mu_accounting()
+        self.assertEqual(ev["verdict"], app.VERDICT_INCONCLUSIVE)
+        self.assertNotIn(ev["verdict"], app.ACCUSING_VERDICTS)
+
+    def test_the_shipped_window_is_long_enough_to_decide(self):
+        # A default that cannot decide makes every unconfigured run pay for two
+        # windows and then declare itself unable to read them.
+        self.assertGreaterEqual(app.MU_WINDOW_SECONDS, app.MU_MIN_DECISIVE_WINDOW_SECONDS)
+
+
+class ChildReadinessTests(unittest.TestCase):
+    """The node calls a microVM ready when its guest network answers, seconds
+    before the service inside it binds a port. Probes must wait for the port,
+    and must never read the gap as the child being killed.
+    """
+
+    def setUp(self):
+        FakeController.rpc_mode = "ok"
+        FakeServiceInterface.stopped = []
+
+    def tearDown(self):
+        FakeServiceInterface.launch_mode = "ok"
+
+    def test_a_child_that_never_opens_its_port_raises_not_ready(self):
+        FakeServiceInterface.launch_mode = "never_ready"
+        with mock.patch.object(app, "CHILD_READY_TIMEOUT_S", 0), \
+             mock.patch.object(app, "CHILD_READY_POLL_S", 0):
+            with self.assertRaises(app.ChildNotReadyError):
+                app._spin_child(app.heavy_service, "heavy")
+
+    def test_a_booting_child_is_not_recorded_as_a_kill(self):
+        FakeServiceInterface.launch_mode = "never_ready"
+        with mock.patch.object(app, "CHILD_READY_TIMEOUT_S", 0), \
+             mock.patch.object(app, "CHILD_READY_POLL_S", 0):
+            ev = app.probe_memory_ceiling()
+        self.assertEqual(ev["verdict"], app.VERDICT_INFRA_ERROR)
+        self.assertIsNone(ev["first_kill_mb"])
+        self.assertTrue(all(r.get("never_ready") for r in ev["attempts"]))
+        self.assertNotIn(ev["verdict"], app.ACCUSING_VERDICTS)
+
+    def test_probes_stop_the_children_they_spin(self):
+        # A child left running keeps billing this service's balance -- which is
+        # what mu_accounting measures -- and node_controller's own contract is
+        # that a taken instance is returned to its queue or stopped.
+        FakeServiceInterface.launch_mode = "ok"
+
+        def fake_get(url, timeout=None):
+            r = mock.Mock()
+            r.status_code = 200
+            r.json.return_value = {"ok": True, "cgroup_mem_current": 1}
+            return r
+
+        with mock.patch.object(app.requests, "get", fake_get):
+            app.probe_memory_ceiling()
+        self.assertEqual(len(FakeServiceInterface.stopped), len(app.MEMORY_LADDER))
+
+    def test_a_self_contradictory_ladder_decides_nothing(self):
+        # A kill below a request that succeeded does not locate a ceiling. The
+        # PASS branch reads only the highest success, so it would call this run
+        # correct on evidence that cannot hold together.
+        FakeServiceInterface.launch_mode = "ok"
+        answers = {64: None, 128: True, 200: True, 240: True, 300: None}
+
+        def fake_get(url, timeout=None):
+            mb = int(url.rsplit("/", 1)[1])
+            if answers.get(mb) is None:
+                raise ConnectionError("connection aborted")
+            r = mock.Mock()
+            r.status_code = 200
+            r.json.return_value = {"ok": True, "cgroup_mem_current": 1}
+            return r
+
+        with mock.patch.object(app.requests, "get", fake_get):
+            ev = app.probe_memory_ceiling()
+        self.assertEqual(ev["verdict"], app.VERDICT_INCONCLUSIVE)
+        self.assertNotIn(ev["verdict"], app.ACCUSING_VERDICTS)
+        self.assertIn("self-contradictory", ev["reason"])
 
 
 class ObserveCorroborationTests(unittest.TestCase):
