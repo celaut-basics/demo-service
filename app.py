@@ -183,8 +183,13 @@ controller = Controller(debug=lambda s: logging.info('Node Controller: %s', s),
 node_url: str = controller.get_node_url()
 mem_limit: int = controller.get_mem_limit_at_start()
 
-# initial_mu the orchestrator asked the node to fund the heavy child with.
-HEAVY_INITIAL_MU = pow(10, 8)
+# initial_mu the orchestrator asks the node to fund each child with, credited
+# to the CHILD's own balance so it can survive its own probe traffic (heavy's
+# multi-rung alloc ladder, ping's egress checks) without going into debt.
+# Raised from the original 1e8: that was sized for a single call, not several
+# children spun back-to-back by the same probe suite.
+HEAVY_INITIAL_MU = 5 * pow(10, 8)
+PING_INITIAL_MU = 2 * pow(10, 8)
 
 resources = {"mem_limit": mem_limit}
 balance_mu = 0
@@ -194,7 +199,10 @@ heavy_service = controller.add_service(
     service_hash=HEAVY_SERVICE,
     config=celaut_pb2.Configuration(initial_mu=to_amount(HEAVY_INITIAL_MU))
 )
-ping_service = controller.add_service(service_hash=PING_SERVICE)
+ping_service = controller.add_service(
+    service_hash=PING_SERVICE,
+    config=celaut_pb2.Configuration(initial_mu=to_amount(PING_INITIAL_MU))
+)
 
 services = []
 logging.info('Gateway main directory: %s', node_url)
@@ -1566,6 +1574,9 @@ if __name__ == '__main__':
     # in the background so Flask still binds immediately. Results are served at
     # /startup_tests, in the report card, and via the MCP get_startup_tests tool.
     start_startup_tests_async()
+    # debug=False: the Werkzeug interactive debugger is a remote-code-execution
+    # risk on a service that is reachable over the network, PIN or not -- this
+    # is an attestation service, not a local dev server.
     # use_reloader=False: the reloader would fork a second process and spin the
     # child services (and the startup tests) twice.
-    app.run(host='0.0.0.0', port=5000, debug=True, use_reloader=False)
+    app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)

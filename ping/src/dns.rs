@@ -648,6 +648,25 @@ fn start_dns_server(config_data_from_protobuf: Vec<ExtractedInfo>) -> std::io::R
     let udp_socket = UdpSocket::bind(listen_address)?; // This may require root/administrator privileges
     println!("DNS server listening on {}", listen_address);
 
+    // Point the guest's own resolver at this server. Nothing else does: the
+    // base image's /etc/resolv.conf is whatever the Docker build left behind
+    // (typically an external or docker-internal resolver, unreachable once
+    // the node's default-deny egress policy is in effect here), and nodo's
+    // microVM boot has no container runtime to rewrite it for us the way
+    // `docker run` would. Without this, reqwest's system resolver queries
+    // that stale, unreachable server and every request times out -- not just
+    // the undeclared one, which is the bug this fixes: `google.com` (declared,
+    // node-resolved, firewalled open) was failing DNS before it ever got to
+    // the connection the firewall actually governs. The socket above is
+    // already bound, so no query sent the instant this file changes is lost.
+    if let Err(e) = std::fs::write("/etc/resolv.conf", "nameserver 127.0.0.1\n") {
+        eprintln!(
+            "Could not point /etc/resolv.conf at the local DNS server: {}. \
+             Outbound requests will keep using whatever resolver the image shipped with.",
+            e
+        );
+    }
+
     // Buffer for receiving incoming UDP packets. DNS over UDP is typically limited to 512 bytes
     // unless EDNS is used (which this server does not implement).
     let mut incoming_packet_buffer = [0u8; 512];

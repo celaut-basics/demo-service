@@ -285,6 +285,33 @@ probe is blind, the report degrades instead:
 `HONEST` / `DISHONEST` / `UNVERIFIED` — and `UNVERIFIED` deliberately **not**
 painted in the dishonest colour: an unverified node is not a guilty node.
 
+## Funding the instance
+
+A full attestation run launches `heavy` up to eight times (the seven-rung
+memory ladder plus `dependency_identity`) and `tiny`/`ping` once each per
+probe that uses them. Each launch is charged against **this** instance's own
+balance, at whatever `heavy`/`tiny`/`ping` cost the node to run -- observed on
+a real node at roughly 0.5 ERG per `heavy` launch (256 MiB, `HEAVY_INITIAL_MU`
+funding its own account). A demo instance funded only at the node's default
+(sized off its own modest `resources.at_init`) runs out partway through the
+ladder and reports the remaining rungs `INFRA_ERROR` — not a node fault, just
+an underfunded verifier. Before triggering `/attestation.json`, top up the
+instance's deposit for headroom across a full run:
+
+```bash
+nodo increase_deposit <instance id> 5   # ERG; adjust to the node's actual prices
+```
+
+`HEAVY_INITIAL_MU` and `PING_INITIAL_MU` (`app.py`) size what each child is
+credited with on launch, not what this orchestrator itself is funded with --
+that answer is `demo/.service/service.json`'s own declared `resources.at_init`
+plus whatever deposit the operator adds after `nodo execute`. Declaring a
+much larger `at_init` here to buy more auto-funding was deliberately rejected:
+this manifest is also what other nodes and peers read to decide whether they
+can host the service, and inflating it past what this Flask orchestrator
+actually needs to hold in memory would misrepresent it -- the honest lever is
+the deposit, not the manifest.
+
 ## Files changed
 
 - `app.py` — probe battery (`probe_network_isolation`, `probe_memory_ceiling`,
@@ -298,6 +325,14 @@ painted in the dishonest colour: an unverified node is not a guilty node.
   verdicts derived from the node-provided allow-list.
 - `ping/src/dns.rs` — `pub fn resolved_tags()` reusing the existing protobuf
   parser to surface the node-granted egress tags.
+- `.service/service.json` — `resources.at_init`/`at_most` raised (1 GiB/5 GiB
+  → 2 GiB/8 GiB mem/disk) to give this orchestrator headroom for holding the
+  probe suite's working set; see "Funding the instance" for why this is not
+  the lever for `heavy`/`ping` launch costs.
+- `app.py` — `debug=False` on `app.run()`: the Werkzeug interactive debugger
+  is a remote-code-execution risk on a network-reachable service. Also raised
+  `HEAVY_INITIAL_MU` and added `PING_INITIAL_MU` so each child survives its
+  own probe traffic on its own balance instead of going into debt.
 
 ## Live validation against a real node
 
