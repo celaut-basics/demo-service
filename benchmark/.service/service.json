@@ -1,0 +1,24 @@
+{
+    "tag": "benchmark",
+    "api": [
+        {
+            "port": 3030,
+            "protocol": [
+                "http"
+            ]
+        }
+    ],
+    "architecture": "linux/arm64",
+    "entrypoint": "/benchmark/serve",
+    "envs": [],
+    "resources": {
+        "at_init": {
+            "mem_limit": 2147483648,
+            "disk_space": 200000000
+        },
+        "at_most": {
+            "mem_limit": 2147483648,
+            "disk_space": 200000000
+        }
+    }
+}
