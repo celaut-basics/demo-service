@@ -1,0 +1,4 @@
+#!/bin/sh
+# Entrypoint: busybox httpd in the foreground, serving the CGI endpoints under
+# /cgi-bin/ (see www/cgi-bin/). Port 3030, like the other demo-service variants.
+exec httpd -f -p "${PORT:-3030}" -h "$(dirname "$0")/www"

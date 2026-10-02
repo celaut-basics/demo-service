@@ -1,0 +1,55 @@
+#!/bin/sh
+# GET /cgi-bin/benchmark[?working_set_bytes=<bytes>]
+#
+# Runs bench.sh and answers with its scores as one JSON object, e.g.
+#
+#   {"architecture":"linux/amd64","int_ops_per_sec":...,"flt_ops_per_sec":...,
+#    "mem_bandwidth_bytes_per_sec":...,"mem_bandwidth_working_set_bytes":1073741824,
+#    "sha256_hashes_per_sec":...,"skipped":[]}
+#
+# `working_set_bytes` is the memory-bandwidth working set; omitted, it is the
+# pinned default (bench.sh, DEFAULT_WORKING_SET_BYTES). It always comes back as
+# `mem_bandwidth_working_set_bytes`, because a bandwidth is only comparable
+# with another one measured over the same amount of memory.
+#
+# One run at a time: two concurrent runs would each measure half a machine. A
+# second request while one is in flight gets 409 rather than a wrong answer.
+
+HERE=$(cd "$(dirname "$0")/../.." && pwd)
+BENCH_LIB=1 . "$HERE/bench.sh"
+
+respond() {
+    # busybox httpd passes a CGI's output through untouched when it starts with
+    # a status line, and otherwise prepends "200 OK" -- so a non-200 answer
+    # has to write its own.
+    printf 'HTTP/1.1 %s\r\nContent-Type: application/json\r\nCache-Control: no-store\r\n\r\n%s\n' "$1" "$2"
+}
+
+json_error() {
+    _msg=$(printf '%s' "$2" | sed 's/\\/\\\\/g; s/"/\\"/g')
+    respond "$1" "{\"error\":\"$_msg\"}"
+}
+
+working_set=""
+_IFS=$IFS
+IFS='&'
+for pair in $QUERY_STRING; do
+    case "$pair" in
+        working_set_bytes=*) working_set=${pair#working_set_bytes=} ;;
+    esac
+done
+IFS=$_IFS
+
+if ! parse_working_set "$working_set"; then
+    json_error "400 Bad Request" "$WORKING_SET_ERROR"
+    exit 0
+fi
+
+lock="$BENCH_TMP/benchmark.lock"
+if ! mkdir "$lock" 2>/dev/null; then
+    json_error "409 Conflict" "a benchmark is already running on this instance; retry when it finishes"
+    exit 0
+fi
+trap 'rmdir "$lock"' EXIT
+
+respond "200 OK" "$(run_all "$WORKING_SET" | render_json)"

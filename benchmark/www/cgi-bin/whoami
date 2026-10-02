@@ -1,0 +1,4 @@
+#!/bin/sh
+# Identity endpoint, as on the other demo-service variants: lets whoever launched
+# this service confirm the dependency it asked for is the one that answered.
+printf 'Content-Type: application/json\r\n\r\n{"service":"benchmark","identity":"celaut-demo-benchmark","role":"node-benchmark"}\n'
