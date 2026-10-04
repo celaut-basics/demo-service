@@ -17,165 +17,15 @@ the gateway and the child services are all stubbed at import time.
 """
 import json
 import os
-import socket
 import sys
-import types
+import time
 import unittest
 from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-ROOT = os.path.dirname(HERE)
-
-
-# Every probe waits for a child's port to accept a connection before it asserts
-# anything, so the stubs need real ports to answer that wait: one that listens
-# and one that refuses. Stubbing the wait away would leave untested the very
-# distinction it exists to draw -- a child that never came up (observed nothing)
-# versus one that died mid-request (a genuine kill).
-_LISTENER = socket.socket()
-_LISTENER.bind(("127.0.0.1", 0))
-_LISTENER.listen(64)
-LISTENING_URI = "127.0.0.1:%d" % _LISTENER.getsockname()[1]
-
-_closed = socket.socket()
-_closed.bind(("127.0.0.1", 0))
-_CLOSED_PORT = _closed.getsockname()[1]
-_closed.close()
-CLOSED_URI = "127.0.0.1:%d" % _CLOSED_PORT
-
-
-# ---------------------------------------------------------------------------
-# Stub out everything app.py touches at import time.
-# ---------------------------------------------------------------------------
-def _install_stubs(tmpdir):
-    """Fake node_controller + bee_rpc so app.py imports with no node present."""
-
-    class _Instance:
-        def __init__(self, uri=None, token="inst-token"):
-            self.uri = uri or LISTENING_URI
-            self.token = token
-
-        def stop(self, gateway_stub):
-            FakeServiceInterface.stopped.append(self.uri)
-
-    class FakeServiceInterface:
-        """Mimics node_controller's ServiceInterface.
-
-        launch_mode:
-          "unbound_local" -> reproduce the observed library bug verbatim
-          "ok"            -> hand back a live instance, on a port that answers
-          "never_ready"   -> hand back an instance whose port never opens: the
-                             shape of a microVM the node reports ready before the
-                             service inside it has bound anything
-        """
-        launch_mode = "unbound_local"
-        # Every uri handed to stop(), so tests can assert children are released.
-        stopped = []
-
-        def __init__(self, service_hash=None, config=None):
-            self.service_hash = service_hash
-            # Real ServiceInterfaces carry the stub _release_child stops through.
-            self.gateway_stub = object()
-
-        def get_instance(self, max_attempts=1):
-            if FakeServiceInterface.launch_mode == "ok":
-                return _Instance()
-            if FakeServiceInterface.launch_mode == "never_ready":
-                return _Instance(uri=CLOSED_URI)
-            # Verbatim shape of the real failure: node_controller's
-            # launch_instance() swallows every grpc.RpcError into debug() and
-            # then executes `return instance` with the name never assigned.
-            raise UnboundLocalError(
-                "cannot access local variable 'instance' where it is not "
-                "associated with a value")
-
-    class FakeController:
-        rpc_mode = "unavailable"  # or "ok"
-
-        def __init__(self, *a, **kw):
-            pass
-
-        def get_node_url(self):
-            return "192.168.200.1:58443"
-
-        def get_mem_limit_at_start(self):
-            return 1000000000
-
-        def add_service(self, service_hash=None, config=None):
-            return FakeServiceInterface(service_hash, config)
-
-        def modify_resources(self, spec):
-            if FakeController.rpc_mode == "ok":
-                return ({"mem_limit": 1000000000}, 10 ** 8)
-            if FakeController.rpc_mode == "node_error":
-                # Verbatim shape of the live failure the node returns when it
-                # cannot charge the caller: the gateway ANSWERED, with a status
-                # and its own details string. Reachability is not in question.
-                raise RuntimeError(
-                    "_MultiThreadedRendezvous: <_MultiThreadedRendezvous of RPC that "
-                    "terminated with:\n\tstatus = StatusCode.UNKNOWN\n\tdetails = "
-                    '"Exception iterating responses: Error charging for the resource '
-                    'change of ipv4:192.168.200.38:49254"\n>')
-            raise RuntimeError(
-                "StatusCode.UNAVAILABLE failed to connect to all addresses; "
-                "last error: UNKNOWN: ipv4:192.168.200.1:58443: Failed to connect")
-
-    nc = types.ModuleType("node_controller")
-    nc_controller = types.ModuleType("node_controller.controller")
-    nc_controller_controller = types.ModuleType("node_controller.controller.controller")
-    nc_controller_controller.Controller = FakeController
-
-    nc_gateway = types.ModuleType("node_controller.gateway")
-    nc_protos = types.ModuleType("node_controller.gateway.protos")
-    celaut_pb2 = types.ModuleType("node_controller.gateway.protos.celaut_pb2")
-    celaut_pb2.Configuration = lambda **kw: {"config": kw}
-    celaut_pb2.ObserveRequest = lambda **kw: {"observe": kw}
-    celaut_pb2.ObserveEvent = object
-    nc_protos.celaut_pb2 = celaut_pb2
-
-    nc_utils = types.ModuleType("node_controller.gateway.utils")
-    nc_utils.to_amount = lambda v: v
-    nc_utils.from_amount = lambda v: v
-
-    nc_comm = types.ModuleType("node_controller.gateway.communication")
-    nc_comm.generate_gateway_stub = lambda url: object()
-
-    bee = types.ModuleType("bee_rpc")
-    bee_client = types.ModuleType("bee_rpc.client")
-    bee_client.client_grpc = lambda **kw: iter(())
-    bee.client = bee_client
-
-    for name, mod in [
-        ("node_controller", nc),
-        ("node_controller.controller", nc_controller),
-        ("node_controller.controller.controller", nc_controller_controller),
-        ("node_controller.gateway", nc_gateway),
-        ("node_controller.gateway.protos", nc_protos),
-        ("node_controller.gateway.protos.celaut_pb2", celaut_pb2),
-        ("node_controller.gateway.utils", nc_utils),
-        ("node_controller.gateway.communication", nc_comm),
-        ("bee_rpc", bee),
-        ("bee_rpc.client", bee_client),
-    ]:
-        sys.modules[name] = mod
-
-    # app.py reads "<DIR>/.dependencies" at import time.
-    svc = os.path.join(tmpdir, "service")
-    os.makedirs(svc, exist_ok=True)
-    with open(os.path.join(svc, ".dependencies"), "w") as fh:
-        fh.write("TINY=tinyhash\nHEAVY=heavyhash\nPING=pinghash\nBENCHMARK=benchmarkhash\n")
-
-    return FakeServiceInterface, FakeController
-
-
-import tempfile  # noqa: E402
-
-_TMP = tempfile.mkdtemp(prefix="verifier-tests-")
-FakeServiceInterface, FakeController = _install_stubs(_TMP)
-
-os.chdir(_TMP)
-sys.path.insert(0, ROOT)
-import app  # noqa: E402
+sys.path.insert(0, HERE)
+from harness import (  # noqa: E402
+    ROOT, LISTENING_URI, CLOSED_URI, FakeServiceInterface, FakeController, app)
 
 
 class BlindNodeTests(unittest.TestCase):
@@ -460,7 +310,8 @@ class DebtIsNotOverchargingTests(unittest.TestCase):
         return lambda min_b, max_b: (next(it), {})
 
     def test_a_balance_already_in_debt_is_not_an_accusation(self):
-        balances = [-1316921755, -1317120138, -1317130138, -1317256207]
+        balances = [-1316921755, -1317120138, -1317130138, -1317256207,
+                    -1317266207, -1317464590]
         with mock.patch.object(app, "MU_WINDOW_SECONDS", 0), \
              mock.patch.object(app, "MU_MIN_DECISIVE_WINDOW_SECONDS", 0), \
              mock.patch.object(app, "_sample_mu_balance", self._samples(balances)):
@@ -475,7 +326,7 @@ class DebtIsNotOverchargingTests(unittest.TestCase):
     def test_crossing_from_positive_into_debt_is_still_dishonest(self):
         # 10^8 down to -1 in one window: the node really did take a funded
         # balance to nothing while holding resources.
-        balances = [10 ** 8, -1, 10 ** 8, 10 ** 8 - 1]
+        balances = [10 ** 8, -1, 10 ** 8, 10 ** 8 - 1, 10 ** 8, 10 ** 8 - 1]
         with mock.patch.object(app, "MU_WINDOW_SECONDS", 0), \
              mock.patch.object(app, "MU_MIN_DECISIVE_WINDOW_SECONDS", 0), \
              mock.patch.object(app, "_sample_mu_balance", self._samples(balances)):
@@ -486,7 +337,7 @@ class DebtIsNotOverchargingTests(unittest.TestCase):
     def test_a_short_window_cannot_accuse_on_scaling_either(self):
         # Spend that does not rise with the ceiling is the other accusing branch.
         # Below the decisive length it must degrade, exactly as zero spend does.
-        balances = [10 ** 8, 10 ** 8 - 500, 10 ** 8, 10 ** 8 - 10]
+        balances = [10 ** 8, 10 ** 8 - 500, 10 ** 8, 10 ** 8 - 10, 10 ** 8, 10 ** 8 - 500]
         with mock.patch.object(app, "MU_WINDOW_SECONDS", 0), \
              mock.patch.object(app, "MU_MIN_DECISIVE_WINDOW_SECONDS", 60), \
              mock.patch.object(app, "_sample_mu_balance", self._samples(balances)):
@@ -495,9 +346,62 @@ class DebtIsNotOverchargingTests(unittest.TestCase):
         self.assertNotIn(ev["verdict"], app.ACCUSING_VERDICTS)
 
     def test_the_shipped_window_is_long_enough_to_decide(self):
-        # A default that cannot decide makes every unconfigured run pay for two
+        # A default that cannot decide makes every unconfigured run pay for the
         # windows and then declare itself unable to read them.
         self.assertGreaterEqual(app.MU_WINDOW_SECONDS, app.MU_MIN_DECISIVE_WINDOW_SECONDS)
+
+
+class MuScalingNoiseTests(unittest.TestCase):
+    """The live false positive at startup: low 216090 MU vs high 184932 MU over
+    60 s was called DISHONEST, on a node every later run found honest. Memory is
+    ~10-15% of the bill, so one heavy window outweighs the whole signal."""
+
+    def setUp(self):
+        FakeController.rpc_mode = "ok"
+
+    @staticmethod
+    def _windows(*spends, seconds=60.0):
+        """_mu_window returns (open, close, secs) for each window in order."""
+        it = iter(spends)
+        return lambda ceiling: (10 ** 8, 10 ** 8 - next(it), seconds)
+
+    def _run(self, *spends, **kw):
+        with mock.patch.object(app, "MU_MIN_DECISIVE_WINDOW_SECONDS", 0), \
+             mock.patch.object(app, "_mu_window", side_effect=self._windows(*spends, **kw)):
+            return app.probe_mu_accounting()
+
+    def test_the_startup_reading_is_inside_the_noise(self):
+        # Same first two windows as the live run; the second low window shows how
+        # far this node's low-ceiling spend wanders on its own (24% here), so a
+        # high window 4% under the low average says nothing either way.
+        ev = self._run(216090, 184932, 170000)
+        self.assertNotIn(ev["verdict"], app.ACCUSING_VERDICTS)
+        self.assertEqual(ev["verdict"], app.VERDICT_INCONCLUSIVE, ev["reason"])
+        self.assertIn("noise", ev["reason"])
+
+    def test_a_steady_node_that_charges_less_for_more_is_dishonest(self):
+        ev = self._run(150000, 100000, 150500)
+        self.assertEqual(ev["verdict"], app.VERDICT_DISHONEST)
+
+    def test_a_small_dip_within_the_floor_tolerance_accuses_nobody(self):
+        ev = self._run(150000, 148000, 150000)  # 1.3% under, floor is 5%
+        self.assertEqual(ev["verdict"], app.VERDICT_INCONCLUSIVE)
+
+    def test_the_honest_shape_passes(self):
+        ev = self._run(145004, 164523, 146000)
+        self.assertEqual(ev["verdict"], app.VERDICT_PASS, ev["reason"])
+
+    def test_spend_is_compared_as_a_rate_over_the_real_window(self):
+        # The high window lasted twice as long: 200 MU over 120 s is a LOWER rate
+        # than 150 MU over 60 s, whatever the raw totals say.
+        durations = iter([60.0, 120.0, 60.0])
+        spends = iter([150, 200, 150])
+        with mock.patch.object(app, "MU_MIN_DECISIVE_WINDOW_SECONDS", 0), \
+             mock.patch.object(app, "_mu_window",
+                               side_effect=lambda c: (10 ** 8, 10 ** 8 - next(spends), next(durations))):
+            ev = app.probe_mu_accounting()
+        self.assertLess(ev["rate_high_mu_per_s"], ev["rate_low_mu_per_s"])
+        self.assertEqual(ev["verdict"], app.VERDICT_DISHONEST)
 
 
 class ChildReadinessTests(unittest.TestCase):
@@ -601,6 +505,183 @@ class ObserveCorroborationTests(unittest.TestCase):
         ev = self._run([session_evt])
         self.assertTrue(ev["observe_stream_alive"])
         self.assertEqual(ev["verdict"], app.VERDICT_DISHONEST)
+
+
+    def test_the_stream_is_opened_before_the_dependency_is_driven(self):
+        # ping only makes traffic while serving GET /; a stream opened after that
+        # can see the tail of the connection at best, nothing at worst.
+        order = []
+
+        def fake_collect(instance_id, out, stop_flag):
+            order.append("observe")
+            out.append(self._session_evt())
+
+        def fake_get(url, timeout=None):
+            order.append("drive")
+            r = mock.Mock()
+            r.json.return_value = {"honest": True, "targets": [{"target": "google.com"}]}
+            return r
+
+        with mock.patch.object(app, "_collect_observe_events", side_effect=fake_collect), \
+             mock.patch.object(app.requests, "get", side_effect=fake_get):
+            ev = app.probe_dependency_observe()
+        self.assertEqual(order, ["observe", "drive"])
+        self.assertTrue(ev["observe_armed_before_drive"])
+
+    def test_a_stream_that_only_wakes_after_the_drive_cannot_accuse(self):
+        # The first event (a session record) arrives only once the dependency was
+        # already driven: the stream never showed it was watching at the time.
+        driven = []
+
+        def fake_collect(instance_id, out, stop_flag):
+            while not driven:
+                time.sleep(0.01)
+            out.append(self._session_evt())
+
+        def fake_get(url, timeout=None):
+            driven.append(True)
+            r = mock.Mock()
+            r.json.return_value = {"honest": True, "targets": [{"target": "google.com"}]}
+            return r
+
+        with mock.patch.object(app, "OBSERVE_ARM_SECONDS", 0.2), \
+             mock.patch.object(app, "OBSERVE_SECONDS", 2), \
+             mock.patch.object(app, "_collect_observe_events", side_effect=fake_collect), \
+             mock.patch.object(app.requests, "get", side_effect=fake_get):
+            ev = app.probe_dependency_observe()
+        self.assertTrue(ev["observe_stream_alive"])
+        self.assertFalse(ev["observe_armed_before_drive"])
+        self.assertEqual(ev["verdict"], app.VERDICT_INCONCLUSIVE)
+
+    @staticmethod
+    def _session_evt():
+        evt = mock.Mock()
+        evt.HasField.side_effect = lambda f: f == "session"
+        evt.session.instance_id = "abc"
+        evt.session.tag = "ping"
+        return evt
+
+
+class FundingTests(unittest.TestCase):
+    """A freshly executed verifier could never run its own suite: each child asked
+    for 2e8-5e8 MU out of an instance the node funds with ~14e6."""
+
+    def setUp(self):
+        FakeController.rpc_mode = "ok"
+        FakeServiceInterface.launch_mode = "ok"
+        del app.FUNDING_FAILURES[:]
+
+    def tearDown(self):
+        app.FUNDING.update(self_rate_mu_per_s=None, child_initial_mu={}, balance_mu=None)
+
+    def test_children_are_funded_for_minutes_not_days(self):
+        # A default node charges a 2 GB / 8 GB instance ~3950 MU/s (14.2e6 per hour).
+        budgets = {label: app.child_initial_mu(label, 3950.0) for label in app.CHILD_DECLARED_RESOURCES}
+        self.assertLess(max(budgets.values()), 14_000_000 // 2,
+                        "the largest child must fit well inside one hour of this instance")
+        self.assertEqual(max(budgets, key=budgets.get), "benchmark")
+        self.assertGreater(budgets["benchmark"], budgets["tiny"])
+
+    def test_one_suite_fits_in_the_funding_the_node_gives_a_new_instance(self):
+        rate = 3950.0
+        app.FUNDING["child_initial_mu"] = {}
+        need = app.funding_requirement(rate)
+        self.assertLess(need["required_mu"], int(rate * 3600) * 0.9)
+
+    def test_first_builds_are_charged_when_the_node_refused_for_funds(self):
+        need = app.funding_requirement(3950.0, pending_builds=4)
+        self.assertEqual(need["pending_builds_mu"], 4 * app.BUILD_MU_ESTIMATE)
+
+    def test_a_short_balance_reports_what_is_missing_and_how_to_top_up(self):
+        required = app.funding_requirement(3950.0)
+        app.FUNDING["balance_mu"] = 1000
+        snap = app.funding_status(required)
+        self.assertFalse(snap["funded"])
+        self.assertEqual(snap["missing_mu"], required["required_mu"] - 1000)
+        self.assertIn("nodo increase_deposit", snap["operator_hint"])
+
+    def test_the_gate_waits_until_the_balance_covers_a_suite(self):
+        # 20 MU/s measured, then the balance is short twice before a top-up lands.
+        balances = iter([10 ** 6 + 20 + app.MODIFY_RESOURCES_MU_ESTIMATE, 10 ** 6,
+                         1000, 1000, 10 ** 9])
+        waits = []
+        with mock.patch.object(app.controller, "modify_resources",
+                               side_effect=lambda spec: ({}, next(balances))), \
+             mock.patch.object(app.time, "monotonic", side_effect=[0.0, 1.0] + [2.0] * 20):
+            funded, snap = app.ensure_funded(timeout=60, on_wait=waits.append)
+        self.assertTrue(funded)
+        self.assertEqual(len(waits), 2)
+        self.assertTrue(all(w["missing_mu"] > 0 for w in waits))
+        self.assertTrue(app.FUNDING["child_initial_mu"], "children must be sized from the rate")
+
+    def test_a_refused_charge_is_classified_as_insufficient_funds(self):
+        # Verbatim shape of the live refusal.
+        exc = RuntimeError(
+            "_MultiThreadedRendezvous: <_MultiThreadedRendezvous of RPC that terminated with:\n"
+            "\tstatus = StatusCode.UNKNOWN\n\tdetails = \"Exception iterating responses: Unable "
+            "to launch service 5de95f70. Attempt details: local: Exception: Launch service error "
+            "charging 93399e98\"\n>")
+        err = app.ChildLaunchError("ping", exc)
+        self.assertTrue(err.insufficient_funds)
+        self.assertIn("INSUFFICIENT FUNDS", str(err))
+        # The node's own words survive instead of being cut at "Unable to l".
+        self.assertIn("error charging", str(err))
+
+    def test_a_starved_launch_is_recorded_for_the_suite(self):
+        exc = RuntimeError('details = "Launch service error charging abc"')
+        with mock.patch.object(app.heavy_service, "get_instance", side_effect=exc):
+            with self.assertRaises(app.ChildLaunchError):
+                app._spin_child(app.heavy_service, "heavy(64MB)")
+        self.assertEqual(app.FUNDING_FAILURES, ["heavy(64MB)"])
+
+    def test_a_starved_run_stops_launching_and_skips_the_mu_windows(self):
+        # The first child the node refuses ends the spending: every later
+        # gateway-dependent probe is skipped as INFRA_ERROR, naming the cause.
+        exc = RuntimeError('details = "Launch service error charging abc"')
+        mu = mock.Mock(side_effect=AssertionError("mu_accounting must not run"))
+        preflight = {"probe": "gateway_reachability", "verdict": app.VERDICT_PASS}
+        with mock.patch.object(FakeServiceInterface, "get_instance", side_effect=exc), \
+             mock.patch.object(app, "probe_gateway_reachability", return_value=preflight), \
+             mock.patch.object(app, "PROBES", [(n, mu if n == "mu_accounting" else f)
+                                              for n, f in app.PROBES]):
+            results = app._run_probe_suite()
+        self.assertEqual(results["dependency_identity"]["verdict"], app.VERDICT_INFRA_ERROR)
+        for name in ("network_isolation", "dependency_observe", "memory_ceiling",
+                     "node_benchmark", "mu_accounting"):
+            self.assertEqual(results[name].get("fault"), "insufficient_funds", name)
+        self.assertEqual(results["resource_provisioning"]["verdict"], app.VERDICT_PASS)
+        mu.assert_not_called()
+
+    def test_clip_never_cuts_a_word(self):
+        self.assertEqual(app.clip("alpha beta gamma", 12), "alpha beta …")
+        self.assertEqual(app.clip("short", 12), "short")
+
+
+class ManifestConstantsTests(unittest.TestCase):
+    """app.py prices and measures against these numbers; a manifest edit that
+    leaves them behind (SELF_DECLARED_MEM_BYTES said 1 GB for a 2 GB manifest)
+    silently skews resource_provisioning, mu_accounting and every child budget."""
+
+    @staticmethod
+    def _resources(arch, label):
+        sub = "" if label == "demo" else label
+        with open(os.path.join(ROOT, arch, sub, ".service", "service.json")) as fh:
+            res = json.load(fh)["resources"]
+        return res["at_init"], res["at_most"]
+
+    def test_self_constants_match_the_manifest(self):
+        for arch in ("amd64", "arm64"):
+            at_init, at_most = self._resources(arch, "demo")
+            self.assertEqual(at_most["mem_limit"], app.SELF_DECLARED_MEM_BYTES, arch)
+            self.assertEqual(at_init["disk_space"], app.SELF_DECLARED_DISK_BYTES, arch)
+
+    def test_child_constants_match_their_manifests(self):
+        for arch in ("amd64", "arm64"):
+            for label, (mem, disk) in app.CHILD_DECLARED_RESOURCES.items():
+                at_init, at_most = self._resources(arch, label)
+                self.assertEqual((at_init["mem_limit"], at_init["disk_space"]), (mem, disk),
+                                 f"{arch}/{label}")
+        self.assertEqual(app.CHILD_DECLARED_RESOURCES["heavy"][0], app.HEAVY_DECLARED_MEM_BYTES)
 
 
 class TaxonomyInvariantTests(unittest.TestCase):
@@ -788,7 +869,7 @@ class NodeBenchmarkTests(unittest.TestCase):
         expected = iter(app.DEP_IDENTITY)
 
         def fake_get(url, timeout=None):
-            tag, _iface, identity, path = next(expected)
+            tag, identity, path = next(expected)
             r = mock.Mock()
             r.status_code = 200
             r.json.return_value = ({"service": tag, "identity": identity}

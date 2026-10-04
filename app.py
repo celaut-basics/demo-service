@@ -24,7 +24,7 @@ attestation report card:
                                         EGO reputation opinion on-chain.
 """
 
-import os, json, logging, hashlib, datetime, re, threading, time, socket, platform
+import os, json, logging, hashlib, datetime, re, threading, time, socket, platform, contextlib
 import requests
 from flask import Flask, jsonify, render_template_string, request
 from google.protobuf.json_format import MessageToDict
@@ -41,7 +41,7 @@ if False:  # development mode toggle (unchanged from the original demo)
     DIR = "."
     CONFIG_FILE = "__config__"
 
-VERIFIER_VERSION = "1.2.0"
+VERIFIER_VERSION = "1.3.0"
 
 # ---------------------------------------------------------------------------
 # Verdict taxonomy
@@ -130,7 +130,7 @@ def classify_rpc_failure(exc):
         "node_answered": fault == FAULT_NODE_RPC,
         "grpc_code": code,
         "node_detail": detail_match.group(1) if detail_match else None,
-        "error": f"{type(exc).__name__}: {text[:200]}",
+        "error": f"{type(exc).__name__}: {clip(text)}",
     }
 
 
@@ -163,10 +163,19 @@ def describe_rpc_failure(failure, rpc, node_url):
     )
 
 
-# Declared ceilings from the child manifests (<svc>/<arch>/.service/service.json
-# at_most; both architectures declare the same resources).
+# Declared resources from the manifests (<svc>/<arch>/.service/service.json
+# at_init == at_most; both architectures declare the same resources).
+# tests/test_verdicts.py holds these to the manifests, so they cannot drift again:
+# SELF_DECLARED_MEM_BYTES said 1 GB for a manifest that declares 2 GB.
 HEAVY_DECLARED_MEM_BYTES = 268435456   # 256 MiB
-SELF_DECLARED_MEM_BYTES = 1000000000   # 1 GB (this service's own manifest)
+SELF_DECLARED_MEM_BYTES = 2000000000   # 2 GB (this service's own manifest)
+SELF_DECLARED_DISK_BYTES = 8000000000  # 8 GB
+CHILD_DECLARED_RESOURCES = {           # label -> (mem_limit, disk_space)
+    "tiny": (50000000, 200000000),
+    "heavy": (HEAVY_DECLARED_MEM_BYTES, 200000000),
+    "ping": (50000000, 500000000),
+    "benchmark": (2147483648, 200000000),
+}
 
 
 def canonical_arch(machine):
@@ -206,33 +215,182 @@ controller = Controller(debug=lambda s: logging.info('Node Controller: %s', s),
 node_url: str = controller.get_node_url()
 mem_limit: int = controller.get_mem_limit_at_start()
 
-# initial_mu the orchestrator asks the node to fund each child with, credited
-# to the CHILD's own balance so it can survive its own probe traffic (heavy's
-# multi-rung alloc ladder, ping's egress checks) without going into debt.
-# Raised from the original 1e8: that was sized for a single call, not several
-# children spun back-to-back by the same probe suite.
-HEAVY_INITIAL_MU = 5 * pow(10, 8)
-PING_INITIAL_MU = 2 * pow(10, 8)
-# benchmark holds its declared 2 GiB for the ~10-20 s one run takes, plus the
-# dependency_identity launch.
-BENCHMARK_INITIAL_MU = 5 * pow(10, 8)
-
 resources = {"mem_limit": mem_limit}
-balance_mu = 0
 
-tiny_service = controller.add_service(service_hash=TINY_SERVICE)
-heavy_service = controller.add_service(
-    service_hash=HEAVY_SERVICE,
-    config=celaut_pb2.Configuration(initial_mu=to_amount(HEAVY_INITIAL_MU))
-)
-ping_service = controller.add_service(
-    service_hash=PING_SERVICE,
-    config=celaut_pb2.Configuration(initial_mu=to_amount(PING_INITIAL_MU))
-)
-benchmark_service = controller.add_service(
-    service_hash=BENCHMARK_SERVICE,
-    config=celaut_pb2.Configuration(initial_mu=to_amount(BENCHMARK_INITIAL_MU))
-)
+# ----------------------------------------------------------------------------
+# Funding — what the suite costs, and whether this instance can pay for it
+# ----------------------------------------------------------------------------
+# Every child is paid for out of THIS instance's balance: the node charges the
+# parent BUILD_MU the first time a child is built plus the child's initial_mu,
+# and refunds whatever the child did not spend when it is stopped. This
+# instance itself is funded by the node for deposits.INITIAL_RUNTIME_HOURS of
+# its own resources -- about 14e6 MU on a default node.
+#
+# The children used to ask for a flat 2e8-5e8 MU each: 35x what funds this
+# whole instance for an hour. Every launch was refused for want of balance
+# ("needed 0.51 ERG"), so a freshly executed verifier could never run its own
+# startup suite. Now each child is funded for CHILD_FUNDED_SECONDS of its own
+# resources, priced from the rate the node really charges this instance, and
+# the suite only starts once the balance covers it.
+#
+# Relative price of each resource per unit-hour (GiB of RAM, vCPU, GiB of disk),
+# from the node's shipped pricing.RAM/CPU/DISK prices. Only the RATIOS are used:
+# the absolute rate is measured, so an operator's prices and scarcity
+# surcharges are already in it.
+PRICE_WEIGHT_RAM_GIB = 1.0
+PRICE_WEIGHT_VCPU = 4.0
+PRICE_WEIGHT_DISK_GIB = 0.1
+GIB = 1024 ** 3
+
+CHILD_FUNDED_SECONDS = int(os.environ.get("CHILD_FUNDED_SECONDS", "600"))
+CHILD_BUDGET_MARGIN = float(os.environ.get("CHILD_BUDGET_MARGIN", "2.0"))
+CHILD_MIN_INITIAL_MU = int(os.environ.get("CHILD_MIN_INITIAL_MU", "100000"))
+# One full suite: the three MU windows dominate (3 x MU_WINDOW_SECONDS), the
+# memory ladder and the benchmark take the rest.
+SUITE_EXPECTED_SECONDS = int(os.environ.get("SUITE_EXPECTED_SECONDS", "480"))
+# Runtime this instance must still have left AFTER a suite, so that verifying
+# the node never leaves the verifier unable to serve the result it produced.
+MIN_RESERVE_SECONDS = int(os.environ.get("MIN_RESERVE_SECONDS", "900"))
+# pricing.BUILD_MU and pricing.MODIFY_RESOURCES_MU on a default node.
+BUILD_MU_ESTIMATE = int(os.environ.get("BUILD_MU_ESTIMATE", "10000000"))
+MODIFY_RESOURCES_MU_ESTIMATE = int(os.environ.get("MODIFY_RESOURCES_MU_ESTIMATE", "10000"))
+FUNDING_RATE_SAMPLE_SECONDS = int(os.environ.get("FUNDING_RATE_SAMPLE_SECONDS", "20"))
+# Each poll settles the account (one MODIFY_RESOURCES charge), so not too often.
+FUNDING_POLL_SECONDS = int(os.environ.get("FUNDING_POLL_SECONDS", "30"))
+FUNDING_WAIT_TIMEOUT_SECONDS = int(os.environ.get("FUNDING_WAIT_TIMEOUT_SECONDS", "3600"))
+# Only for the operator hint: the unit `nodo increase_deposit` reads by default.
+MU_PER_ERG = int(os.environ.get("MU_PER_ERG", str(10 ** 9)))
+
+_CHILD_HASHES = {"tiny": TINY_SERVICE, "heavy": HEAVY_SERVICE,
+                 "ping": PING_SERVICE, "benchmark": BENCHMARK_SERVICE}
+
+FUNDING = {
+    "balance_mu": None,          # last balance the node reported
+    "sampled_at": None,
+    "self_rate_mu_per_s": None,  # measured; None until two samples exist
+    "child_initial_mu": {},      # label -> what each child is funded with
+    "built_children": [],        # children this instance has seen launch
+}
+_funding_lock = threading.Lock()
+
+
+def price_weight(mem_bytes, disk_bytes, vcpus=1.0):
+    """Relative hourly price of holding these resources (1 vCPU unless declared)."""
+    return (mem_bytes / GIB * PRICE_WEIGHT_RAM_GIB + vcpus * PRICE_WEIGHT_VCPU
+            + disk_bytes / GIB * PRICE_WEIGHT_DISK_GIB)
+
+
+def child_initial_mu(label, self_rate):
+    """MU to fund one child with: CHILD_FUNDED_SECONDS of its own resources."""
+    mem, disk = CHILD_DECLARED_RESOURCES[label]
+    self_weight = price_weight(mem_limit or SELF_DECLARED_MEM_BYTES, SELF_DECLARED_DISK_BYTES)
+    child_rate = self_rate * price_weight(mem, disk) / self_weight
+    return max(CHILD_MIN_INITIAL_MU, int(child_rate * CHILD_FUNDED_SECONDS * CHILD_BUDGET_MARGIN))
+
+
+def _add_child(label, initial_mu=None):
+    # No initial_mu: the node funds the child for INITIAL_RUNTIME_HOURS of its own
+    # resources, which is sane until this instance has measured its rate.
+    config = (celaut_pb2.Configuration(initial_mu=to_amount(initial_mu))
+              if initial_mu is not None else None)
+    return controller.add_service(service_hash=_CHILD_HASHES[label], config=config)
+
+
+tiny_service = _add_child("tiny")
+heavy_service = _add_child("heavy")
+ping_service = _add_child("ping")
+benchmark_service = _add_child("benchmark")
+
+
+def configure_child_budgets(self_rate):
+    """Re-register every child funded for CHILD_FUNDED_SECONDS at this rate."""
+    global tiny_service, heavy_service, ping_service, benchmark_service
+    budgets = {label: child_initial_mu(label, self_rate) for label in CHILD_DECLARED_RESOURCES}
+    tiny_service = _add_child("tiny", budgets["tiny"])
+    heavy_service = _add_child("heavy", budgets["heavy"])
+    ping_service = _add_child("ping", budgets["ping"])
+    benchmark_service = _add_child("benchmark", budgets["benchmark"])
+    FUNDING["child_initial_mu"] = budgets
+    logging.info("Child budgets at %.1f MU/s: %s", self_rate, budgets)
+    return budgets
+
+
+def child_iface(label):
+    """The current interface for a child (budgets re-register them)."""
+    return {"tiny": tiny_service, "heavy": heavy_service,
+            "ping": ping_service, "benchmark": benchmark_service}[label]
+
+
+def sample_balance():
+    """Settle the account at the declared ceiling and record the balance."""
+    _, balance = controller.modify_resources(
+        {"min": mem_limit or MU_HIGH_CEILING, "max": MU_HIGH_CEILING})
+    with _funding_lock:
+        FUNDING["balance_mu"] = balance
+        FUNDING["sampled_at"] = time.time()
+    return balance
+
+
+def measure_self_rate():
+    """MU/s the node charges this instance, from two settled balances.
+
+    The closing sample's own MODIFY_RESOURCES_MU charge is taken out, so the
+    rate is the upkeep alone. A top-up between the samples makes the delta
+    negative; that is reported as unknown rather than as a free node.
+    """
+    t0 = time.monotonic()
+    b0 = sample_balance()
+    time.sleep(FUNDING_RATE_SAMPLE_SECONDS)
+    b1 = sample_balance()
+    elapsed = time.monotonic() - t0
+    spent = b0 - b1 - MODIFY_RESOURCES_MU_ESTIMATE
+    if elapsed <= 0 or spent < 0:
+        return None
+    rate = spent / elapsed
+    FUNDING["self_rate_mu_per_s"] = rate
+    return rate
+
+
+def funding_requirement(self_rate, pending_builds=0):
+    """MU this instance needs on hand before a suite may start."""
+    budgets = FUNDING["child_initial_mu"] or {
+        label: child_initial_mu(label, self_rate) for label in CHILD_DECLARED_RESOURCES}
+    parts = {
+        # Children run one at a time and are refunded on stop, so only the
+        # largest deposit is ever held at once.
+        "largest_child_deposit_mu": max(budgets.values()),
+        "suite_upkeep_mu": int(self_rate * SUITE_EXPECTED_SECONDS),
+        "reserve_after_suite_mu": int(self_rate * MIN_RESERVE_SECONDS),
+        "pending_builds_mu": pending_builds * BUILD_MU_ESTIMATE,
+    }
+    parts["required_mu"] = sum(parts.values())
+    return parts
+
+
+def funding_status(required=None):
+    """Snapshot for the UI, the MCP and the startup gate (no RPC)."""
+    with _funding_lock:
+        snap = dict(FUNDING)
+    if required is not None:
+        balance = snap.get("balance_mu") or 0
+        missing = max(0, required["required_mu"] - balance)
+        snap.update(required)
+        snap["missing_mu"] = missing
+        snap["funded"] = missing == 0
+        if missing:
+            snap["operator_hint"] = (
+                f"Top this instance up by at least {missing} MU "
+                f"(~{missing / MU_PER_ERG:.4f} ERG on a default node): "
+                "`nodo increase_deposit <instance> <amount>` (amount in ui.DISPLAY_UNIT, ERG by default).")
+    return snap
+
+
+# Launch failures in the current suite that the node refused for want of
+# balance. A probe reports them as INFRA_ERROR like any launch failure; the
+# suite runner reads this to know the run was starved, not blind.
+FUNDING_FAILURES = []
+_INSUFFICIENT_FUNDS_RE = re.compile(r"error charging|insufficient balance|not enough balance",
+                                    re.IGNORECASE)
 
 services = []
 logging.info('Gateway main directory: %s', node_url)
@@ -314,7 +472,26 @@ class ChildLaunchError(RuntimeError):
     def __init__(self, label, original):
         self.label = label
         self.original = original
-        super().__init__(f"could not launch child '{label}': {_describe_launch_failure(original)}")
+        self.insufficient_funds = bool(_INSUFFICIENT_FUNDS_RE.search(_full_error_text(original)))
+        msg = f"could not launch child '{label}': {_describe_launch_failure(original)}"
+        if self.insufficient_funds:
+            msg = (f"INSUFFICIENT FUNDS: the node refused to charge this instance for child "
+                   f"'{label}' (balance too low for its build + initial deposit). {msg}")
+        super().__init__(msg)
+
+
+def clip(text, limit=400):
+    """Shorten for a report without cutting a word in half."""
+    text = str(text)
+    if len(text) <= limit:
+        return text
+    cut = text[:limit].rsplit(" ", 1)[0]
+    return cut + " …"
+
+
+def _full_error_text(exc):
+    last = getattr(exc, "last_error", None)
+    return f"{exc} {last}" if last is not None else str(exc)
 
 
 def _describe_launch_failure(exc):
@@ -324,15 +501,23 @@ def _describe_launch_failure(exc):
     and then trips over `return instance` with the name unbound, so an
     UnboundLocalError is all that reaches us. Translate that into what it
     actually means instead of propagating a meaningless Python detail.
+
+    A gRPC failure is reduced to the node's own `details = "..."` text: the
+    rendezvous wrapper around it used up the whole length budget, so reports
+    ended in "Unable to l" and the actual cause was only in the node's log.
     """
     if isinstance(exc, UnboundLocalError) and "instance" in str(exc):
         return (f"every StartService attempt to the node gateway at {node_url} failed; "
                 "the client library discarded the gRPC status (see app.log for "
                 "'GRPC ERROR LAUNCHING INSTANCE')")
-    last = getattr(exc, "last_error", None)
-    if last is not None:
-        return f"{type(last).__name__}: {str(last)[:200]}"
-    return f"{type(exc).__name__}: {str(exc)[:200]}"
+    err = getattr(exc, "last_error", None) or exc
+    text = str(err)
+    details = _STATUS_DETAILS_RE.search(text)
+    if details:
+        code = _STATUS_CODE_RE.search(text)
+        status = f"grpc {code.group(1)}: " if code else ""
+        return clip(f"{status}{details.group(1)}")
+    return clip(f"{type(err).__name__}: {text}")
 
 
 class ChildNotReadyError(Exception):
@@ -382,8 +567,15 @@ def _spin_child(service_iface, label, wait_ready=True):
         inst = service_iface.get_instance(max_attempts=2)
     except Exception as e:
         logging.error('Could not spin %s child: %s', label, _describe_launch_failure(e))
-        raise ChildLaunchError(label, e) from e
+        err = ChildLaunchError(label, e)
+        if err.insufficient_funds:
+            FUNDING_FAILURES.append(label)
+        raise err from e
     logging.info('Spun %s child at %s', label, inst.uri)
+    base = label.split("(", 1)[0]
+    with _funding_lock:
+        if base in CHILD_DECLARED_RESOURCES and base not in FUNDING["built_children"]:
+            FUNDING["built_children"].append(base)
     if wait_ready:
         _wait_until_ready(inst.uri, label)
     return inst
@@ -407,7 +599,7 @@ def _wait_until_ready(uri, label, timeout=None):
                 logging.info('Child %s at %s is accepting connections', label, uri)
                 return
         except OSError as e:
-            last = f"{type(e).__name__}: {str(e)[:120]}"
+            last = f"{type(e).__name__}: {clip(e)}"
             if time.monotonic() >= deadline:
                 raise ChildNotReadyError(label, uri, timeout, last)
             time.sleep(CHILD_READY_POLL_S)
@@ -418,7 +610,7 @@ def _release_child(service_iface, inst, label):
 
     Left running, each child keeps drawing MU from this service's balance for
     the rest of the run. That is not only waste: it is measured by the
-    mu_accounting probe, whose two windows would otherwise be dominated by the
+    mu_accounting probe, whose windows would otherwise be dominated by the
     upkeep of children the verifier itself abandoned rather than by the resource
     ceiling those windows are meant to compare.
     """
@@ -463,7 +655,7 @@ def probe_network_isolation():
                         "No claim about the node's isolation is made.")
     except Exception as e:
         ev["verdict"] = VERDICT_INFRA_ERROR
-        ev["reason"] = f"probe could not run: {type(e).__name__}: {str(e)[:200]}"
+        ev["reason"] = f"probe could not run: {type(e).__name__}: {clip(e)}"
     finally:
         _release_child(ping_service, inst, "ping")
     return ev
@@ -497,7 +689,7 @@ def probe_memory_ceiling():
             # fault into a "shortchanged" accusation).
             rung["ok"] = False
             rung["launch_failed"] = True
-            rung["error"] = str(e)[:200]
+            rung["error"] = clip(e)
             launch_failures.append(rung)
             ev["attempts"].append(rung)
             continue
@@ -507,7 +699,7 @@ def probe_memory_ceiling():
             # decide a ceiling, and must never feed first_kill.
             rung["ok"] = False
             rung["never_ready"] = True
-            rung["error"] = str(e)[:200]
+            rung["error"] = clip(e)
             launch_failures.append(rung)
             ev["attempts"].append(rung)
             continue
@@ -528,7 +720,7 @@ def probe_memory_ceiling():
             # connect refused by a guest still booting and calls it a kill.
             rung["ok"] = False
             rung["killed"] = True
-            rung["error"] = str(e)[:160]
+            rung["error"] = clip(e)
             observed_rungs += 1
             if first_kill is None:
                 first_kill = mb
@@ -605,7 +797,7 @@ def probe_resource_provisioning():
     model = detect_isolation_model()
     ev["declared_manifest_mem_bytes"] = SELF_DECLARED_MEM_BYTES
     ev["node_reported_mem_limit_at_start"] = mem_limit
-    ev["heavy_child_initial_mu_charged"] = HEAVY_INITIAL_MU
+    ev["child_initial_mu"] = dict(FUNDING["child_initial_mu"])
     ev["container_actual"] = limits
     ev["isolation_model"] = model
 
@@ -658,24 +850,37 @@ def probe_resource_provisioning():
 # ----------------------------------------------------------------------------
 # The node meters usage in MU. `controller.modify_resources({min,max})` settles
 # the account and returns the service's *current* MU balance, so we can measure
-# how many MU the node actually deducts over a fixed window. To check that the
-# spend tracks USAGE (not a flat or arbitrary drain) we run two equal-length
-# windows: one holding a LOW resource ceiling and one holding a HIGH ceiling
-# (up to the manifest at_most). An honest node must (a) actually charge — the
-# balance must fall while resources are held — (b) charge MORE when it provisions
-# more, and (c) not take a positive balance to zero inside a single window.
+# how many MU the node actually deducts over a window. To check that the spend
+# tracks USAGE (not a flat or arbitrary drain) we hold a LOW resource ceiling,
+# then a HIGH one (up to the manifest at_most), then the LOW one again. An honest
+# node must (a) actually charge -- the balance must fall while resources are
+# held -- (b) charge MORE when it provisions more, and (c) not take a positive
+# balance to zero inside a single window.
 #
-# Comparing the two windows only works if this service's own ceiling is the only
-# thing that changed between them. Every probe therefore stops its children (see
-# _release_child): each one left running keeps drawing MU from this same balance,
-# and enough of them swamp the difference the two windows exist to measure.
+# (b) is a weak signal: every instance pays for its vCPU at both ceilings, so on
+# a default node memory is only ~10-15% of the bill. Two single windows compared
+# with `>=` called an honest node DISHONEST when one window ran 17% heavy. So:
+#   - spend is turned into a RATE over the time each window really lasted (the
+#     settle RPCs alone take 0.5-0.7 s and are not the same every time);
+#   - the two LOW windows bracket the HIGH one, and how much they disagree is
+#     the noise of this node, measured on this run;
+#   - only a HIGH rate below the LOW rate by more than that noise (and never by
+#     less than MU_SCALING_TOLERANCE) is an accusation. Inside the noise it is
+#     INCONCLUSIVE: the run could not tell.
+#
+# Comparing windows only works if this service's own ceiling is the only thing
+# that changed between them. Every probe therefore stops its children (see
+# _release_child), and the suite lock keeps any other run from spinning children
+# on this balance while the windows are open.
 # Defaulted to the decisive length below, because a window shorter than that
-# yields readings this probe is not allowed to accuse on: a shorter default makes
-# every run pay for two windows it cannot read.
+# yields readings this probe is not allowed to accuse on.
 MU_WINDOW_SECONDS = int(os.environ.get("MU_WINDOW_SECONDS", "60"))
 # Below this window length a small charge is indistinguishable from an honest
 # node's rounding, so no reading from it can support an accusation.
 MU_MIN_DECISIVE_WINDOW_SECONDS = int(os.environ.get("MU_MIN_DECISIVE_WINDOW_SECONDS", "60"))
+# Smallest shortfall of the HIGH rate that may ever be called a scaling failure,
+# however quiet the two LOW windows were.
+MU_SCALING_TOLERANCE = float(os.environ.get("MU_SCALING_TOLERANCE", "0.05"))
 MU_LOW_CEILING = 64 * 1024 * 1024                      # 64 MiB
 MU_HIGH_CEILING = SELF_DECLARED_MEM_BYTES              # this service's declared at_most
 
@@ -686,37 +891,54 @@ def _sample_mu_balance(min_b, max_b):
     return balance, sysreq
 
 
+def _mu_window(ceiling):
+    """Hold `ceiling` for MU_WINDOW_SECONDS; return (b_open, b_close, seconds)."""
+    b_open, _ = _sample_mu_balance(ceiling, ceiling)
+    t_open = time.monotonic()
+    time.sleep(MU_WINDOW_SECONDS)
+    b_close, _ = _sample_mu_balance(ceiling, ceiling)
+    return b_open, b_close, time.monotonic() - t_open
+
+
 def probe_mu_accounting():
     ev = {"probe": "mu_accounting", "window_seconds": MU_WINDOW_SECONDS,
           "low_ceiling_bytes": MU_LOW_CEILING, "high_ceiling_bytes": MU_HIGH_CEILING}
     try:
-        # Window 1 — hold a LOW ceiling, measure MU spent.
-        b0_low, _ = _sample_mu_balance(MU_LOW_CEILING, MU_LOW_CEILING)
-        time.sleep(MU_WINDOW_SECONDS)
-        b1_low, _ = _sample_mu_balance(MU_LOW_CEILING, MU_LOW_CEILING)
-        spent_low = b0_low - b1_low
+        windows = [("low_1", MU_LOW_CEILING), ("high", MU_HIGH_CEILING), ("low_2", MU_LOW_CEILING)]
+        readings = {}
+        for name, ceiling in windows:
+            b_open, b_close, secs = _mu_window(ceiling)
+            spent = b_open - b_close
+            readings[name] = {"balance": [b_open, b_close], "seconds": round(secs, 3),
+                              "spent_mu": spent,
+                              # A window measured as 0 s (tests, a frozen clock) still
+                              # has a spend to compare; rate it over the nominal length.
+                              "rate_mu_per_s": spent / (secs if secs > 0 else max(MU_WINDOW_SECONDS, 1))}
+        ev["windows"] = readings
+        low1, high, low2 = readings["low_1"], readings["high"], readings["low_2"]
+        ev["spent_low_mu"] = low1["spent_mu"] + low2["spent_mu"]
+        ev["spent_high_mu"] = high["spent_mu"]
 
-        # Window 2 — hold a HIGH ceiling, measure MU spent over the same interval.
-        b0_high, _ = _sample_mu_balance(MU_HIGH_CEILING, MU_HIGH_CEILING)
-        time.sleep(MU_WINDOW_SECONDS)
-        b1_high, _ = _sample_mu_balance(MU_HIGH_CEILING, MU_HIGH_CEILING)
-        spent_high = b0_high - b1_high
+        rate_low = (low1["rate_mu_per_s"] + low2["rate_mu_per_s"]) / 2
+        rate_high = high["rate_mu_per_s"]
+        noise = abs(low1["rate_mu_per_s"] - low2["rate_mu_per_s"]) / rate_low if rate_low > 0 else 0.0
+        margin = max(MU_SCALING_TOLERANCE, 2 * noise)
+        ev["rate_low_mu_per_s"] = round(rate_low, 3)
+        ev["rate_high_mu_per_s"] = round(rate_high, 3)
+        ev["low_window_noise"] = round(noise, 4)
+        ev["accusation_margin"] = round(margin, 4)
 
-        ev["balance_low"] = [b0_low, b1_low]
-        ev["spent_low_mu"] = spent_low
-        ev["balance_high"] = [b0_high, b1_high]
-        ev["spent_high_mu"] = spent_high
-
-        charging = (spent_low > 0) or (spent_high > 0)
+        opens = [r["balance"][0] for r in readings.values()]
+        closes = [r["balance"][1] for r in readings.values()]
+        charging = any(r["spent_mu"] > 0 for r in readings.values())
         # "Drained" has to mean the window did the draining. A balance that was
         # already at or below zero when the window opened was not spent by this
         # node during it -- operators run nodes with `costs.ALLOW_DEBT` enabled,
         # where a negative balance is the configured policy and says nothing
         # about how much was charged. Testing only the closing balance accuses
         # every node in debt, for a drain that predates the measurement.
-        ev["started_in_debt"] = (b0_low <= 0) or (b0_high <= 0)
-        drained = (b0_low > 0 >= b1_low) or (b0_high > 0 >= b1_high)
-        scales = spent_high >= spent_low
+        ev["started_in_debt"] = any(b <= 0 for b in opens)
+        drained = any(o > 0 >= c for o, c in zip(opens, closes))
         # One gate for every accusing branch. A window too short to tell a real
         # charge from rounding is too short to price one ceiling against another
         # as well, so the caution the zero-spend branch needs applies to all
@@ -738,7 +960,7 @@ def probe_mu_accounting():
                                 "accounted (free ride / broken metering)")
             else:
                 ev["verdict"] = VERDICT_INCONCLUSIVE
-                ev["reason"] = f"no MU movement over a {MU_WINDOW_SECONDS}s window; {too_coarse}."
+                ev["reason"] = f"no MU movement over {MU_WINDOW_SECONDS}s windows; {too_coarse}."
         elif drained:
             if decisive:
                 ev["verdict"] = VERDICT_DISHONEST
@@ -746,21 +968,27 @@ def probe_mu_accounting():
                                 "window — spending MU far in excess of usage (overcharging)")
             else:
                 ev["verdict"] = VERDICT_INCONCLUSIVE
-                ev["reason"] = f"balance crossed into debt during the window, but {too_coarse}."
-        elif not scales:
-            if decisive:
-                ev["verdict"] = VERDICT_DISHONEST
-                ev["reason"] = (f"MU spend does not track resource usage: low ceiling spent {spent_low} MU "
-                                f"but high ceiling spent only {spent_high} MU over {MU_WINDOW_SECONDS}s")
-            else:
-                ev["verdict"] = VERDICT_INCONCLUSIVE
-                ev["reason"] = (f"spend did not rise with the ceiling ({spent_low} MU low vs "
-                                f"{spent_high} MU high), but {too_coarse}.")
-        else:
+                ev["reason"] = f"balance crossed into debt during a window, but {too_coarse}."
+        elif rate_high >= rate_low:
             ev["verdict"] = VERDICT_PASS
-            ev["reason"] = (f"node spent MU in line with usage: {spent_low} MU at low ceiling <= "
-                            f"{spent_high} MU at high ceiling over {MU_WINDOW_SECONDS}s, balance never "
+            ev["reason"] = (f"node spent MU in line with usage: {rate_low:.1f} MU/s at the low "
+                            f"ceiling <= {rate_high:.1f} MU/s at the high ceiling, balance never "
                             "crossed into debt during a window")
+        elif rate_high >= rate_low * (1 - margin):
+            ev["verdict"] = VERDICT_INCONCLUSIVE
+            ev["reason"] = (f"high-ceiling rate {rate_high:.1f} MU/s is below the low-ceiling "
+                            f"{rate_low:.1f} MU/s, but within this run's noise (the two low "
+                            f"windows differ by {noise:.1%}; margin {margin:.1%}). Cannot tell "
+                            "scaling from noise; no accounting claim is made.")
+        elif decisive:
+            ev["verdict"] = VERDICT_DISHONEST
+            ev["reason"] = (f"MU spend does not track resource usage: {rate_low:.1f} MU/s at the "
+                            f"low ceiling but only {rate_high:.1f} MU/s at the high ceiling, "
+                            f"beyond the {margin:.1%} this run's noise allows")
+        else:
+            ev["verdict"] = VERDICT_INCONCLUSIVE
+            ev["reason"] = (f"spend did not rise with the ceiling ({rate_low:.1f} MU/s low vs "
+                            f"{rate_high:.1f} MU/s high), but {too_coarse}.")
     except Exception as e:
         # modify_resources is the one call that propagates the real gRPC status, so
         # an exception here is never an accusation -- but it is not automatically an
@@ -792,17 +1020,18 @@ def probe_mu_accounting():
 # instance that comes back self-identifies as the very service we asked for —
 # a node that silently substituted or misrouted a dependency is caught here.
 DEP_IDENTITY = [
-    ("tiny", tiny_service, "celaut-demo-tiny", "/whoami"),
-    ("heavy", heavy_service, "celaut-demo-heavy", "/whoami"),
-    ("ping", ping_service, "celaut-demo-ping", "/whoami"),
-    ("benchmark", benchmark_service, "celaut-demo-benchmark", "/cgi-bin/whoami"),
+    ("tiny", "celaut-demo-tiny", "/whoami"),
+    ("heavy", "celaut-demo-heavy", "/whoami"),
+    ("ping", "celaut-demo-ping", "/whoami"),
+    ("benchmark", "celaut-demo-benchmark", "/cgi-bin/whoami"),
 ]
 
 
 def probe_dependency_identity():
     ev = {"probe": "dependency_identity", "checks": []}
     mismatches, not_observed, verified = [], [], 0
-    for tag, iface, expected_identity, whoami_path in DEP_IDENTITY:
+    for tag, expected_identity, whoami_path in DEP_IDENTITY:
+        iface = child_iface(tag)
         c = {"requested": tag, "expected_identity": expected_identity}
         inst = None
         try:
@@ -819,19 +1048,19 @@ def probe_dependency_identity():
             # Never ran -> nothing was observed about its identity.
             c["match"] = None
             c["launch_failed"] = True
-            c["error"] = str(e)[:200]
+            c["error"] = clip(e)
             not_observed.append(tag)
         except ChildNotReadyError as e:
             # Ran but never answered -> still nothing observed about identity.
             c["match"] = None
             c["never_ready"] = True
-            c["error"] = str(e)[:200]
+            c["error"] = clip(e)
             not_observed.append(tag)
         except Exception as e:
             # Ran but we could not read its identity: still not a substitution.
             c["match"] = None
             c["unreachable"] = True
-            c["error"] = str(e)[:160]
+            c["error"] = clip(e)
             not_observed.append(tag)
         finally:
             _release_child(iface, inst, tag)
@@ -895,7 +1124,7 @@ def probe_node_benchmark():
             # measured, and a benchmark has no ceiling a kill would be evidence of.
             ev["verdict"] = VERDICT_INFRA_ERROR
             ev["reason"] = (f"benchmark run did not complete within {BENCHMARK_TIMEOUT_S}s: "
-                            f"{type(e).__name__}: {str(e)[:160]}")
+                            f"{type(e).__name__}: {clip(e)}")
             return ev
         ev["http_status"] = r.status_code
         try:
@@ -904,7 +1133,7 @@ def probe_node_benchmark():
             data = None
         if not isinstance(data, dict):
             ev["verdict"] = VERDICT_INCONCLUSIVE
-            ev["reason"] = f"benchmark answered {r.status_code} with no JSON object: {r.text[:160]!r}"
+            ev["reason"] = f"benchmark answered {r.status_code} with no JSON object: {clip(r.text, 160)!r}"
             return ev
         if r.status_code != 200:
             ev["verdict"] = VERDICT_INCONCLUSIVE
@@ -948,6 +1177,8 @@ def probe_node_benchmark():
 # corroborate, or Observe reveals traffic to undeclared peers, the node's
 # connectivity picture is fraudulent.
 OBSERVE_SECONDS = int(os.environ.get("OBSERVE_SECONDS", "12"))
+# How long to wait for the stream's first event before driving the dependency.
+OBSERVE_ARM_SECONDS = float(os.environ.get("OBSERVE_ARM_SECONDS", "5"))
 OBSERVE_MAX_EVENTS = 60
 
 
@@ -967,7 +1198,7 @@ def _collect_observe_events(instance_id, out, stop_flag):
             if len(out) >= OBSERVE_MAX_EVENTS or stop_flag[0]:
                 break
     except Exception as e:
-        out.append(("__error__", str(e)[:200]))
+        out.append(("__error__", clip(e)))
 
 
 def probe_dependency_observe():
@@ -983,21 +1214,37 @@ def probe_dependency_observe():
         ev["dependency"] = "ping"
         ev["instance_id_used"] = instance_id
 
-        # 1) Drive the dependency so it produces real traffic and capture its
-        #    own account of what it connected to.
-        try:
-            self_report = requests.get(f"http://{inst.uri}", timeout=30).json()
-        except Exception as e:
-            self_report = {"error": str(e)[:160]}
-        ev["dependency_self_report"] = self_report
-
-        # 2) Independently Observe the dependency's real packets via the node.
+        # 1) Open the Observe stream FIRST. ping only makes traffic while it is
+        #    serving GET /, so a stream opened after that request has returned
+        #    can see at most the tail of a closed connection -- 2 packets on one
+        #    run, 25 on another, none on a third. That third run, with the
+        #    stream's own session event as "proof of life", was reported as
+        #    fabricated connectivity on an honest node.
         events, stop_flag = [], [False]
         t = threading.Thread(target=_collect_observe_events,
                              args=(instance_id, events, stop_flag), daemon=True)
         t.start()
+        armed_deadline = time.monotonic() + OBSERVE_ARM_SECONDS
+        while not events and t.is_alive() and time.monotonic() < armed_deadline:
+            time.sleep(0.1)
+        # Silence only means something if the stream was demonstrably running
+        # BEFORE the traffic it is supposed to see.
+        armed_before_drive = bool(events) and not (
+            isinstance(events[0], tuple) and events[0] and events[0][0] == "__error__")
+        ev["observe_armed_before_drive"] = armed_before_drive
+
+        # 2) Drive the dependency, inside the observed window, and capture its
+        #    own account of what it connected to.
+        try:
+            self_report = requests.get(f"http://{inst.uri}", timeout=30).json()
+        except Exception as e:
+            self_report = {"error": clip(e)}
+        ev["dependency_self_report"] = self_report
+
+        # 3) Keep observing a little past the request, for packets still in flight.
         t.join(timeout=OBSERVE_SECONDS)
         stop_flag[0] = True
+        events = list(events)
 
         packets, sessions, obs_err = [], [], None
         for e in events:
@@ -1039,14 +1286,20 @@ def probe_dependency_observe():
         elif undeclared:
             ev["verdict"] = VERDICT_DISHONEST
             ev["reason"] = f"Observe revealed traffic to undeclared/unauthorized peers: {undeclared[:3]}"
-        elif not packets and claims_connectivity and stream_alive:
-            # Only accusable because the stream demonstrably worked and still
-            # showed nothing for a dependency that claims it connected.
+        elif not packets and claims_connectivity and stream_alive and armed_before_drive:
+            # Only accusable because the stream demonstrably worked BEFORE the
+            # dependency made its connection, and still showed nothing for it.
             ev["verdict"] = VERDICT_DISHONEST
             ev["reason"] = ("dependency self-reports connectivity but the node's Observe stream — which "
-                            f"was demonstrably live ({len(sessions)} session event(s) in the same "
-                            "window) — shows no corresponding traffic; the connectivity picture is "
-                            "fabricated")
+                            "was demonstrably live before the dependency was driven "
+                            f"({len(sessions)} session event(s)) — shows no corresponding traffic; the "
+                            "connectivity picture is fabricated")
+        elif not packets and claims_connectivity and stream_alive:
+            ev["verdict"] = VERDICT_INCONCLUSIVE
+            ev["reason"] = (f"the Observe stream produced its first event only after the dependency "
+                            f"had been driven (waited {OBSERVE_ARM_SECONDS}s for it), so it cannot "
+                            "show it was watching when the connection happened; no claim is made "
+                            "(raise OBSERVE_ARM_SECONDS to decide)")
         elif not packets and claims_connectivity:
             # The stream produced nothing at all, so we cannot tell a fabricated
             # connectivity claim from an Observe window that was simply too short
@@ -1068,56 +1321,149 @@ def probe_dependency_observe():
         ev["reason"] = f"observe probe could not run: {e}"
     except Exception as e:
         ev["verdict"] = VERDICT_INFRA_ERROR
-        ev["reason"] = f"observe probe could not run: {type(e).__name__}: {str(e)[:180]}"
+        ev["reason"] = f"observe probe could not run: {type(e).__name__}: {clip(e)}"
     finally:
         _release_child(ping_service, inst, "ping")
     return ev
 
 
+def _now():
+    return datetime.datetime.utcnow().isoformat() + "Z"
+
+
+# ----------------------------------------------------------------------------
+# One suite at a time
+# ----------------------------------------------------------------------------
+# Every probe spins children on THIS instance's balance, and mu_accounting
+# measures that balance. Two runs at once -- the report page auto-starting an
+# attestation while the startup suite was still going, or an MCP client calling
+# a probe beside the UI's job -- doubled the spend and fed one run's children
+# into the other's MU windows. Anything that spins a child or moves this
+# instance's resources takes this lock; callers that cannot wait get a BusyError
+# naming what is running.
+_suite_lock = threading.Lock()
+CURRENT_WORK = {"name": None, "since": None}
+
+
+class BusyError(RuntimeError):
+    def __init__(self):
+        self.running = dict(CURRENT_WORK)
+        super().__init__(f"busy: {self.running['name']} has been running since "
+                         f"{self.running['since']}; try again when it finishes")
+
+
+@contextlib.contextmanager
+def exclusive(name, wait=False):
+    if not _suite_lock.acquire(blocking=wait):
+        raise BusyError()
+    CURRENT_WORK.update(name=name, since=_now())
+    try:
+        yield
+    finally:
+        CURRENT_WORK.update(name=None, since=None)
+        _suite_lock.release()
+
+
+def ensure_funded(pending_builds=0, timeout=None, on_wait=None):
+    """Wait until the balance covers one suite. Returns (funded, funding snapshot).
+
+    The first call measures what the node charges this instance and sizes every
+    child from it. When the rate cannot be measured -- the gateway is down, or
+    the node charges nothing -- there is nothing to wait for: the suite runs and
+    its preflight reports the gateway, or the node is free.
+    Call with the suite lock held: sampling settles this instance's resources.
+    """
+    timeout = FUNDING_WAIT_TIMEOUT_SECONDS if timeout is None else timeout
+    deadline = time.monotonic() + timeout
+    try:
+        rate = FUNDING["self_rate_mu_per_s"]
+        if rate is None:
+            rate = measure_self_rate()
+        if rate is None:
+            return True, dict(funding_status(), note="rate unknown (no charge, or a top-up "
+                                                     "during sampling); not gating on funds")
+        if not FUNDING["child_initial_mu"]:
+            configure_child_budgets(rate)
+        while True:
+            required = funding_requirement(rate, pending_builds)
+            sample_balance()
+            snap = funding_status(required)
+            if snap["funded"] or time.monotonic() >= deadline:
+                return snap["funded"], snap
+            if on_wait:
+                on_wait(snap)
+            time.sleep(FUNDING_POLL_SECONDS)
+    except Exception as e:
+        return True, dict(funding_status(),
+                          note=f"could not read the balance ({type(e).__name__}); the "
+                               "gateway preflight will report why")
+
+
 # ----------------------------------------------------------------------------
 # Startup automation-test harness
-# (runs on boot; executes every dependency and records the verdicts)
+# (runs on boot once funded; executes every dependency and records the verdicts)
 # ----------------------------------------------------------------------------
-STARTUP_TESTS = {"status": "pending", "started_at": None, "finished_at": None, "results": None}
+# The suite used to start the instant the service booted, before anyone could
+# have topped the instance up, so a freshly executed verifier reported five
+# INFRA_ERRORs and never tried again. Now it waits until the balance covers a
+# suite, says exactly how much is missing while it waits, and if the node still
+# refuses a launch for want of balance (a child's first build costs BUILD_MU)
+# it waits for that too and runs again.
+STARTUP_MAX_ATTEMPTS = int(os.environ.get("STARTUP_MAX_ATTEMPTS", "3"))
+STARTUP_ACTIVE = ("queued", "running", "waiting_for_funds")
+STARTUP_TESTS = {"status": "pending", "started_at": None, "finished_at": None,
+                 "results": None, "funding": None, "attempt": 0, "error": None}
 _startup_lock = threading.Lock()
 
 # ----------------------------------------------------------------------------
-# Attestation job — run in the background, polled by the UI
+# Attestation job — run in the background, polled by the UI and the MCP
 # ----------------------------------------------------------------------------
-# A full attestation run drives every probe (memory ceiling ladder, two
+# A full attestation run drives every probe (memory ceiling ladder, three
 # MU-accounting windows, several child launches) and can legitimately take
 # minutes. Blocking one HTTP request for that long is what a proxy/tunnel
 # sitting in front of this service will eventually kill mid-flight, which the
 # browser reports as a bare "NetworkError" with no HTTP status to explain it.
-# So attestation runs the same way STARTUP_TESTS already does: kicked off in a
-# background thread, polled from a short-lived request.
+# So attestation runs the same way STARTUP_TESTS does: kicked off in a
+# background thread, polled from a short-lived request -- by the page and by the
+# MCP tools alike, so both read the same run.
+ATTESTATION_ACTIVE = ("queued", "running")
 ATTESTATION_JOB = {"status": "idle", "started_at": None, "finished_at": None,
-                    "result": None, "error": None}
+                   "result": None, "error": None, "funding": None}
 _attestation_lock = threading.Lock()
 
 
 def run_attestation_job():
-    with _attestation_lock:
-        if ATTESTATION_JOB["status"] == "running":
-            return ATTESTATION_JOB
-        ATTESTATION_JOB["status"] = "running"
-        ATTESTATION_JOB["started_at"] = datetime.datetime.utcnow().isoformat() + "Z"
-        ATTESTATION_JOB["finished_at"] = None
-        ATTESTATION_JOB["result"] = None
-        ATTESTATION_JOB["error"] = None
+    ATTESTATION_JOB["status"] = "running"
     try:
-        ATTESTATION_JOB["result"] = build_attestation()
-        ATTESTATION_JOB["status"] = "done"
+        with exclusive("attestation"):
+            funded, snap = ensure_funded(timeout=0)
+            ATTESTATION_JOB["funding"] = snap
+            if not funded:
+                ATTESTATION_JOB["status"] = "insufficient_funds"
+                ATTESTATION_JOB["error"] = snap.get("operator_hint")
+            else:
+                ATTESTATION_JOB["result"] = build_attestation()
+                ATTESTATION_JOB["status"] = "done"
+    except BusyError as e:
+        ATTESTATION_JOB["status"] = "busy"
+        ATTESTATION_JOB["error"] = str(e)
     except Exception as e:
         ATTESTATION_JOB["status"] = "error"
-        ATTESTATION_JOB["error"] = f"{type(e).__name__}: {str(e)[:200]}"
-    ATTESTATION_JOB["finished_at"] = datetime.datetime.utcnow().isoformat() + "Z"
+        ATTESTATION_JOB["error"] = f"{type(e).__name__}: {clip(e)}"
+    ATTESTATION_JOB["finished_at"] = _now()
     logging.info("Attestation job finished: status=%s", ATTESTATION_JOB.get("status"))
     return ATTESTATION_JOB
 
 
 def start_attestation_async():
+    """Schedule one attestation unless one is already queued or running."""
+    with _attestation_lock:
+        if ATTESTATION_JOB["status"] in ATTESTATION_ACTIVE:
+            return False
+        ATTESTATION_JOB.update(status="queued", started_at=_now(), finished_at=None,
+                               result=None, error=None, funding=None)
     threading.Thread(target=run_attestation_job, name="attestation-run", daemon=True).start()
+    return True
 
 # Registry of all probes: (key, callable). Used by the startup harness and the
 # attestation so both stay in sync and a single misbehaving probe can never take
@@ -1158,6 +1504,8 @@ def probe_gateway_reachability():
             {"min": mem_limit or MU_HIGH_CEILING, "max": MU_HIGH_CEILING})
         ev["rpc_roundtrip_ms"] = int((time.time() - t0) * 1000)
         ev["balance_mu"] = balance
+        with _funding_lock:
+            FUNDING["balance_mu"], FUNDING["sampled_at"] = balance, time.time()
         ev["verdict"] = VERDICT_PASS
         ev["reason"] = f"node gateway reachable and answering RPCs at {node_url}"
     except Exception as e:
@@ -1200,12 +1548,13 @@ def _safe_probe(name, fn):
         return fn()
     except Exception as e:
         return {"probe": name, "verdict": VERDICT_INFRA_ERROR,
-                "reason": f"probe crashed: {type(e).__name__}: {str(e)[:180]}"}
+                "reason": f"probe crashed: {type(e).__name__}: {clip(e)}"}
 
 
 def _run_probe_suite():
     """Run the preflight, then every probe, short-circuiting the gateway-dependent
     ones when the node is unreachable. Returns an ordered {name: evidence} dict."""
+    del FUNDING_FAILURES[:]
     results = {}
     preflight = _safe_probe("gateway_reachability", probe_gateway_reachability)
     results["gateway_reachability"] = preflight
@@ -1229,43 +1578,94 @@ def _run_probe_suite():
                 "skipped": True,
             }
             continue
+        if FUNDING_FAILURES and name in GATEWAY_DEPENDENT:
+            # The node already refused to fund a child: this run is starved and
+            # will be re-run once topped up. Launching the rest only collects the
+            # same refusal, and mu_accounting's windows would cost minutes of a
+            # balance that is already short.
+            results[name] = {
+                "probe": name,
+                "verdict": VERDICT_INFRA_ERROR,
+                "reason": (f"skipped: the node refused to fund child(ren) {FUNDING_FAILURES} "
+                           "for want of balance earlier in this run (INSUFFICIENT FUNDS)"),
+                "fault": "insufficient_funds",
+                "skipped": True,
+            }
+            continue
         results[name] = _safe_probe(name, fn)
     return results
 
 
+def summarize_suite(results):
+    unobserved = [p for p in results.values() if p.get("verdict") not in CONCLUSIVE_VERDICTS]
+    summary = {
+        "pass": sum(1 for p in results.values() if p.get("verdict") == VERDICT_PASS),
+        "dishonest": sum(1 for p in results.values() if p.get("verdict") in ACCUSING_VERDICTS),
+        "unobserved": len(unobserved),
+        "unobserved_probes": [p.get("probe") for p in unobserved],
+        "total": len(results),
+    }
+    summary["observation_complete"] = not unobserved
+    summary["all_passed"] = summary["dishonest"] == 0 and summary["unobserved"] == 0
+    return summary
+
+
 def run_startup_tests():
-    with _startup_lock:
-        if STARTUP_TESTS["status"] == "running":
-            return STARTUP_TESTS
-        STARTUP_TESTS["status"] = "running"
-        STARTUP_TESTS["started_at"] = datetime.datetime.utcnow().isoformat() + "Z"
+    def waiting(snap):
+        STARTUP_TESTS.update(status="waiting_for_funds", funding=snap)
+
     try:
-        # gateway preflight + resource provisioning + dependency identity +
-        # network isolation (real ping child) + observe + memory ceiling +
-        # node benchmark + MU.
-        results = _run_probe_suite()
-        unobserved = [p for p in results.values() if p.get("verdict") not in CONCLUSIVE_VERDICTS]
-        summary = {
-            "pass": sum(1 for p in results.values() if p.get("verdict") == VERDICT_PASS),
-            "dishonest": sum(1 for p in results.values() if p.get("verdict") in ACCUSING_VERDICTS),
-            "unobserved": len(unobserved),
-            "unobserved_probes": [p.get("probe") for p in unobserved],
-            "total": len(results),
-        }
-        summary["observation_complete"] = not unobserved
-        summary["all_passed"] = summary["dishonest"] == 0 and summary["unobserved"] == 0
-        STARTUP_TESTS["results"] = {"summary": summary, "probes": results}
-        STARTUP_TESTS["status"] = "done"
+        # Waits for an attestation or probe already running instead of colliding.
+        with exclusive("startup_tests", wait=True):
+            pending_builds = 0
+            for attempt in range(1, STARTUP_MAX_ATTEMPTS + 1):
+                STARTUP_TESTS["attempt"] = attempt
+                funded, snap = ensure_funded(pending_builds, on_wait=waiting)
+                STARTUP_TESTS["funding"] = snap
+                if not funded:
+                    STARTUP_TESTS["status"] = "unfunded"
+                    STARTUP_TESTS["error"] = (f"still {snap.get('missing_mu')} MU short after "
+                                              f"{FUNDING_WAIT_TIMEOUT_SECONDS}s. "
+                                              f"{snap.get('operator_hint', '')}")
+                    break
+                STARTUP_TESTS.update(status="running", started_at=_now())
+                # gateway preflight + resource provisioning + dependency identity +
+                # network isolation (real ping child) + observe + memory ceiling +
+                # node benchmark + MU.
+                results = _run_probe_suite()
+                STARTUP_TESTS["results"] = {"summary": summarize_suite(results), "probes": results}
+                starved = list(FUNDING_FAILURES)
+                STARTUP_TESTS["starved_children"] = starved
+                STARTUP_TESTS["status"] = "done"
+                if not starved:
+                    break
+                # The node refused a launch for want of balance: children that have
+                # never launched here still owe their first build. Wait for that too.
+                pending_builds = max(1, sum(1 for c in CHILD_DECLARED_RESOURCES
+                                            if c not in FUNDING["built_children"]))
+                logging.info("Startup suite starved of funds (%s); waiting for %d build(s)",
+                             starved, pending_builds)
     except Exception as e:
         STARTUP_TESTS["status"] = "error"
-        STARTUP_TESTS["error"] = str(e)
-    STARTUP_TESTS["finished_at"] = datetime.datetime.utcnow().isoformat() + "Z"
+        STARTUP_TESTS["error"] = f"{type(e).__name__}: {clip(e)}"
+    STARTUP_TESTS["finished_at"] = _now()
     logging.info("Startup automation tests finished: status=%s", STARTUP_TESTS.get("status"))
     return STARTUP_TESTS
 
 
 def start_startup_tests_async():
+    """Schedule the startup suite unless it is already queued, waiting or running.
+
+    The status is claimed under the lock: the rerun route used to write "pending"
+    over a running suite, which the running-check then let through, so a rerun
+    during a run started a second suite on the same balance.
+    """
+    with _startup_lock:
+        if STARTUP_TESTS["status"] in STARTUP_ACTIVE:
+            return False
+        STARTUP_TESTS.update(status="queued", started_at=None, finished_at=None, error=None)
     threading.Thread(target=run_startup_tests, name="startup-tests", daemon=True).start()
+    return True
 
 
 # ----------------------------------------------------------------------------
@@ -1330,15 +1730,18 @@ def build_attestation():
         "probes": probes,
         "summary": summary,
         "content_hash": content_hash,
+        # Children the node refused to launch for want of balance: the run was
+        # starved, not blind. Evidence only; not part of the hashed payload.
+        "starved_children": list(FUNDING_FAILURES),
     }
 
 
 # ----------------------------------------------------------------------------
-# Routes — attestation
+# Routes — attestation, probes, startup tests, status
 # ----------------------------------------------------------------------------
 @app.route('/attestation.json', methods=['GET'])
 def attestation_json():
-    """Poll the current attestation job (idle / running / done / error)."""
+    """Poll the current attestation job."""
     return jsonify(ATTESTATION_JOB)
 
 
@@ -1346,56 +1749,49 @@ def attestation_json():
 def attestation_json_run():
     """Schedule an attestation run if one isn't already in flight, and return
     immediately -- the caller polls GET /attestation.json for the result."""
-    with _attestation_lock:
-        already_running = ATTESTATION_JOB["status"] == "running"
-    if not already_running:
-        start_attestation_async()
+    start_attestation_async()
     return jsonify(ATTESTATION_JOB), 202
 
 
-@app.route('/probe/network', methods=['GET', 'POST'])
-def route_probe_network():
-    return jsonify(probe_network_isolation())
+# (MCP tool, HTTP route, probe). One table so the routes and the MCP tools
+# cannot list different probes.
+PROBE_ENDPOINTS = [
+    ("probe_gateway_reachability", "/probe/gateway", probe_gateway_reachability),
+    ("probe_resource_provisioning", "/probe/resources", probe_resource_provisioning),
+    ("probe_dependency_identity", "/probe/dependency_identity", probe_dependency_identity),
+    ("probe_network_isolation", "/probe/network", probe_network_isolation),
+    ("probe_dependency_observe", "/probe/dependency_observe", probe_dependency_observe),
+    ("probe_memory_ceiling", "/probe/memory", probe_memory_ceiling),
+    ("probe_node_benchmark", "/probe/benchmark", probe_node_benchmark),
+    ("probe_mu_accounting", "/probe/mu_accounting", probe_mu_accounting),
+]
+# Reads /proc and /__config__ only: it spins nothing and moves nothing, so it
+# may run beside a suite.
+LOCK_FREE_PROBES = ("probe_resource_provisioning",)
 
 
-@app.route('/probe/memory', methods=['GET', 'POST'])
-def route_probe_memory():
-    return jsonify(probe_memory_ceiling())
+def run_single_probe(tool):
+    # Looked up by name at call time, so a patched probe is the one that runs.
+    fn = globals()[dict((t, p.__name__) for t, _, p in PROBE_ENDPOINTS)[tool]]
+    if tool in LOCK_FREE_PROBES:
+        return fn()
+    with exclusive(tool):
+        return fn()
 
 
-@app.route('/probe/resources', methods=['GET', 'POST'])
-def route_probe_resources():
-    return jsonify(probe_resource_provisioning())
+def _probe_view(tool):
+    def view():
+        try:
+            return jsonify(run_single_probe(tool))
+        except BusyError as e:
+            return jsonify({"status": "busy", "error": str(e), "running": e.running}), 409
+    return view
 
 
-@app.route('/probe/dependency_identity', methods=['GET', 'POST'])
-def route_probe_dep_identity():
-    return jsonify(probe_dependency_identity())
+for _tool, _path, _fn in PROBE_ENDPOINTS:
+    app.add_url_rule(_path, endpoint=_tool, view_func=_probe_view(_tool), methods=['GET', 'POST'])
 
 
-@app.route('/probe/mu_accounting', methods=['GET', 'POST'])
-def route_probe_mu():
-    return jsonify(probe_mu_accounting())
-
-
-@app.route('/probe/dependency_observe', methods=['GET', 'POST'])
-def route_probe_observe():
-    return jsonify(probe_dependency_observe())
-
-
-@app.route('/probe/benchmark', methods=['GET', 'POST'])
-def route_probe_benchmark():
-    return jsonify(probe_node_benchmark())
-
-
-@app.route('/probe/gateway', methods=['GET', 'POST'])
-def route_probe_gateway():
-    return jsonify(probe_gateway_reachability())
-
-
-# ----------------------------------------------------------------------------
-# Startup automation-test results
-# ----------------------------------------------------------------------------
 @app.route('/startup_tests', methods=['GET'])
 def route_startup_tests():
     return jsonify(STARTUP_TESTS)
@@ -1403,9 +1799,42 @@ def route_startup_tests():
 
 @app.route('/startup_tests/rerun', methods=['POST'])
 def route_startup_tests_rerun():
-    STARTUP_TESTS["status"] = "pending"
-    start_startup_tests_async()
-    return jsonify({"status": "rerun scheduled"})
+    started = start_startup_tests_async()
+    return jsonify({"status": "rerun scheduled" if started else "already active",
+                    "startup_tests": STARTUP_TESTS}), (202 if started else 409)
+
+
+def service_status(refresh=False):
+    """Balance, funding, and what is running. `refresh` settles the account for a
+    live balance -- skipped while a suite runs, because settling moves this
+    instance's resources under mu_accounting's windows."""
+    note = None
+    if refresh:
+        try:
+            with exclusive("status_refresh"):
+                sample_balance()
+        except BusyError:
+            note = "a suite is running; balance shown is the last one sampled"
+        except Exception as e:
+            note = f"could not refresh the balance: {type(e).__name__}: {clip(e)}"
+    rate = FUNDING["self_rate_mu_per_s"]
+    required = funding_requirement(rate) if rate is not None else None
+    return {
+        "verifier": "celaut-node-honesty-verifier",
+        "version": VERIFIER_VERSION,
+        "node_url": node_url,
+        "mem_limit_bytes": mem_limit,
+        "funding": funding_status(required),
+        "balance_note": note,
+        "running": dict(CURRENT_WORK),
+        "startup_tests_status": STARTUP_TESTS["status"],
+        "attestation_status": ATTESTATION_JOB["status"],
+    }
+
+
+@app.route('/status', methods=['GET'])
+def route_status():
+    return jsonify(service_status(refresh=request.args.get("refresh") in ("1", "true")))
 
 
 # ----------------------------------------------------------------------------
@@ -1414,65 +1843,111 @@ def route_startup_tests_rerun():
 # ----------------------------------------------------------------------------
 MCP_PROTOCOL_VERSION = "2024-11-05"
 _EMPTY_SCHEMA = {"type": "object", "properties": {}}
+_OBJECT_SCHEMA = {"type": "object"}
+_SPENDS = (" Spends MU from this instance's balance (children are funded from it and "
+           "refunded on stop) and waits for the suite lock: returns a busy error while "
+           "another run is in progress.")
+
+
+def _tool(name, description, read_only, input_schema=_EMPTY_SCHEMA):
+    return {"name": name, "description": description, "inputSchema": input_schema,
+            "outputSchema": _OBJECT_SCHEMA,
+            "annotations": {"readOnlyHint": read_only, "destructiveHint": False,
+                            "idempotentHint": read_only, "openWorldHint": not read_only}}
+
+
 MCP_TOOLS = [
-    {"name": "probe_gateway_reachability",
-     "description": ("Preflight: check whether this service can reach the node's gRPC gateway at "
-                     "all. Run this FIRST when other probes report INFRA_ERROR — it distinguishes "
-                     "a node/network fault from actual node dishonesty."),
-     "inputSchema": _EMPTY_SCHEMA},
-    {"name": "run_attestation",
-     "description": ("Run all node-honesty probes and return the attestation report card. The "
-                     "content hash is only minted when every probe reached a conclusive verdict; "
-                     "otherwise the report is explicitly NOT attestable."),
-     "inputSchema": _EMPTY_SCHEMA},
-    {"name": "get_startup_tests",
-     "description": "Return the results of the automation tests that run when the service starts.",
-     "inputSchema": _EMPTY_SCHEMA},
-    {"name": "probe_dependency_identity",
-     "description": "Execute each dependency and assert the requested dependency is the one that actually ran.",
-     "inputSchema": _EMPTY_SCHEMA},
-    {"name": "probe_network_isolation",
-     "description": "Run the ping child and assert declared egress is reachable and undeclared egress is blocked.",
-     "inputSchema": _EMPTY_SCHEMA},
-    {"name": "probe_memory_ceiling",
-     "description": "Ramp the heavy child toward/past its declared memory ceiling and check enforcement.",
-     "inputSchema": _EMPTY_SCHEMA},
-    {"name": "probe_resource_provisioning",
-     "description": "Compare declared/charged resources against the container's real cgroup limits.",
-     "inputSchema": _EMPTY_SCHEMA},
-    {"name": "probe_mu_accounting",
-     "description": "Verify the node spends the service's MUs in line with the resources it provisions (charges, scales with usage, does not drain).",
-     "inputSchema": _EMPTY_SCHEMA},
-    {"name": "probe_dependency_observe",
-     "description": "Use the node Observe RPC to independently watch a dependency's real packets and confirm its connectivity is genuine, not fabricated by the node.",
-     "inputSchema": _EMPTY_SCHEMA},
-    {"name": "probe_node_benchmark",
-     "description": "Run the benchmark child (the node's per-core benchmark core service), return its scores and check it ran under its declared architecture.",
-     "inputSchema": _EMPTY_SCHEMA},
+    _tool("probe_gateway_reachability",
+          "Preflight: check whether this service can reach the node's gRPC gateway at all. Run "
+          "this FIRST when other probes report INFRA_ERROR — it distinguishes a node/network "
+          "fault from actual node dishonesty. Settles the account (one MODIFY_RESOURCES charge).",
+          False),
+    _tool("run_attestation",
+          "Start a full attestation run (every probe) in the background and return at once with "
+          "the job state; poll get_attestation for the report card. This is the same job the web "
+          "report shows. Refused with status insufficient_funds when the balance cannot cover a "
+          "suite. The content hash is only minted when every probe reached a conclusive verdict."
+          + _SPENDS, False),
+    _tool("get_attestation",
+          "Return the current attestation job (idle / queued / running / done / error / "
+          "insufficient_funds / busy) and, once done, its report card — exactly what the web "
+          "report renders.", True),
+    _tool("get_startup_tests",
+          "Return the startup automation suite: its status (queued / waiting_for_funds / running "
+          "/ done / unfunded / error), the funding it is waiting for, and its results.", True),
+    _tool("rerun_startup_tests",
+          "Run the startup automation suite again in the background (it waits for funds first); "
+          "poll get_startup_tests. No-op while it is already queued, waiting or running." + _SPENDS,
+          False),
+    _tool("get_service_status",
+          "Balance, measured MU rate, what a suite needs on hand and how much is missing (with "
+          "the nodo command to top up), memory, and what is running.",
+          True, {"type": "object", "properties": {"refresh": {
+              "type": "boolean",
+              "description": "settle the account for a live balance (one MODIFY_RESOURCES charge)"}}}),
+    _tool("probe_dependency_identity",
+          "Execute each dependency and assert the requested dependency is the one that actually ran."
+          + _SPENDS, False),
+    _tool("probe_network_isolation",
+          "Run the ping child and assert declared egress is reachable and undeclared egress is blocked."
+          + _SPENDS, False),
+    _tool("probe_memory_ceiling",
+          "Ramp the heavy child toward/past its declared memory ceiling and check enforcement."
+          + _SPENDS, False),
+    _tool("probe_resource_provisioning",
+          "Compare declared/charged resources against the instance's real memory limits. Reads "
+          "only local files; spends nothing and may run beside a suite.", True),
+    _tool("probe_mu_accounting",
+          "Verify the node spends the service's MUs in line with the resources it provisions "
+          "(charges, scales with usage beyond the run's own noise, does not drain). Takes three "
+          "MU windows (~3 min)." + _SPENDS, False),
+    _tool("probe_dependency_observe",
+          "Use the node Observe RPC to independently watch a dependency's real packets and confirm "
+          "its connectivity is genuine, not fabricated by the node." + _SPENDS, False),
+    _tool("probe_node_benchmark",
+          "Run the benchmark child (the node's per-core benchmark core service), return its scores "
+          "and check it ran under its declared architecture." + _SPENDS, False),
 ]
 
+# Every HTTP route an operator can use, and the MCP tool(s) that give a model the
+# same thing. tests/test_mcp.py fails when a route has neither an entry here nor
+# a reason in ROUTES_WITHOUT_MCP.
+ROUTE_MCP_TOOLS = {
+    "/attestation.json": ("get_attestation", "run_attestation"),
+    "/startup_tests": ("get_startup_tests",),
+    "/startup_tests/rerun": ("rerun_startup_tests",),
+    "/status": ("get_service_status",),
+    "/current_balance": ("get_service_status",),
+    "/memory_usage": ("get_service_status",),
+    **{path: (tool,) for tool, path, _ in PROBE_ENDPOINTS},
+}
+ROUTES_WITHOUT_MCP = {
+    "/": "the HTML report card; everything it renders comes from routes mapped above",
+    "/mcp": "the MCP endpoint itself",
+    "/static/<path:filename>": "Flask's built-in static route",
+    "/services": "legacy demo endpoint",
+    "/generate_service": "legacy demo endpoint",
+    "/generate_heavy_service": "legacy demo endpoint",
+    "/generate_ping_service": "legacy demo endpoint",
+    "/use_services": "legacy demo endpoint",
+}
 
-def _mcp_call_tool(name):
-    if name == "probe_gateway_reachability":
-        return probe_gateway_reachability()
+
+def _mcp_call_tool(name, args):
+    if name in dict((t, None) for t, _, _ in PROBE_ENDPOINTS):
+        return run_single_probe(name)
     if name == "run_attestation":
-        return build_attestation()
+        started = start_attestation_async()
+        return dict(ATTESTATION_JOB, started=started)
+    if name == "get_attestation":
+        return ATTESTATION_JOB
     if name == "get_startup_tests":
         return STARTUP_TESTS
-    if name == "probe_dependency_identity":
-        return probe_dependency_identity()
-    if name == "probe_network_isolation":
-        return probe_network_isolation()
-    if name == "probe_memory_ceiling":
-        return probe_memory_ceiling()
-    if name == "probe_resource_provisioning":
-        return probe_resource_provisioning()
-    if name == "probe_mu_accounting":
-        return probe_mu_accounting()
-    if name == "probe_dependency_observe":
-        return probe_dependency_observe()
-    if name == "probe_node_benchmark":
-        return probe_node_benchmark()
+    if name == "rerun_startup_tests":
+        started = start_startup_tests_async()
+        return dict(STARTUP_TESTS, started=started)
+    if name == "get_service_status":
+        return service_status(refresh=bool(args.get("refresh")))
     raise ValueError(f"unknown tool: {name}")
 
 
@@ -1494,6 +1969,10 @@ def mcp_endpoint():
     def _error(code, msg):
         return jsonify({"jsonrpc": "2.0", "id": rid, "error": {"code": code, "message": msg}})
 
+    def _content(out, is_error):
+        return _result({"content": [{"type": "text", "text": json.dumps(out)}],
+                        "structuredContent": out, "isError": is_error})
+
     if method == "initialize":
         return _result({"protocolVersion": MCP_PROTOCOL_VERSION,
                         "capabilities": {"tools": {}},
@@ -1507,12 +1986,11 @@ def mcp_endpoint():
         params = req.get("params") or {}
         name = params.get("name")
         try:
-            out = _mcp_call_tool(name)
-            return _result({"content": [{"type": "text", "text": json.dumps(out)}],
-                            "isError": False})
+            return _content(_mcp_call_tool(name, params.get("arguments") or {}), False)
+        except BusyError as e:
+            return _content({"status": "busy", "error": str(e), "running": e.running}, True)
         except Exception as e:
-            return _result({"content": [{"type": "text", "text": f"error: {e}"}],
-                            "isError": True})
+            return _content({"error": f"{type(e).__name__}: {clip(e)}"}, True)
     return _error(-32601, f"method not found: {method}")
 
 
@@ -1541,8 +2019,10 @@ REPORT_HTML = """
 <p><small>Absence of evidence is not evidence of dishonesty: probes that could not observe the node
 report <b>INFRA_ERROR</b>, and no attestation hash is minted unless every probe reached a
 conclusive verdict.</small></p>
-<div id="overall">Running probes… (this launches child microVMs and can take ~1 minute)</div>
-<button class="btn btn-primary" onclick="run()">Re-run attestation</button>
+<div id="funding"></div>
+<div id="overall">Loading the last attestation…</div>
+<button class="btn btn-primary" onclick="run()">Run attestation</button>
+<p><small>A run launches child microVMs paid for from this instance's balance and takes a few minutes.</small></p>
 <h3>Startup automation tests</h3>
 <div id="startup">Loading startup test results…</div>
 <div id="cards"></div>
@@ -1580,8 +2060,33 @@ function renderAttestation(rep){
 // child launches) and can take minutes, so the job runs in the background and
 // this polls a short-lived status endpoint instead of awaiting one long fetch
 // that a proxy/tunnel in front of this service could kill mid-flight.
+// Opening the page no longer starts a run: every visit used to spend MU on a
+// fresh attestation, and collide with the startup suite while it was running.
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+
+function fundingHtml(f){
+  if(!f) return '';
+  if(f.funded===false){
+    return '<div class="card UNVERIFIED"><b>Waiting for funds</b>: balance '+f.balance_mu+
+      ' MU, a suite needs '+f.required_mu+' MU ('+f.missing_mu+' MU missing).<br>'+
+      (f.operator_hint||'')+'</div>';
+  }
+  return '';
+}
+
+async function loadFunding(){
+  try{
+    const st=await (await fetch('/status')).json();
+    const f=st.funding||{};
+    document.getElementById('funding').innerHTML = f.balance_mu==null ? '' :
+      '<p><small>Balance '+f.balance_mu+' MU'+
+      (f.required_mu!=null ? ' · a suite needs '+f.required_mu+' MU' : '')+
+      (st.running&&st.running.name ? ' · running: '+st.running.name : '')+'</small></p>'+fundingHtml(f);
+  }catch(e){}
+}
+
 async function run(){
-  document.getElementById('overall').innerText='Running probes… please wait.';
+  document.getElementById('overall').innerText='Starting attestation…';
   try{
     await fetch('/attestation.json',{method:'POST'});
     await pollAttestation();
@@ -1589,33 +2094,51 @@ async function run(){
 }
 
 async function pollAttestation(){
+  const el=document.getElementById('overall');
   for(;;){
-    const res=await fetch('/attestation.json');
-    const job=await res.json();
+    const job=await (await fetch('/attestation.json')).json();
     if(job.status==='done'){ renderAttestation(job.result); return; }
-    if(job.status==='error'){ document.getElementById('overall').innerText='Attestation failed: '+job.error; return; }
-    document.getElementById('overall').innerText='Running probes… ('+job.status+')';
-    await new Promise(r=>setTimeout(r,3000));
+    if(job.status==='idle'){ el.innerText='No attestation has been run on this instance yet.'; return; }
+    if(job.status==='insufficient_funds'){ el.innerHTML='Not started — insufficient funds.'+fundingHtml(job.funding); return; }
+    if(job.status==='busy'){ el.innerText='Not started — '+job.error; return; }
+    if(job.status==='error'){ el.innerText='Attestation failed: '+job.error; return; }
+    el.innerText='Running probes… ('+job.status+')';
+    await sleep(3000);
   }
 }
+
 async function loadStartup(){
-  try{
-    const res=await fetch('/startup_tests');const st=await res.json();
-    const el=document.getElementById('startup');
-    if(st.status!=='done'){el.innerHTML='<em>status: '+st.status+'</em> (tests run on boot; refresh in a moment)';return;}
-    const s=st.results.summary;
-    const cls = s.all_passed?'PASS':(s.dishonest>0?'DISHONEST':'UNVERIFIED');
-    const txt = s.all_passed?'ALL PASSED':(s.dishonest>0?'DISHONESTY OBSERVED':'INCOMPLETE OBSERVATION');
-    let h='<div class="card '+cls+'"><b>'+txt+'</b> — '+s.pass+' pass / '+s.dishonest+
-      ' dishonest / '+s.unobserved+' unobserved / '+s.total+' tests</div>';
-    Object.values(st.results.probes).forEach(p=>{const v=p.verdict||'INFRA_ERROR';
-      h+='<div class="card '+v+'"><h4>'+p.probe+' <span class="badge b-'+v+'">'+v+'</span></h4>'+
-         '<p>'+(p.reason||'')+'</p><pre>'+JSON.stringify(p,null,2)+'</pre></div>';});
-    el.innerHTML=h;
-  }catch(e){document.getElementById('startup').innerText='Error loading startup tests: '+e;}
+  const el=document.getElementById('startup');
+  for(;;){
+    let st;
+    try{ st=await (await fetch('/startup_tests')).json(); }
+    catch(e){ el.innerText='Error loading startup tests: '+e; return; }
+    if(st.status==='waiting_for_funds'){
+      el.innerHTML='<em>waiting for funds before running</em>'+fundingHtml(st.funding);
+    }else if(st.status==='unfunded' || st.status==='error'){
+      el.innerHTML='<div class="card UNVERIFIED"><b>'+st.status+'</b>: '+(st.error||'')+'</div>';
+      return;
+    }else if(st.status!=='done' || !st.results){
+      el.innerHTML='<em>status: '+st.status+'</em>';
+    }else{
+      const s=st.results.summary;
+      const cls = s.all_passed?'PASS':(s.dishonest>0?'DISHONEST':'UNVERIFIED');
+      const txt = s.all_passed?'ALL PASSED':(s.dishonest>0?'DISHONESTY OBSERVED':'INCOMPLETE OBSERVATION');
+      let h='<div class="card '+cls+'"><b>'+txt+'</b> — '+s.pass+' pass / '+s.dishonest+
+        ' dishonest / '+s.unobserved+' unobserved / '+s.total+' tests</div>';
+      Object.values(st.results.probes).forEach(p=>{const v=p.verdict||'INFRA_ERROR';
+        h+='<div class="card '+v+'"><h4>'+p.probe+' <span class="badge b-'+v+'">'+v+'</span></h4>'+
+           '<p>'+(p.reason||'')+'</p><pre>'+JSON.stringify(p,null,2)+'</pre></div>';});
+      el.innerHTML=h;
+      return;
+    }
+    await sleep(5000);
+    loadFunding();
+  }
 }
+loadFunding();
 loadStartup();
-run();
+pollAttestation();
 </script>
 </body></html>
 """
@@ -1685,7 +2208,10 @@ def use_services():
 
 @app.route('/current_balance', methods=['GET'])
 def current_balance():
-    return jsonify({"balance_mu": "{:.2e}".format(balance_mu)})
+    # Used to format a module global that nothing ever updated, so it said 0.00e+00
+    # forever. Now the last balance the node reported (see /status for the rest).
+    balance = FUNDING["balance_mu"]
+    return jsonify({"balance_mu": "{:.2e}".format(balance) if balance is not None else None})
 
 
 @app.route('/memory_usage', methods=['GET'])
@@ -1697,8 +2223,9 @@ def memory_usage():
 if __name__ == '__main__':
     logging.info('Starting the node-honesty verifier.')
     # Kick off the automation test suite as soon as the service starts; it runs
-    # in the background so Flask still binds immediately. Results are served at
-    # /startup_tests, in the report card, and via the MCP get_startup_tests tool.
+    # in the background so Flask still binds immediately, and waits until the
+    # balance covers it. Results are served at /startup_tests, in the report
+    # card, and via the MCP get_startup_tests tool.
     start_startup_tests_async()
     # debug=False: the Werkzeug interactive debugger is a remote-code-execution
     # risk on a service that is reachable over the network, PIN or not -- this
