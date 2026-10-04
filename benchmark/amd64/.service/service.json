@@ -9,7 +9,12 @@
         }
     ],
     "architecture": "linux/amd64",
-    "entrypoint": "/benchmark/serve",
+    "init": {
+        "entry_path": [
+            "benchmark",
+            "serve"
+        ]
+    },
     "envs": [],
     "resources": {
         "at_init": {

@@ -1,5 +1,4 @@
 {
-  "workdir": "ping-service",
   "include": [
     "src",
     "Cargo.toml",

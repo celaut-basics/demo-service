@@ -4,13 +4,16 @@
         {
             "port": 3030,
             "protocol": [
-                "http",
-                "tls"
+                "http"
             ]
         }
     ],
     "architecture": "linux/amd64",
-    "entrypoint": "/tiny-service",
+    "init": {
+        "entry_path": [
+            "tiny-service"
+        ]
+    },
     "envs": [],
     "resources": {
         "at_init": {
