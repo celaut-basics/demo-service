@@ -1,5 +1,5 @@
 {
-    "tag": "demo",
+    "tag": "celaut-node-honesty-verifier",
     "api": [
         {
             "port": 5000,

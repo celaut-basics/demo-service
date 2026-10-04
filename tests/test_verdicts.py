@@ -163,7 +163,7 @@ def _install_stubs(tmpdir):
     svc = os.path.join(tmpdir, "service")
     os.makedirs(svc, exist_ok=True)
     with open(os.path.join(svc, ".dependencies"), "w") as fh:
-        fh.write("TINY=tinyhash\nHEAVY=heavyhash\nPING=pinghash\n")
+        fh.write("TINY=tinyhash\nHEAVY=heavyhash\nPING=pinghash\nBENCHMARK=benchmarkhash\n")
 
     return FakeServiceInterface, FakeController
 
@@ -209,7 +209,7 @@ class BlindNodeTests(unittest.TestCase):
         ev = app.probe_dependency_identity()
         self.assertEqual(ev["verdict"], app.VERDICT_INFRA_ERROR)
         self.assertEqual(ev["verified_count"], 0)
-        self.assertEqual(sorted(ev["not_observed"]), ["heavy", "ping", "tiny"])
+        self.assertEqual(sorted(ev["not_observed"]), ["benchmark", "heavy", "ping", "tiny"])
         self.assertEqual(ev["mismatched"], [])
         for check in ev["checks"]:
             self.assertIsNone(check["match"], "unobserved must be None, not False")
@@ -259,7 +259,8 @@ class BlindNodeTests(unittest.TestCase):
         """FINDINGS-2026-08-22.md, 'Criterio de aceptacion'.
 
         With the node in the observed state (gateway unreachable) the battery
-        must report 1 PASS + 6 INFRA_ERROR, attestable: false, content_hash: null.
+        must report 1 PASS + 6 INFRA_ERROR, attestable: false, content_hash: null --
+        7 INFRA_ERROR now that node_benchmark joined the gateway-dependent probes.
         The guest's real /proc/meminfo figures are injected because the test host
         is not the microVM.
         """
@@ -275,8 +276,8 @@ class BlindNodeTests(unittest.TestCase):
             self.assertEqual(verdicts[name], app.VERDICT_INFRA_ERROR)
         self.assertEqual(rep["summary"]["pass"], 1)
         self.assertEqual(rep["summary"]["dishonest"], 0)
-        self.assertEqual(rep["summary"]["unobserved"], 6)
-        self.assertEqual(rep["summary"]["total"], 7)
+        self.assertEqual(rep["summary"]["unobserved"], 7)
+        self.assertEqual(rep["summary"]["total"], 8)
         self.assertFalse(rep["summary"]["attestable"])
         self.assertIsNone(rep["content_hash"]["value"])
 
@@ -699,6 +700,104 @@ class FaultAttributionTests(unittest.TestCase):
         failure = app.classify_rpc_failure(_RpcError("no text status here"))
         self.assertEqual(failure["grpc_code"], "RESOURCE_EXHAUSTED")
         self.assertEqual(failure["fault"], app.FAULT_NODE_RPC)
+
+
+class NodeBenchmarkTests(unittest.TestCase):
+    """benchmark is launched like every other dependency and runs in the suite."""
+
+    SCORES = {"architecture": app.BENCHMARK_DECLARED_ARCH, "int_ops_per_sec": 78500,
+              "flt_ops_per_sec": 250000, "mem_bandwidth_bytes_per_sec": 14810232055,
+              "mem_bandwidth_working_set_bytes": 1073741824,
+              "sha256_hashes_per_sec": 17024, "skipped": []}
+
+    def setUp(self):
+        FakeServiceInterface.launch_mode = "ok"
+        FakeController.rpc_mode = "ok"
+        FakeServiceInterface.stopped = []
+
+    def _run(self, payload, status=200):
+        urls = []
+
+        def fake_get(url, timeout=None):
+            urls.append(url)
+            r = mock.Mock()
+            r.status_code = status
+            r.json.return_value = payload
+            return r
+        with mock.patch.object(app.requests, "get", side_effect=fake_get):
+            ev = app.probe_node_benchmark()
+        return ev, urls
+
+    def test_the_demo_packs_benchmark_as_a_dependency(self):
+        # The layout itself is checked by tests/test_layout.py.
+        for arch in ("arm64", "amd64"):
+            with open(os.path.join(ROOT, arch, ".service", "pack_config.json")) as fh:
+                self.assertEqual(json.load(fh)["dependencies"].get("BENCHMARK"), "benchmark")
+        self.assertEqual(app.benchmark_service.service_hash, "benchmarkhash")
+
+    def test_the_expected_architecture_is_this_instance_own(self):
+        self.assertEqual(app.canonical_arch("x86_64"), "linux/amd64")
+        self.assertEqual(app.canonical_arch("aarch64"), "linux/arm64")
+        self.assertEqual(app.canonical_arch("riscv64"), "linux/riscv64")
+        self.assertEqual(app.BENCHMARK_DECLARED_ARCH, app.canonical_arch(app.platform.machine()))
+
+    def test_benchmark_is_part_of_the_suite_and_needs_the_gateway(self):
+        self.assertIn("node_benchmark", dict(app.PROBES))
+        self.assertIn("node_benchmark", app.GATEWAY_DEPENDENT)
+        self.assertIn("probe_node_benchmark", [t["name"] for t in app.MCP_TOOLS])
+        self.assertIn("benchmark", [d[0] for d in app.DEP_IDENTITY])
+
+    def test_a_full_run_under_the_declared_architecture_passes(self):
+        ev, urls = self._run(dict(self.SCORES))
+        self.assertEqual(ev["verdict"], app.VERDICT_PASS, ev["reason"])
+        self.assertEqual(ev["scores"]["int_ops_per_sec"], 78500)
+        self.assertTrue(urls[0].endswith("/cgi-bin/benchmark"))
+        self.assertEqual(FakeServiceInterface.stopped, [LISTENING_URI])
+
+    def test_another_architecture_is_a_substitution(self):
+        other = "linux/amd64" if app.BENCHMARK_DECLARED_ARCH != "linux/amd64" else "linux/arm64"
+        ev, _ = self._run(dict(self.SCORES, architecture=other))
+        self.assertEqual(ev["verdict"], app.VERDICT_DISHONEST)
+
+    def test_an_unmeasured_primitive_is_inconclusive(self):
+        scores = dict(self.SCORES, skipped=["sha256_hashes_per_sec: sha256sum failed"])
+        del scores["sha256_hashes_per_sec"]
+        ev, _ = self._run(scores)
+        self.assertEqual(ev["verdict"], app.VERDICT_INCONCLUSIVE)
+        self.assertIn("sha256_hashes_per_sec", ev["reason"])
+
+    def test_a_refused_run_does_not_accuse(self):
+        ev, _ = self._run({"error": "a benchmark is already running"}, status=409)
+        self.assertEqual(ev["verdict"], app.VERDICT_INCONCLUSIVE)
+
+    def test_a_child_that_never_ran_is_infra_error(self):
+        FakeServiceInterface.launch_mode = "unbound_local"
+        ev, urls = self._run(dict(self.SCORES))
+        self.assertEqual(ev["verdict"], app.VERDICT_INFRA_ERROR)
+        self.assertEqual(urls, [])
+
+    def test_a_run_that_never_answers_is_infra_error(self):
+        with mock.patch.object(app.requests, "get", side_effect=TimeoutError("read timed out")):
+            ev = app.probe_node_benchmark()
+        self.assertEqual(ev["verdict"], app.VERDICT_INFRA_ERROR)
+        self.assertEqual(FakeServiceInterface.stopped, [LISTENING_URI])
+
+    def test_identity_is_read_from_the_cgi_whoami(self):
+        # The probe visits DEP_IDENTITY in order; each child answers as itself,
+        # but only on the path its own server actually serves.
+        expected = iter(app.DEP_IDENTITY)
+
+        def fake_get(url, timeout=None):
+            tag, _iface, identity, path = next(expected)
+            r = mock.Mock()
+            r.status_code = 200
+            r.json.return_value = ({"service": tag, "identity": identity}
+                                   if url.endswith(path) else {})
+            return r
+        with mock.patch.object(app.requests, "get", side_effect=fake_get):
+            ev = app.probe_dependency_identity()
+        self.assertEqual(ev["verdict"], app.VERDICT_PASS, ev["reason"])
+        self.assertEqual(ev["verified_count"], 4)
 
 
 if __name__ == "__main__":

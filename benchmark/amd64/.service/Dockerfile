@@ -1,3 +1,7 @@
+# linux/amd64 variant. nodo builds it with --opt platform=linux/amd64 (from
+# service.json); the busybox digest below is a multi-arch index, so it resolves
+# to linux/amd64.
+
 # Pinned by digest, like every other image in this repo: the scores a node files
 # are only comparable with another node's if both ran the very same busybox, and
 # the service id (a content hash) is what makes that checkable. The digest is the

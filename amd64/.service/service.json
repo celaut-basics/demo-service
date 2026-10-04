@@ -1,0 +1,41 @@
+{
+    "tag": "celaut-node-honesty-verifier",
+    "api": [
+        {
+            "port": 5000,
+            "protocol": [
+                "http",
+                "mcp"
+            ]
+        }
+    ],
+    "architecture": "linux/amd64",
+    "entrypoint": "/service/app.py",
+    "envs": [],
+    "resources": {
+        "at_init": {
+            "mem_limit": 2000000000,
+            "disk_space": 8000000000
+        },
+        "at_most": {
+            "mem_limit": 2000000000,
+            "disk_space": 8000000000
+        }
+    },
+    "network": [
+        {
+            "tags": [
+                "google.com",
+                "www.google.com"
+            ],
+            "prose": "Connection to Google Search Engine."
+        },
+        {
+            "tags": [
+                "amazon.com",
+                "www.amazon.com"
+            ],
+            "prose": "Connection to Amazon."
+        }
+    ]
+}
