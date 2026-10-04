@@ -4,13 +4,16 @@
         {
             "port": 3030,
             "protocol": [
-                "http",
-                "tls"
+                "http"
             ]
         }
     ],
     "architecture": "linux/arm64",
-    "entrypoint": "/ping-service",
+    "init": {
+        "entry_path": [
+            "ping-service"
+        ]
+    },
     "envs": [],
     "network": [
         {

@@ -1,5 +1,4 @@
 {
-  "workdir": "benchmark",
   "include": [
     "bench.sh",
     "serve",

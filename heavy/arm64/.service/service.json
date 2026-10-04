@@ -4,13 +4,16 @@
         {
             "port": 3030,
             "protocol": [
-                "http",
-                "tls"
+                "http"
             ]
         }
     ],
     "architecture": "linux/arm64",
-    "entrypoint": "/heavy-service",
+    "init": {
+        "entry_path": [
+            "heavy-service"
+        ]
+    },
     "envs": [],
     "resources": {
         "at_init": {
