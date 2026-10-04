@@ -15,6 +15,7 @@ Run with:  python3 tests/test_benchmark.py
 """
 import json
 import os
+import platform
 import shutil
 import subprocess
 import tempfile
@@ -26,9 +27,11 @@ BENCH_DIR = os.path.join(ROOT, "benchmark")
 BENCH_SH = os.path.join(BENCH_DIR, "bench.sh")
 CGI = os.path.join(BENCH_DIR, "www", "cgi-bin", "benchmark")
 
-# The image benchmark/.service/Dockerfile builds FROM. Read out of the Dockerfile
-# rather than repeated here, so the test cannot drift from what is packed.
-with open(os.path.join(BENCH_DIR, ".service", "Dockerfile")) as _f:
+# The image benchmark/<arch>/.service/Dockerfile builds FROM, for the architecture
+# this test runs on. Read out of the Dockerfile rather than repeated here, so the
+# test cannot drift from what is packed.
+_ARCH = "amd64" if platform.machine().lower() in ("x86_64", "amd64") else "arm64"
+with open(os.path.join(BENCH_DIR, _ARCH, ".service", "Dockerfile")) as _f:
     PINNED_BUSYBOX = next(
         line.split()[1] for line in _f if line.startswith("FROM ")
     )

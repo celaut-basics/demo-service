@@ -12,15 +12,19 @@ attestation report card:
   2. memory_ceiling      (heavy child)  allocation up to the declared at_most
                                         (256 MiB) must succeed; past it the node
                                         must OOM-kill AT the declared boundary.
-  3. resource_provisioning (self)       what the manifest declared / the node
+  3. node_benchmark      (benchmark child) the per-core benchmark the node runs as its
+                                        `benchmark` core service must run here under
+                                        its declared architecture and return a full
+                                        set of scores.
+  4. resource_provisioning (self)       what the manifest declared / the node
                                         charged must match what the container
                                         actually gets (cgroup + /proc/meminfo).
-  4. attestation         report card    per-probe verdict + a content hash of the
+  5. attestation         report card    per-probe verdict + a content hash of the
                                         result, ready to be submitted later as an
                                         EGO reputation opinion on-chain.
 """
 
-import os, json, logging, hashlib, datetime, re, threading, time, socket
+import os, json, logging, hashlib, datetime, re, threading, time, socket, platform
 import requests
 from flask import Flask, jsonify, render_template_string, request
 from google.protobuf.json_format import MessageToDict
@@ -37,7 +41,7 @@ if False:  # development mode toggle (unchanged from the original demo)
     DIR = "."
     CONFIG_FILE = "__config__"
 
-VERIFIER_VERSION = "1.1.0"
+VERIFIER_VERSION = "1.2.0"
 
 # ---------------------------------------------------------------------------
 # Verdict taxonomy
@@ -159,9 +163,27 @@ def describe_rpc_failure(failure, rpc, node_url):
     )
 
 
-# Declared ceilings from the child manifests (.service/service.json at_most).
+# Declared ceilings from the child manifests (<svc>/<arch>/.service/service.json
+# at_most; both architectures declare the same resources).
 HEAVY_DECLARED_MEM_BYTES = 268435456   # 256 MiB
 SELF_DECLARED_MEM_BYTES = 1000000000   # 1 GB (this service's own manifest)
+
+
+def canonical_arch(machine):
+    """Celaut's architecture tag for a `uname -m`, as benchmark/bench.sh maps it."""
+    m = (machine or "").lower()
+    if m in ("x86_64", "amd64"):
+        return "linux/amd64"
+    if m in ("aarch64", "arm64"):
+        return "linux/arm64"
+    return f"linux/{m}"
+
+
+# The architecture benchmark/<arch>/.service/service.json declares. This service
+# and its children are packed together from one arm64/ or amd64/ tree, so the
+# benchmark this instance launches was declared for the architecture this
+# instance itself runs under.
+BENCHMARK_DECLARED_ARCH = canonical_arch(platform.machine())
 
 env_vars = {}
 with open(os.path.join(DIR, ".dependencies")) as f:
@@ -172,6 +194,7 @@ with open(os.path.join(DIR, ".dependencies")) as f:
 TINY_SERVICE = env_vars.get("TINY", None)
 HEAVY_SERVICE = env_vars.get("HEAVY", None)
 PING_SERVICE = env_vars.get("PING", None)
+BENCHMARK_SERVICE = env_vars.get("BENCHMARK", None)
 
 logging.basicConfig(filename='app.log', level=logging.DEBUG,
                     format='%(asctime)s - %(levelname)s - %(message)s')
@@ -190,6 +213,9 @@ mem_limit: int = controller.get_mem_limit_at_start()
 # children spun back-to-back by the same probe suite.
 HEAVY_INITIAL_MU = 5 * pow(10, 8)
 PING_INITIAL_MU = 2 * pow(10, 8)
+# benchmark holds its declared 2 GiB for the ~10-20 s one run takes, plus the
+# dependency_identity launch.
+BENCHMARK_INITIAL_MU = 5 * pow(10, 8)
 
 resources = {"mem_limit": mem_limit}
 balance_mu = 0
@@ -202,6 +228,10 @@ heavy_service = controller.add_service(
 ping_service = controller.add_service(
     service_hash=PING_SERVICE,
     config=celaut_pb2.Configuration(initial_mu=to_amount(PING_INITIAL_MU))
+)
+benchmark_service = controller.add_service(
+    service_hash=BENCHMARK_SERVICE,
+    config=celaut_pb2.Configuration(initial_mu=to_amount(BENCHMARK_INITIAL_MU))
 )
 
 services = []
@@ -755,26 +785,29 @@ def probe_mu_accounting():
 # Probe 4 — dependency execution identity
 # (the dependency requested must be the dependency that actually runs)
 # ----------------------------------------------------------------------------
-# Each child exposes GET /whoami returning a fixed, service-specific signature.
+# Each child exposes a whoami endpoint returning a fixed, service-specific
+# signature (GET /whoami; busybox httpd only runs CGIs under /cgi-bin/, so the
+# benchmark's lives at /cgi-bin/whoami).
 # We request each dependency by its own service hash and assert that the
 # instance that comes back self-identifies as the very service we asked for —
 # a node that silently substituted or misrouted a dependency is caught here.
 DEP_IDENTITY = [
-    ("tiny", tiny_service, "celaut-demo-tiny"),
-    ("heavy", heavy_service, "celaut-demo-heavy"),
-    ("ping", ping_service, "celaut-demo-ping"),
+    ("tiny", tiny_service, "celaut-demo-tiny", "/whoami"),
+    ("heavy", heavy_service, "celaut-demo-heavy", "/whoami"),
+    ("ping", ping_service, "celaut-demo-ping", "/whoami"),
+    ("benchmark", benchmark_service, "celaut-demo-benchmark", "/cgi-bin/whoami"),
 ]
 
 
 def probe_dependency_identity():
     ev = {"probe": "dependency_identity", "checks": []}
     mismatches, not_observed, verified = [], [], 0
-    for tag, iface, expected_identity in DEP_IDENTITY:
+    for tag, iface, expected_identity, whoami_path in DEP_IDENTITY:
         c = {"requested": tag, "expected_identity": expected_identity}
         inst = None
         try:
             inst = _spin_child(iface, tag)
-            r = requests.get(f"http://{inst.uri}/whoami", timeout=45)
+            r = requests.get(f"http://{inst.uri}{whoami_path}", timeout=45)
             data = r.json()
             c["executed"] = data.get("service")
             c["identity"] = data.get("identity")
@@ -822,6 +855,86 @@ def probe_dependency_identity():
         ev["verdict"] = VERDICT_PASS
         ev["reason"] = "every requested dependency executed and self-identified correctly"
     return ev
+
+
+# ----------------------------------------------------------------------------
+# Probe — node benchmark (benchmark child, the node's `benchmark` core service)
+# ----------------------------------------------------------------------------
+# The node files the scores this child returns into its own config.yaml, under
+# the architecture the child reports, and admits services against them. So the
+# suite runs it like any other dependency and checks the one thing a run can
+# prove about the node: that the image it was asked for is the image that ran.
+# A guest's `uname -m` is the architecture of the image it booted -- under
+# QEMU+TCG too, which emulates the guest's ISA rather than translating it -- so
+# a benchmark declared linux/arm64 that reports anything else was not the
+# service requested.
+#
+# The scores themselves are evidence, not a verdict: there is no declared
+# number a node's speed could be held against here.
+BENCHMARK_SCORE_KEYS = ("int_ops_per_sec", "flt_ops_per_sec",
+                        "mem_bandwidth_bytes_per_sec", "sha256_hashes_per_sec")
+# A run is ~10 s natively and about as long again under QEMU+TCG; the memory
+# primitive is the only one whose duration is not fixed.
+BENCHMARK_TIMEOUT_S = int(os.environ.get("BENCHMARK_TIMEOUT_S", "180"))
+
+
+def probe_node_benchmark():
+    ev = {"probe": "node_benchmark", "declared_architecture": BENCHMARK_DECLARED_ARCH}
+    inst = None
+    try:
+        try:
+            inst = _spin_child(benchmark_service, "benchmark")
+        except (ChildLaunchError, ChildNotReadyError) as e:
+            ev["verdict"] = VERDICT_INFRA_ERROR
+            ev["reason"] = f"benchmark child never ran: {e}"
+            return ev
+        try:
+            r = requests.get(f"http://{inst.uri}/cgi-bin/benchmark", timeout=BENCHMARK_TIMEOUT_S)
+        except Exception as e:
+            # Port proven open, then the run never answered: nothing was
+            # measured, and a benchmark has no ceiling a kill would be evidence of.
+            ev["verdict"] = VERDICT_INFRA_ERROR
+            ev["reason"] = (f"benchmark run did not complete within {BENCHMARK_TIMEOUT_S}s: "
+                            f"{type(e).__name__}: {str(e)[:160]}")
+            return ev
+        ev["http_status"] = r.status_code
+        try:
+            data = r.json()
+        except Exception:
+            data = None
+        if not isinstance(data, dict):
+            ev["verdict"] = VERDICT_INCONCLUSIVE
+            ev["reason"] = f"benchmark answered {r.status_code} with no JSON object: {r.text[:160]!r}"
+            return ev
+        if r.status_code != 200:
+            ev["verdict"] = VERDICT_INCONCLUSIVE
+            ev["reason"] = f"benchmark refused the run ({r.status_code}): {data.get('error')}"
+            return ev
+
+        ev["scores"] = data
+        arch = data.get("architecture")
+        missing = [k for k in BENCHMARK_SCORE_KEYS
+                   if not isinstance(data.get(k), int) or data.get(k) <= 0]
+        if arch and arch != BENCHMARK_DECLARED_ARCH:
+            # Checked before completeness: an observed substitution outranks a
+            # partial measurement.
+            ev["verdict"] = VERDICT_DISHONEST
+            ev["reason"] = (f"benchmark declared {BENCHMARK_DECLARED_ARCH} ran as {arch}: the node "
+                            "ran a different image than the one requested")
+        elif not arch:
+            ev["verdict"] = VERDICT_INCONCLUSIVE
+            ev["reason"] = "benchmark did not report the architecture it ran under"
+        elif missing:
+            ev["verdict"] = VERDICT_INCONCLUSIVE
+            ev["reason"] = (f"benchmark ran under {arch} but could not measure {missing} "
+                            f"(skipped: {data.get('skipped')})")
+        else:
+            ev["verdict"] = VERDICT_PASS
+            ev["reason"] = (f"benchmark ran under its declared {arch} and measured every primitive "
+                            f"(mem working set {data.get('mem_bandwidth_working_set_bytes')} B)")
+        return ev
+    finally:
+        _release_child(benchmark_service, inst, "benchmark")
 
 
 # ----------------------------------------------------------------------------
@@ -1065,6 +1178,7 @@ PROBES = [
     ("network_isolation", probe_network_isolation),
     ("dependency_observe", probe_dependency_observe),
     ("memory_ceiling", probe_memory_ceiling),
+    ("node_benchmark", probe_node_benchmark),
     ("mu_accounting", probe_mu_accounting),
 ]
 
@@ -1074,7 +1188,8 @@ PROBES = [
 # resource_provisioning is deliberately NOT here: it only reads /proc and
 # /__config__, so it stays valid (and can legitimately PASS) with the gateway down.
 GATEWAY_DEPENDENT = ("dependency_identity", "network_isolation",
-                     "dependency_observe", "memory_ceiling", "mu_accounting")
+                     "dependency_observe", "memory_ceiling", "node_benchmark",
+                     "mu_accounting")
 
 
 def _safe_probe(name, fn):
@@ -1126,7 +1241,8 @@ def run_startup_tests():
         STARTUP_TESTS["started_at"] = datetime.datetime.utcnow().isoformat() + "Z"
     try:
         # gateway preflight + resource provisioning + dependency identity +
-        # network isolation (real ping child) + observe + memory ceiling + MU.
+        # network isolation (real ping child) + observe + memory ceiling +
+        # node benchmark + MU.
         results = _run_probe_suite()
         unobserved = [p for p in results.values() if p.get("verdict") not in CONCLUSIVE_VERDICTS]
         summary = {
@@ -1267,6 +1383,11 @@ def route_probe_observe():
     return jsonify(probe_dependency_observe())
 
 
+@app.route('/probe/benchmark', methods=['GET', 'POST'])
+def route_probe_benchmark():
+    return jsonify(probe_node_benchmark())
+
+
 @app.route('/probe/gateway', methods=['GET', 'POST'])
 def route_probe_gateway():
     return jsonify(probe_gateway_reachability())
@@ -1325,6 +1446,9 @@ MCP_TOOLS = [
     {"name": "probe_dependency_observe",
      "description": "Use the node Observe RPC to independently watch a dependency's real packets and confirm its connectivity is genuine, not fabricated by the node.",
      "inputSchema": _EMPTY_SCHEMA},
+    {"name": "probe_node_benchmark",
+     "description": "Run the benchmark child (the node's per-core benchmark core service), return its scores and check it ran under its declared architecture.",
+     "inputSchema": _EMPTY_SCHEMA},
 ]
 
 
@@ -1347,6 +1471,8 @@ def _mcp_call_tool(name):
         return probe_mu_accounting()
     if name == "probe_dependency_observe":
         return probe_dependency_observe()
+    if name == "probe_node_benchmark":
+        return probe_node_benchmark()
     raise ValueError(f"unknown tool: {name}")
 
 
@@ -1411,7 +1537,7 @@ REPORT_HTML = """
 </style></head>
 <body>
 <h1>Celaut Node-Honesty Verifier</h1>
-<p>Actively probes the node under test for resource, memory-ceiling and network-isolation honesty.</p>
+<p>Actively probes the node under test for resource, memory-ceiling and network-isolation honesty, and runs its per-core benchmark.</p>
 <p><small>Absence of evidence is not evidence of dishonesty: probes that could not observe the node
 report <b>INFRA_ERROR</b>, and no attestation hash is minted unless every probe reached a
 conclusive verdict.</small></p>

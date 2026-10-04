@@ -7,6 +7,11 @@ It measures the four per-core primitives nodo's admission holds a service's
 architecture it ran under. The node writes them into its own `config.yaml`,
 under that architecture.
 
+It is also a dependency of the demo-service verifier (`BENCHMARK` in
+`../<arch>/.service/pack_config.json`): packing the demo packs this too, and its probe
+suite launches it like `tiny`/`heavy`/`ping` (`dependency_identity` and
+`node_benchmark`, see `../VERIFIER.md`).
+
 ## API
 
 Port 3030, HTTP, like the other variants.
@@ -88,14 +93,17 @@ only lower bandwidth, so it never flatters a node.
 ## Packing
 
 ```sh
-cd benchmark && nodo pack .     # prints the service id
+nodo pack benchmark/arm64     # prints the linux/arm64 service id
+nodo pack benchmark/amd64     # prints the linux/amd64 service id
 ```
 
-`service.json` says `linux/arm64`, like every variant here. **A service is one
-architecture**, so a node that serves `linux/amd64` (natively, or under QEMU+TCG)
-needs this packed a second time with `"architecture": "linux/amd64"`: same
-source, another id. The Dockerfile pins the busybox *index* digest, so both packs
-take their image from the same pin.
+**A service is one architecture**, so this one is kept twice: `arm64/.service/`
+and `amd64/.service/`, each with its own `Dockerfile`, `service.json` and
+`pack_config.json`, over the shared `bench.sh`/`serve`/`www` (linked into each).
+A node that serves `linux/amd64` (natively, or under QEMU+TCG) needs the amd64
+pack: same source, another id. Both Dockerfiles pin the busybox *index* digest,
+so both packs take their image from the same pin. See "Packing: one tree per
+architecture" in `../VERIFIER.md` for the layout.
 
 Then, on the node (`config.yaml`):
 

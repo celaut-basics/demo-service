@@ -2,7 +2,7 @@
 
 This turns the passive `demo-service` into an **active verifier** that checks
 whether the nodo node it is running on is *honest*. It reuses the existing
-`tiny` / `heavy` / `ping` child scaffolding and the `node_controller` library —
+`tiny` / `heavy` / `ping` / `benchmark` child scaffolding and the `node_controller` library —
 nothing was rewritten from scratch.
 
 An honest node must:
@@ -60,8 +60,9 @@ Two consequences follow:
 | 3 | `resource_provisioning` | orchestrator (self) | node-reported/charged memory matches the ceiling the guest really got |
 | 4 | `dependency_identity` | all | the dependency requested is the dependency that actually ran |
 | 5 | `dependency_observe` | `ping` | the node's `Observe` stream independently corroborates the dependency's connectivity |
-| 6 | `mu_accounting` | orchestrator (self) | the node spends MUs in line with the resources it provisions |
-| 7 | `attestation` | orchestrator | per-probe verdict + `sha3_256` content hash, as JSON and HTML |
+| 6 | `node_benchmark` | `benchmark` | the node's per-core benchmark runs under its declared architecture and measures every primitive; the scores travel as evidence |
+| 7 | `mu_accounting` | orchestrator (self) | the node spends MUs in line with the resources it provisions |
+| 8 | `attestation` | orchestrator | per-probe verdict + `sha3_256` content hash, as JSON and HTML |
 
 ### Child readiness — the node's "ready" is not the service's "ready"
 
@@ -135,7 +136,7 @@ Exposed as `GET/POST /probe/gateway` and as the MCP tool
 
 ### 1. Network isolation (`ping/`)
 
-`ping/.service/service.json` declares an egress allow-list of **only** google.
+`ping/<arch>/.service/service.json` declares an egress allow-list of **only** google.
 `ping/src/main.rs` also tries amazon, which is **not** declared. The probe reads
 the node-provided allow-list from `/__config__` (the `NetworkResolution` entries,
 decoded by the existing `dns.rs` parser — now exposed via `dns::resolved_tags()`)
@@ -252,6 +253,25 @@ measure. On the run that motivated this, the parent's balance fell by ~1.2e9 MU
 during the suite — 12 abandoned `heavy` children at `initial_mu` 1e8 each, all
 of them spun by the verifier itself.
 
+### Node benchmark (`benchmark/`)
+
+`benchmark` is the service a node runs as its `benchmark` core service
+(see `benchmark/README.md`); it is packed as a dependency of this demo
+(`BENCHMARK` in `<arch>/.service/pack_config.json`) and launched like the other
+children, so every run of the suite also runs it. `dependency_identity` checks
+it at `/cgi-bin/whoami` (busybox httpd only runs CGIs under `/cgi-bin/`), and
+`node_benchmark` calls `/cgi-bin/benchmark` and records the scores as evidence.
+
+There is no declared speed to hold a node against, so the scores never decide
+a verdict. What a run *can* prove is which image ran: a guest's `uname -m` is
+the architecture of the image it booted, QEMU+TCG included, so a benchmark
+declared for this instance's own architecture (`BENCHMARK_DECLARED_ARCH`, read
+from `uname -m`: the demo and its children are packed together from one
+`arm64/` or `amd64/` tree) that reports another architecture is a substituted
+service — `DISHONEST`. A run that never started
+or never answered (`BENCHMARK_TIMEOUT_S`, 180 s) is `INFRA_ERROR`; a refused run,
+a missing architecture or an unmeasured primitive is `INCONCLUSIVE`.
+
 ### 4. Attestation report card
 
 A full run drives every probe — including the memory-ceiling ladder and the two
@@ -288,8 +308,9 @@ painted in the dishonest colour: an unverified node is not a guilty node.
 ## Funding the instance
 
 A full attestation run launches `heavy` up to eight times (the seven-rung
-memory ladder plus `dependency_identity`) and `tiny`/`ping` once each per
-probe that uses them. Each launch is charged against **this** instance's own
+memory ladder plus `dependency_identity`) and `tiny`/`ping`/`benchmark` once
+each per probe that uses them (`benchmark` holds its declared 2 GiB for the
+~10-20 s of a run, funded by `BENCHMARK_INITIAL_MU`). Each launch is charged against **this** instance's own
 balance, at whatever `heavy`/`tiny`/`ping` cost the node to run -- observed on
 a real node at roughly 0.5 ERG per `heavy` launch (256 MiB, `HEAVY_INITIAL_MU`
 funding its own account). A demo instance funded only at the node's default
@@ -302,9 +323,9 @@ instance's deposit for headroom across a full run:
 nodo increase_deposit <instance id> 5   # ERG; adjust to the node's actual prices
 ```
 
-`HEAVY_INITIAL_MU` and `PING_INITIAL_MU` (`app.py`) size what each child is
+`HEAVY_INITIAL_MU`, `PING_INITIAL_MU` and `BENCHMARK_INITIAL_MU` (`app.py`) size what each child is
 credited with on launch, not what this orchestrator itself is funded with --
-that answer is `demo/.service/service.json`'s own declared `resources.at_init`
+that answer is `<arch>/.service/service.json`'s own declared `resources.at_init`
 plus whatever deposit the operator adds after `nodo execute`. Declaring a
 much larger `at_init` here to buy more auto-funding was deliberately rejected:
 this manifest is also what other nodes and peers read to decide whether they
@@ -362,9 +383,65 @@ The node's own log recorded no failure at all across the 32 microVMs the run
 launched — only `instance registered before the guest could call in`, once per
 VM, which is the race in one line.
 
+## Packing: one tree per architecture
+
+A Celaut service is one architecture (`service.json → architecture`, which nodo
+passes to BuildKit as `--opt platform=`), so every service here is maintained
+twice, by hand, and packed from the tree of the architecture wanted:
+
+```sh
+nodo pack arm64          # demo + tiny/heavy/ping/benchmark, all linux/arm64
+nodo pack amd64          # the same, all linux/amd64
+nodo pack benchmark/amd64   # one service on its own
+```
+
+```
+arm64/  amd64/                  the demo's pack roots
+├── .service/                   Dockerfile, service.json, pack_config.json — per arch
+├── app.py      -> ../app.py
+└── tiny heavy ping benchmark   -> ../<svc>/<arch>
+<svc>/                          tiny, heavy, ping, benchmark
+├── src/ Cargo.* | bench.sh serve www/     shared source
+└── arm64/  amd64/              the service's pack roots
+    ├── .service/               per arch
+    └── <sources>  -> ../<sources>
+```
+
+The shape follows from what `nodo pack <dir>` does (`src/commands/packer/
+zip_with_dockerfile/`): it reads only `<dir>/.service/` (the name is fixed),
+copies `<dir>` to its cache **following symlinks**, and resolves each local
+dependency as `<copy>/<path>` — so a dependency has to sit inside the pack root
+(a `../tiny` would point outside the copy), and the shared sources reach each
+root as symlinks that the copy turns into real files. `Dockerfile` and
+`pack_config.json` are real files in each `.service/`, edited independently;
+only `architecture` differs today. `tests/test_layout.py` checks the shape.
+
+Why every Dockerfile builds for both architectures:
+
+- **Every `FROM` is a multi-arch index** with `linux/amd64` and `linux/arm64`:
+  the pinned `python:3.11@sha256:7bd2bb…` and `busybox:1.37.0@sha256:bdf57e…`
+  digests, `rust:1.86.0-bookworm`, `gcr.io/distroless/cc`, `debian:bookworm-slim`
+  (checked against the registries on 2026-10-04). BuildKit picks the entry for
+  the requested platform, so one pin serves both.
+- **Rust children build natively for the target**: `cargo build` without
+  `--target` emits a binary for the builder stage's own platform, which is the
+  target one. `ring` (ping's only C/asm crate, via rustls) builds with the gcc
+  `rust:bookworm` ships for both. `.cargo/config`'s aarch64 linker is not in any
+  `include`, so it never reaches a build.
+- **The demo compiles nothing**: its one native dependency, `grpcio==1.56.0`
+  (via bee-rpc), and `protobuf` ship cp311 manylinux wheels for x86_64 and
+  aarch64.
+- **No source is architecture-specific**: `heavy` touches memory at a 4096-byte
+  stride, which reaches every page on both (pages are ≥ 4 KiB), and
+  `benchmark/bench.sh` maps `uname -m` to both tags.
+
+Packing an architecture other than the host's needs a binfmt_misc handler for
+it on the machine that builds (nodo checks this in `ensure_native_arch`) and
+the packer enabled for it (`packer.ARM_PACKER_SUPPORT` / `X86_PACKER_SUPPORT`).
+
 ## Reproducibility
 
-`.service/Dockerfile` pins every input: the base image by digest, `requests` and
+`<arch>/.service/Dockerfile` pins every input: the base image by digest, `requests` and
 `Flask` by version, and `celaut-service-libraries` by commit SHA. This service is
 content-addressed, so an unpinned `git+…` install (which resolves to whatever
 `master` happened to be that day) means two packs of the same source tree produce

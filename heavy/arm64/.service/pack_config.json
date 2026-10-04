@@ -1,0 +1,8 @@
+{
+  "workdir": "heavy-service",
+  "include": [
+    "src",
+    "Cargo.toml",
+    "Cargo.lock"
+  ]
+}
