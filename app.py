@@ -41,7 +41,7 @@ if False:  # development mode toggle (unchanged from the original demo)
     DIR = "."
     CONFIG_FILE = "__config__"
 
-VERIFIER_VERSION = "1.2.0"
+VERIFIER_VERSION = "1.3.0"
 
 # ---------------------------------------------------------------------------
 # Verdict taxonomy
@@ -1575,6 +1575,20 @@ def _run_probe_suite():
                 "verdict": VERDICT_INFRA_ERROR,
                 "reason": f"skipped: {headline} ({preflight.get('reason')})",
                 "fault": preflight.get("fault"),
+                "skipped": True,
+            }
+            continue
+        if FUNDING_FAILURES and name in GATEWAY_DEPENDENT:
+            # The node already refused to fund a child: this run is starved and
+            # will be re-run once topped up. Launching the rest only collects the
+            # same refusal, and mu_accounting's windows would cost minutes of a
+            # balance that is already short.
+            results[name] = {
+                "probe": name,
+                "verdict": VERDICT_INFRA_ERROR,
+                "reason": (f"skipped: the node refused to fund child(ren) {FUNDING_FAILURES} "
+                           "for want of balance earlier in this run (INSUFFICIENT FUNDS)"),
+                "fault": "insufficient_funds",
                 "skipped": True,
             }
             continue

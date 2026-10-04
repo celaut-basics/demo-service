@@ -378,13 +378,20 @@ startup suite reported five `INFRA_ERROR`s, and it never tried again. Now:
 4. **A refused launch is named.** When the node refuses to charge for a child,
    the probe's `INFRA_ERROR` says `INSUFFICIENT FUNDS` and quotes the node
    (`Launch service error charging …`) instead of a reason cut off at
-   `Unable to l`. The startup suite then waits for the first builds
+   `Unable to l`. The rest of that run is skipped (`fault:
+   "insufficient_funds"`) rather than launching children the node will refuse
+   or spending three MU windows on a run that will be repeated. The startup
+   suite then waits for the first builds
    (`BUILD_MU_ESTIMATE` per child not yet launched here) and runs again, up to
    `STARTUP_MAX_ATTEMPTS` (3).
 
-The first suite on a node that has never built the children costs four builds
-(~4e7 MU) on top, which the default funding of one instance cannot cover; the
-verifier waits for that top-up rather than reporting a starved run:
+Validated on a real node (`ch`, amd64): a fresh instance with no deposit
+measured 3755 MU/s, needed 9.3e6 MU of the 12.3e6 it was given, and passed 8/8
+on its first attempt with ~49 minutes of runtime left. The first suite on a node
+that has never built the children costs four builds (~4e7 MU) on top, which the
+default funding of one instance cannot cover; the verifier then reported
+`waiting_for_funds` with the shortfall (3.69e7 MU), resumed by itself after the
+top-up and passed 8/8:
 
 ```bash
 nodo increase_deposit <instance> <amount>   # ui.DISPLAY_UNIT, ERG by default

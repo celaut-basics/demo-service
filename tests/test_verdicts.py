@@ -634,6 +634,24 @@ class FundingTests(unittest.TestCase):
                 app._spin_child(app.heavy_service, "heavy(64MB)")
         self.assertEqual(app.FUNDING_FAILURES, ["heavy(64MB)"])
 
+    def test_a_starved_run_stops_launching_and_skips_the_mu_windows(self):
+        # The first child the node refuses ends the spending: every later
+        # gateway-dependent probe is skipped as INFRA_ERROR, naming the cause.
+        exc = RuntimeError('details = "Launch service error charging abc"')
+        mu = mock.Mock(side_effect=AssertionError("mu_accounting must not run"))
+        preflight = {"probe": "gateway_reachability", "verdict": app.VERDICT_PASS}
+        with mock.patch.object(FakeServiceInterface, "get_instance", side_effect=exc), \
+             mock.patch.object(app, "probe_gateway_reachability", return_value=preflight), \
+             mock.patch.object(app, "PROBES", [(n, mu if n == "mu_accounting" else f)
+                                              for n, f in app.PROBES]):
+            results = app._run_probe_suite()
+        self.assertEqual(results["dependency_identity"]["verdict"], app.VERDICT_INFRA_ERROR)
+        for name in ("network_isolation", "dependency_observe", "memory_ceiling",
+                     "node_benchmark", "mu_accounting"):
+            self.assertEqual(results[name].get("fault"), "insufficient_funds", name)
+        self.assertEqual(results["resource_provisioning"]["verdict"], app.VERDICT_PASS)
+        mu.assert_not_called()
+
     def test_clip_never_cuts_a_word(self):
         self.assertEqual(app.clip("alpha beta gamma", 12), "alpha beta …")
         self.assertEqual(app.clip("short", 12), "short")
