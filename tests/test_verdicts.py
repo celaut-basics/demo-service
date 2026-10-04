@@ -34,6 +34,15 @@ class BlindNodeTests(unittest.TestCase):
     def setUp(self):
         FakeServiceInterface.launch_mode = "unbound_local"
         FakeController.rpc_mode = "unavailable"
+        # resource_provisioning reads the memory ceiling of the machine the test
+        # runs on; a CI container with a small cgroup limit would make it accuse.
+        # Give every test here a guest that got what the node reported.
+        guest = {"cgroup_memory_max": None, "cgroup_memory_current": None,
+                 "cgroup_cpu_max": None, "proc_meminfo_memtotal_bytes": app.mem_limit}
+        for patch in (mock.patch.object(app, "read_container_limits", return_value=guest),
+                      mock.patch.object(app, "detect_isolation_model", return_value="microvm")):
+            patch.start()
+            self.addCleanup(patch.stop)
 
     # -- D1 ------------------------------------------------------------------
     def test_launch_failure_is_typed_and_explains_the_real_cause(self):
@@ -640,7 +649,14 @@ class FundingTests(unittest.TestCase):
         exc = RuntimeError('details = "Launch service error charging abc"')
         mu = mock.Mock(side_effect=AssertionError("mu_accounting must not run"))
         preflight = {"probe": "gateway_reachability", "verdict": app.VERDICT_PASS}
+        # resource_provisioning reads the memory ceiling of the machine the test
+        # runs on. Give it a microVM that got what the node reported, so the
+        # assertion below does not depend on the cgroup layout of the host.
+        guest = {"cgroup_memory_max": None, "cgroup_memory_current": None,
+                 "cgroup_cpu_max": None, "proc_meminfo_memtotal_bytes": app.mem_limit}
         with mock.patch.object(FakeServiceInterface, "get_instance", side_effect=exc), \
+             mock.patch.object(app, "read_container_limits", return_value=guest), \
+             mock.patch.object(app, "detect_isolation_model", return_value="microvm"), \
              mock.patch.object(app, "probe_gateway_reachability", return_value=preflight), \
              mock.patch.object(app, "PROBES", [(n, mu if n == "mu_accounting" else f)
                                               for n, f in app.PROBES]):
