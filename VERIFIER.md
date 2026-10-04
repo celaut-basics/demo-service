@@ -217,16 +217,32 @@ The `heavy` child's `/introspect` reports the same pair (`ceiling_bytes`,
 ### MU accounting (orchestrator)
 
 `controller.modify_resources({min,max})` settles the account and returns this
-service's current MU balance, so holding a ceiling across a fixed window and
-sampling the balance at both ends measures what the node actually deducted. Two
-equal windows are run — one at a LOW ceiling (64 MiB), one at the HIGH ceiling
-this service declared — so the spend can be checked against *usage* rather than
-merely against zero. An honest node must:
+service's current MU balance, so holding a ceiling across a window and sampling
+the balance at both ends measures what the node actually deducted. Three windows
+are run — LOW (64 MiB), HIGH (the ceiling this service declared), LOW again — so
+the spend can be checked against *usage* rather than merely against zero. An
+honest node must:
 
-- **charge at all** — a zero spend at both ceilings is a free ride or broken
+- **charge at all** — a zero spend in every window is a free ride or broken
   metering;
-- **charge more when it provisions more** — `spent_high >= spent_low`;
+- **charge more when it provisions more** — the HIGH rate must not fall below the
+  LOW rate by more than this run's own noise;
 - **not take a funded balance to nothing inside one window**.
+
+**Scaling is a weak signal, so it is read as a rate against measured noise.**
+Every instance pays for its vCPU at both ceilings, so on a default node memory is
+only ~10-15% of the bill. Two single windows compared with `spent_high >=
+spent_low` called an honest node `DISHONEST` at startup (216 090 MU low vs
+184 932 MU high over 60 s) while every later run of the same node passed
+(~145k low vs ~164k high). Now:
+
+- each window's spend is divided by the time it **really** lasted (the settle
+  RPCs alone take 0.5-0.7 s, and not the same each time) → `rate_*_mu_per_s`;
+- the two LOW windows bracket the HIGH one; their average is the LOW rate and
+  their disagreement is the run's noise (`low_window_noise`);
+- `HIGH >= LOW` is `PASS`; a shortfall inside `max(MU_SCALING_TOLERANCE,
+  2 × noise)` (`accusation_margin`, floor 5%) is `INCONCLUSIVE`; only a shortfall
+  beyond it is `DISHONEST`.
 
 Three details keep each of those from misfiring:
 
@@ -243,15 +259,29 @@ reader can see it was considered and dismissed.
 coarse to tell a real charge from rounding is equally too coarse to price one
 ceiling against another. Below it the probe returns `INCONCLUSIVE` and says to
 raise `MU_WINDOW_SECONDS`. That default is 60 to match — a shipped window that
-cannot decide makes every unconfigured run pay for two windows and then decline
+cannot decide makes every unconfigured run pay for its windows and then decline
 to read them.
 
 **Only this service's own ceiling may vary between the windows.** Which is why
 every probe stops its children: each one left running keeps drawing MU from this
-same balance, and enough of them swamp the difference the two windows exist to
+same balance, and enough of them swamp the difference the windows exist to
 measure. On the run that motivated this, the parent's balance fell by ~1.2e9 MU
 during the suite — 12 abandoned `heavy` children at `initial_mu` 1e8 each, all
 of them spun by the verifier itself.
+
+### Dependency observe (`ping`)
+
+The probe opens the node's `Observe` stream on the `ping` child **before**
+driving it, waits up to `OBSERVE_ARM_SECONDS` (5) for the stream's first event,
+then calls `ping` and keeps observing `OBSERVE_SECONDS` (12) more.
+
+`ping` only makes traffic while it serves `GET /`. The stream used to be opened
+after that request had returned, so it could see at most the tail of a closed
+connection: 2 packets on one run, 25 on another — and none on a third, where the
+stream's own session event counted as "proof of life" and an honest node was
+reported as fabricating connectivity. Silence is now an accusation only when the
+stream was demonstrably live **before** the drive (`observe_armed_before_drive`);
+a stream that only woke up afterwards is `INCONCLUSIVE`.
 
 ### Node benchmark (`benchmark/`)
 
@@ -274,15 +304,16 @@ a missing architecture or an unmeasured primitive is `INCONCLUSIVE`.
 
 ### 4. Attestation report card
 
-A full run drives every probe — including the memory-ceiling ladder and the two
-`MU_WINDOW_SECONDS` MU-accounting windows — and can take minutes, so it runs as
-a background job rather than inside one HTTP request:
+A full run drives every probe — including the memory-ceiling ladder and the
+three `MU_WINDOW_SECONDS` MU-accounting windows — and can take minutes, so it
+runs as a background job rather than inside one HTTP request:
 
-- `POST /attestation.json` schedules a run (a no-op if one is already in
-  flight) and returns immediately with the job status.
-- `GET /attestation.json` polls that job: `{"status":"idle|running|done|error",
-  "started_at":…, "finished_at":…, "result":…, "error":…}`. The report below is
-  `result` once `status` is `"done"`:
+- `POST /attestation.json` (MCP `run_attestation`) schedules a run (a no-op if
+  one is already queued or running) and returns immediately with the job status.
+- `GET /attestation.json` (MCP `get_attestation`) polls that job:
+  `{"status":"idle|queued|running|done|error|insufficient_funds|busy",
+  "started_at":…, "finished_at":…, "result":…, "error":…, "funding":…}`. The
+  report below is `result` once `status` is `"done"`:
 
 ```json
 {"summary":{"node_honest":true,"observation_complete":true,"attestable":true,
@@ -304,34 +335,86 @@ probe is blind, the report degrades instead:
 `GET /` renders the same report as an HTML report card, with three states —
 `HONEST` / `DISHONEST` / `UNVERIFIED` — and `UNVERIFIED` deliberately **not**
 painted in the dishonest colour: an unverified node is not a guilty node.
+Opening the page shows the last run; it no longer starts one, since every visit
+used to spend MU on a fresh attestation and collide with the startup suite.
+
+**One suite at a time.** Every probe spins children on this instance's balance,
+and `mu_accounting` measures that balance, so two runs at once doubled the spend
+and fed one run's children into the other's MU windows. Anything that spins a
+child or moves this instance's resources takes one lock (`exclusive()`): the
+startup suite waits for it, while an attestation, a single probe (HTTP `409`)
+or an MCP call gets `busy` and the name of what is running.
+`probe_resource_provisioning` only reads local files and may run beside a suite.
 
 ## Funding the instance
 
-A full attestation run launches `heavy` up to eight times (the seven-rung
-memory ladder plus `dependency_identity`) and `tiny`/`ping`/`benchmark` once
-each per probe that uses them (`benchmark` holds its declared 2 GiB for the
-~10-20 s of a run, funded by `BENCHMARK_INITIAL_MU`). Each launch is charged against **this** instance's own
-balance, at whatever `heavy`/`tiny`/`ping` cost the node to run -- observed on
-a real node at roughly 0.5 ERG per `heavy` launch (256 MiB, `HEAVY_INITIAL_MU`
-funding its own account). A demo instance funded only at the node's default
-(sized off its own modest `resources.at_init`) runs out partway through the
-ladder and reports the remaining rungs `INFRA_ERROR` — not a node fault, just
-an underfunded verifier. Before triggering `/attestation.json`, top up the
-instance's deposit for headroom across a full run:
+Every child is paid for out of **this** instance's balance: the node charges the
+parent `BUILD_MU` (10 000 000 on a default node) the first time a child is built,
+plus the child's `initial_mu`, and refunds whatever the child did not spend when
+it is stopped. The node itself funds this instance for
+`deposits.INITIAL_RUNTIME_HOURS` of its own resources — about 14e6 MU on a
+default node.
+
+The children used to ask for a flat 2e8-5e8 MU each (`HEAVY_INITIAL_MU` etc.):
+35× what funds this whole instance for an hour. Every launch of a freshly
+executed verifier was refused (`Insufficient balance … needed 0.51 ERG`), its
+startup suite reported five `INFRA_ERROR`s, and it never tried again. Now:
+
+1. **Children are funded for minutes, not days.** On the first suite the
+   verifier measures the rate the node really charges it (two settled balances,
+   `FUNDING_RATE_SAMPLE_SECONDS` apart) and funds each child for
+   `CHILD_FUNDED_SECONDS` (600) × `CHILD_BUDGET_MARGIN` (2) of the child's own
+   resources, priced from that rate with the node's shipped RAM/vCPU/disk price
+   ratios. The largest (`benchmark`, 2 GiB) comes to ~4e6 MU on a default node.
+2. **The suite only starts once the balance covers it**: the largest child
+   deposit (children run one at a time and are refunded), the suite's own upkeep
+   (`SUITE_EXPECTED_SECONDS`), and `MIN_RESERVE_SECONDS` (900) of runtime left
+   afterwards. On a node that has built the children before, the default funding
+   of a new instance covers that, so the startup suite runs straight away.
+3. **While short, it says so.** The startup suite sits in `waiting_for_funds`,
+   showing the balance, what is required and the shortfall with the exact
+   command; an attestation is refused as `insufficient_funds` instead of running
+   into `INFRA_ERROR`s. `GET /status` (MCP `get_service_status`) shows the same.
+4. **A refused launch is named.** When the node refuses to charge for a child,
+   the probe's `INFRA_ERROR` says `INSUFFICIENT FUNDS` and quotes the node
+   (`Launch service error charging …`) instead of a reason cut off at
+   `Unable to l`. The startup suite then waits for the first builds
+   (`BUILD_MU_ESTIMATE` per child not yet launched here) and runs again, up to
+   `STARTUP_MAX_ATTEMPTS` (3).
+
+The first suite on a node that has never built the children costs four builds
+(~4e7 MU) on top, which the default funding of one instance cannot cover; the
+verifier waits for that top-up rather than reporting a starved run:
 
 ```bash
-nodo increase_deposit <instance id> 5   # ERG; adjust to the node's actual prices
+nodo increase_deposit <instance> <amount>   # ui.DISPLAY_UNIT, ERG by default
 ```
 
-`HEAVY_INITIAL_MU`, `PING_INITIAL_MU` and `BENCHMARK_INITIAL_MU` (`app.py`) size what each child is
-credited with on launch, not what this orchestrator itself is funded with --
-that answer is `<arch>/.service/service.json`'s own declared `resources.at_init`
-plus whatever deposit the operator adds after `nodo execute`. Declaring a
-much larger `at_init` here to buy more auto-funding was deliberately rejected:
-this manifest is also what other nodes and peers read to decide whether they
-can host the service, and inflating it past what this Flask orchestrator
-actually needs to hold in memory would misrepresent it -- the honest lever is
-the deposit, not the manifest.
+Declaring a much larger `at_init` here to buy more auto-funding was deliberately
+rejected: this manifest is also what other nodes and peers read to decide
+whether they can host the service, and inflating it past what this Flask
+orchestrator actually needs would misrepresent it — the honest lever is the
+deposit, not the manifest.
+
+## MCP interface
+
+`POST /mcp` speaks JSON-RPC 2.0 (`initialize`, `tools/list`, `tools/call`). Every
+tool returns its result both as text and as `structuredContent`, declares an
+`outputSchema`, and is annotated `readOnlyHint` — the `get_*` tools and
+`probe_resource_provisioning` are read-only; every other tool spends MU and says
+so in its description.
+
+| tool | HTTP route |
+|---|---|
+| `run_attestation` / `get_attestation` | `POST` / `GET /attestation.json` — the same job the page shows |
+| `get_startup_tests` / `rerun_startup_tests` | `GET /startup_tests` / `POST /startup_tests/rerun` |
+| `get_service_status` (`refresh`) | `GET /status`, `/current_balance`, `/memory_usage` |
+| `probe_*` | `/probe/*` |
+
+`ROUTE_MCP_TOOLS` in `app.py` is that table; `tests/test_mcp.py` fails when a
+route has neither a tool nor a reason in `ROUTES_WITHOUT_MCP`, when the page
+fetches a route without one, or when the MCP and the route return different
+things.
 
 ## Files changed
 
@@ -354,6 +437,16 @@ the deposit, not the manifest.
   is a remote-code-execution risk on a network-reachable service. Also raised
   `HEAVY_INITIAL_MU` and added `PING_INITIAL_MU` so each child survives its
   own probe traffic on its own balance instead of going into debt.
+
+- `app.py` — MCP parity with the UI (`ROUTE_MCP_TOOLS`, `run_attestation` now
+  starts the shared background job, `get_attestation`, `rerun_startup_tests`,
+  `get_service_status`), one suite at a time (`exclusive()`), children funded
+  from the measured rate and a startup suite gated on funds,
+  `dependency_observe` arms the stream before driving `ping`, `mu_accounting`
+  compares rates across LOW/HIGH/LOW windows against measured noise, launch
+  errors quoted from the node's own `details`, `SELF_DECLARED_MEM_BYTES`
+  corrected to the 2 GB the manifest declares.
+- `tests/harness.py` (stubs shared by the suites), `tests/test_mcp.py`.
 
 ## Live validation against a real node
 
