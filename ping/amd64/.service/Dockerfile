@@ -7,12 +7,12 @@
 
 FROM rust:1.86.0-bookworm AS builder
 COPY service /ping-service
-WORKDIR ping-service
+WORKDIR /ping-service
 RUN cargo build --release --locked
 
-# FROM gcr.io/distroless/cc
-# COPY --from=builder /ping-service/target/release/ping-service /ping-service
-
+# Not distroless: dns.rs writes /etc/resolv.conf at start, so the runtime
+# keeps a plain Debian /etc. Nothing is installed on top of it. TLS is rustls
+# with its own root store (Cargo.toml), and the binary links only libc,
+# libm and libgcc_s, so the image needs no OpenSSL and no CA bundle.
 FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y libssl-dev && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /ping-service/target/release/ping-service /ping-service
