@@ -662,11 +662,13 @@ nodo increase_deposit <instance id> <amount>   # if the startup suite waits for 
 
 Why every Dockerfile builds for both architectures:
 
-- **Every `FROM` is a multi-arch index** with `linux/amd64` and `linux/arm64`:
-  the pinned `python:3.11@sha256:7bd2bb…` and `busybox:1.37.0@sha256:bdf57e…`
-  digests, `rust:1.86.0-bookworm`, `gcr.io/distroless/cc-debian12`, `debian:bookworm-slim`
-  (checked against the registries on 2026-10-04). BuildKit picks the entry for
-  the requested platform, so one pin serves both.
+- **Every `FROM` is a multi-arch index** with `linux/amd64` and `linux/arm64`,
+  pinned by the digest of that index: `python:3.11@sha256:7bd2bb…`,
+  `busybox:1.37.0@sha256:bdf57e…`, `rust:1.86.0-bookworm@sha256:300ec5…`,
+  `gcr.io/distroless/cc-debian12@sha256:e5d81d…` and
+  `debian:bookworm-slim@sha256:3783cc…` (checked against the registries on
+  2026-10-05). BuildKit picks the entry for the requested platform, so one pin
+  serves both.
 - **Rust children build natively for the target**: `cargo build` without
   `--target` emits a binary for the builder stage's own platform, which is the
   target one. `ring` (ping's only C/asm crate, via rustls) builds with the gcc
@@ -686,8 +688,10 @@ the packer enabled for it (`packer.ARM_PACKER_SUPPORT` / `X86_PACKER_SUPPORT`).
 ## Reproducibility
 
 `<arch>/.service/Dockerfile` pins every input: the base image by digest, `requests`,
-`Flask`, `grpcio` and `protobuf` by version, and `bee-rpc` and
-`celaut-service-libraries` (`node_controller`) by commit SHA. This service is
+`Flask`, `grpcio`, `protobuf` and each package that Flask and requests pull in by
+version, and `bee-rpc` and `celaut-service-libraries` (`node_controller`) by
+commit SHA. The Rust children pin their builder and runtime images by digest,
+and their crates through `Cargo.lock` (`cargo build --locked`). This service is
 content-addressed, so an unpinned `git+…` install (which resolves to whatever
 `master` happened to be that day) means two packs of the same source tree produce
 different images — and any bug observed in a running instance cannot be traced
