@@ -37,5 +37,17 @@
             ],
             "prose": "Connection to Amazon."
         }
+    ],
+    "shared_filesystems": [
+        {
+            "path": "/shared",
+            "role": "shared",
+            "tag": "demo-share"
+        },
+        {
+            "path": "/shared-ro",
+            "role": "shared",
+            "tag": "demo-share-ro"
+        }
     ]
 }

@@ -3,7 +3,7 @@
 Celaut node-honesty verifier (orchestrator).
 
 This service turns the passive "demo" into an ACTIVE verifier that checks whether
-the nodo node it runs on is HONEST. It drives three child services and turns each
+the nodo node it runs on is HONEST. It drives the child services and turns each
 observation into an explicit PASS/FAIL assertion, then assembles a signed-ready
 attestation report card:
 
@@ -19,12 +19,16 @@ attestation report card:
   4. resource_provisioning (self)       what the manifest declared / the node
                                         charged must match what the container
                                         actually gets (cgroup + /proc/meminfo).
-  5. attestation         report card    per-probe verdict + a content hash of the
+  5. shared_filesystem   (sharefs, sharefs-denied)  the directory this service exports
+                                        must be shared with its child both ways and
+                                        read-only where asked, and a child asking for a
+                                        share its parent does not export must be refused.
+  6. attestation         report card    per-probe verdict + a content hash of the
                                         result, ready to be submitted later as an
                                         EGO reputation opinion on-chain.
 """
 
-import os, json, logging, hashlib, datetime, re, threading, time, socket, platform, contextlib
+import os, json, logging, hashlib, datetime, re, threading, time, socket, platform, contextlib, secrets
 import requests
 from flask import Flask, jsonify, render_template_string, request
 from google.protobuf.json_format import MessageToDict
@@ -41,7 +45,7 @@ if False:  # development mode toggle (unchanged from the original demo)
     DIR = "."
     CONFIG_FILE = "__config__"
 
-VERIFIER_VERSION = "1.3.0"
+VERIFIER_VERSION = "1.4.0"
 
 # ---------------------------------------------------------------------------
 # Verdict taxonomy
@@ -175,7 +179,13 @@ CHILD_DECLARED_RESOURCES = {           # label -> (mem_limit, disk_space)
     "heavy": (HEAVY_DECLARED_MEM_BYTES, 200000000),
     "ping": (50000000, 500000000),
     "benchmark": (2147483648, 200000000),
+    "sharefs": (50000000, 200000000),
 }
+# sharefs-denied is deliberately NOT in the table above. It declares the same resources
+# (tests/test_verdicts.py holds it to its manifest), but it is never meant to start: the
+# table drives the budgets and the count of builds a starved run still owes, and a child
+# that is never built would be owed forever.
+SHARE_DENIED_DECLARED_RESOURCES = (50000000, 200000000)
 
 
 def canonical_arch(machine):
@@ -204,6 +214,8 @@ TINY_SERVICE = env_vars.get("TINY", None)
 HEAVY_SERVICE = env_vars.get("HEAVY", None)
 PING_SERVICE = env_vars.get("PING", None)
 BENCHMARK_SERVICE = env_vars.get("BENCHMARK", None)
+SHAREFS_SERVICE = env_vars.get("SHAREFS", None)
+SHAREFS_DENIED_SERVICE = env_vars.get("SHAREFS_DENIED", None)
 
 logging.basicConfig(filename='app.log', level=logging.DEBUG,
                     format='%(asctime)s - %(levelname)s - %(message)s')
@@ -262,7 +274,8 @@ FUNDING_WAIT_TIMEOUT_SECONDS = int(os.environ.get("FUNDING_WAIT_TIMEOUT_SECONDS"
 MU_PER_ERG = int(os.environ.get("MU_PER_ERG", str(10 ** 9)))
 
 _CHILD_HASHES = {"tiny": TINY_SERVICE, "heavy": HEAVY_SERVICE,
-                 "ping": PING_SERVICE, "benchmark": BENCHMARK_SERVICE}
+                 "ping": PING_SERVICE, "benchmark": BENCHMARK_SERVICE,
+                 "sharefs": SHAREFS_SERVICE, "sharefs_denied": SHAREFS_DENIED_SERVICE}
 
 FUNDING = {
     "balance_mu": None,          # last balance the node reported
@@ -300,16 +313,21 @@ tiny_service = _add_child("tiny")
 heavy_service = _add_child("heavy")
 ping_service = _add_child("ping")
 benchmark_service = _add_child("benchmark")
+sharefs_service = _add_child("sharefs")
+# Funded at the floor: an honest node refuses it before anything is spent, and if a node
+# does start it the probe still has to be able to inspect it, not be starved of funds.
+sharefs_denied_service = _add_child("sharefs_denied", CHILD_MIN_INITIAL_MU)
 
 
 def configure_child_budgets(self_rate):
     """Re-register every child funded for CHILD_FUNDED_SECONDS at this rate."""
-    global tiny_service, heavy_service, ping_service, benchmark_service
+    global tiny_service, heavy_service, ping_service, benchmark_service, sharefs_service
     budgets = {label: child_initial_mu(label, self_rate) for label in CHILD_DECLARED_RESOURCES}
     tiny_service = _add_child("tiny", budgets["tiny"])
     heavy_service = _add_child("heavy", budgets["heavy"])
     ping_service = _add_child("ping", budgets["ping"])
     benchmark_service = _add_child("benchmark", budgets["benchmark"])
+    sharefs_service = _add_child("sharefs", budgets["sharefs"])
     FUNDING["child_initial_mu"] = budgets
     logging.info("Child budgets at %.1f MU/s: %s", self_rate, budgets)
     return budgets
@@ -318,7 +336,8 @@ def configure_child_budgets(self_rate):
 def child_iface(label):
     """The current interface for a child (budgets re-register them)."""
     return {"tiny": tiny_service, "heavy": heavy_service,
-            "ping": ping_service, "benchmark": benchmark_service}[label]
+            "ping": ping_service, "benchmark": benchmark_service,
+            "sharefs": sharefs_service, "sharefs_denied": sharefs_denied_service}[label]
 
 
 def sample_balance():
@@ -1024,7 +1043,10 @@ DEP_IDENTITY = [
     ("heavy", "celaut-demo-heavy", "/whoami"),
     ("ping", "celaut-demo-ping", "/whoami"),
     ("benchmark", "celaut-demo-benchmark", "/cgi-bin/whoami"),
+    ("sharefs", "celaut-demo-sharefs", "/whoami"),
 ]
+# sharefs-denied is absent on purpose: a node that honours the share rules never starts it,
+# so there is no identity to read. shared_filesystem is what asks for it.
 
 
 def probe_dependency_identity():
@@ -1164,6 +1186,321 @@ def probe_node_benchmark():
         return ev
     finally:
         _release_child(benchmark_service, inst, "benchmark")
+
+
+# ----------------------------------------------------------------------------
+# Probe — shared filesystem (sharefs child is granted a share, sharefs-denied is not)
+# ----------------------------------------------------------------------------
+# This service exports two directories to its children (service.json, shared_filesystems):
+#
+#   /shared     tag demo-share     read-write, mounted by sharefs at /mnt/from-parent
+#   /shared-ro  tag demo-share-ro  mounted by sharefs with access=ro at /mnt/readonly
+#
+# The invariant a node must keep: only the exporter's direct children can attach to
+# what it exports, a child declaring a directory its parent does not export cannot run
+# at all, and nothing else can reach the directory. So the probe has two halves.
+#
+#   granted -- sharefs must SEE what this service wrote, this service must SEE what
+#              sharefs wrote, and the read-only mount must refuse a write. This service
+#              holds the other end of the share, so it checks the child's claims against
+#              what really landed on disk instead of trusting them.
+#   denied  -- sharefs-denied declares a directory under a tag this service does NOT
+#              export. The node must refuse to launch it.
+#
+# The same discipline as every other probe applies: only an OBSERVED violation accuses.
+# Two things the probe cannot see from here are reported as INCONCLUSIVE, never as
+# DISHONEST: whether the packed child specs really carry the share declarations (a
+# packer that does not know the `shared_filesystems` field silently drops it, and then a
+# child launches with nothing mounted exactly as it would on a node that skipped the
+# mount), and why a node refused a launch other than by the text of its refusal.
+SHARE_DIR = os.environ.get("SHARE_DIR", "/shared")
+SHARE_RO_DIR = os.environ.get("SHARE_RO_DIR", "/shared-ro")
+# Files each side writes. They live under the share, so the other end can read them.
+SHARE_PARENT_NONCE_FILE = "parent_nonce"
+SHARE_RO_SEED_FILE = "ro_seed"
+SHARE_CHILD_NONCE_FILE = "child_nonce"
+SHARE_RO_ATTEMPT_FILE = "child_write_attempt"
+# Where sharefs mounts them. They must match sharefs/.service/service.json and its main.rs.
+SHARE_GUEST_RW_MOUNT = "/mnt/from-parent"
+SHARE_GUEST_RO_MOUNT = "/mnt/readonly"
+# The directory sharefs-denied declares for a tag nobody exports. The node's refusal names
+# it ("cannot inherit '/mnt/not-granted': ..."), which is how that refusal is told apart
+# from any other launch failure. Must match sharefs-denied/.service/service.json.
+SHARE_DENIED_MOUNT = "/mnt/not-granted"
+# A write by the guest reaches the host's directory at once, but a reader may see it a
+# moment later; wait this long before concluding it never arrived.
+SHARE_PROPAGATION_TIMEOUT_S = float(os.environ.get("SHARE_PROPAGATION_TIMEOUT_S", "10"))
+SHARE_PROPAGATION_POLL_S = float(os.environ.get("SHARE_PROPAGATION_POLL_S", "0.5"))
+
+_SHARE_OK = "ok"
+_SHARE_DISHONEST = "dishonest"
+_SHARE_INFRA = "infra"
+_SHARE_INCONCLUSIVE = "inconclusive"
+
+_PACKAGING_HINT = ("If the packed services do not carry their shared_filesystems declarations "
+                   "(a nodo packer older than the one that supports the field drops it without "
+                   "an error), this is what a child looks like; repack with a nodo whose packer "
+                   "supports shared_filesystems (celaut-project/nodo#474).")
+
+
+def _share_refused(exc, guest_path):
+    """Whether the node refused this launch because the share at `guest_path` was not granted.
+
+    The node's own refusal reads "Unable to launch service <id>: cannot inherit
+    '<path>': <why>" (src/manager/shares.py). The path is the one the manifest declares,
+    so the match is on that exact text and nothing looser: a launch that failed for want
+    of balance, a timeout or a crash is not a refusal of a share, and counting it as one
+    would let a broken node pass the denied half.
+    """
+    return re.search(r"cannot inherit '" + re.escape(guest_path) + r"'", _full_error_text(exc)) is not None
+
+
+def _share_write(path, text):
+    with open(path, "w") as fh:
+        fh.write(text)
+        fh.flush()
+        os.fsync(fh.fileno())
+
+
+def _share_read(path):
+    """The file's text, or None when it does not exist (any other error propagates)."""
+    try:
+        with open(path) as fh:
+            return fh.read().strip()
+    except FileNotFoundError:
+        return None
+
+
+def _share_remove(path):
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+
+
+def _share_wait_for(path, expected, timeout=None):
+    """Poll `path` until it holds `expected`; return what it last held (None if absent)."""
+    timeout = SHARE_PROPAGATION_TIMEOUT_S if timeout is None else timeout
+    deadline = time.monotonic() + timeout
+    seen = None
+    while True:
+        seen = _share_read(path)
+        if seen == expected or time.monotonic() >= deadline:
+            return seen
+        time.sleep(SHARE_PROPAGATION_POLL_S)
+
+
+def _share_part(status, reason, **evidence):
+    return {"status": status, "reason": reason, "evidence": evidence}
+
+
+def _judge_granted_share(data, nonces):
+    """Decide what the sharefs child reported, against what is on this side of the share."""
+    plan = data.get("mount_plan") or {}
+    shared = data.get("shared") or {}
+    readonly = data.get("readonly") or {}
+    raw_plan = plan.get("raw") or ""
+    evidence = {"child_report": data}
+
+    # The node injects a mount plan into a guest that inherits shares. Without one, the
+    # node was never asked to mount anything for this instance: that is a package that
+    # does not declare the share, or a node that skipped it, and a guest cannot tell the
+    # two apart. Not an accusation.
+    missing = [p for p in (SHARE_GUEST_RW_MOUNT, SHARE_GUEST_RO_MOUNT) if p not in raw_plan]
+    if not plan.get("present") or missing:
+        return _share_part(
+            _SHARE_INCONCLUSIVE,
+            "the child launched without a guest mount plan for "
+            f"{missing or [SHARE_GUEST_RW_MOUNT, SHARE_GUEST_RO_MOUNT]}, so it was not asked "
+            f"to mount the shares it declares. {_PACKAGING_HINT}",
+            **evidence)
+
+    failures = []
+
+    # parent -> child, through the read-write share
+    seen_by_child = shared.get("parent_nonce") or {}
+    if not (seen_by_child.get("ok") and seen_by_child.get("content") == nonces["parent"]):
+        failures.append(
+            f"the child could not read what this service wrote to {SHARE_DIR}/"
+            f"{SHARE_PARENT_NONCE_FILE} (child saw {seen_by_child})")
+
+    # child -> parent, through the same share. Checked on this side's own disk.
+    child_write = shared.get("child_write") or {}
+    seen_by_parent = _share_wait_for(
+        os.path.join(SHARE_DIR, SHARE_CHILD_NONCE_FILE), nonces["child"])
+    evidence["parent_saw_child_nonce"] = seen_by_parent
+    if not child_write.get("ok"):
+        failures.append(f"the read-write share refused the child's write ({child_write})")
+    elif seen_by_parent != nonces["child"]:
+        failures.append(
+            f"what the child wrote to {SHARE_GUEST_RW_MOUNT} never appeared in {SHARE_DIR} "
+            f"(this service saw {seen_by_parent!r})")
+
+    # the exporter's content reaches the read-only mount
+    seed_seen = readonly.get("seed") or {}
+    if not (seed_seen.get("ok") and seed_seen.get("content") == nonces["seed"]):
+        failures.append(
+            f"the read-only mount did not show what this service put in {SHARE_RO_DIR}/"
+            f"{SHARE_RO_SEED_FILE} (child saw {seed_seen})")
+
+    # ...and refuses a write. The child's own report is not enough: the file's absence
+    # on this side is what proves the write did not land.
+    attempt = readonly.get("write_attempt") or {}
+    landed = _share_read(os.path.join(SHARE_RO_DIR, SHARE_RO_ATTEMPT_FILE))
+    evidence["ro_attempt_landed"] = landed is not None
+    if attempt.get("succeeded") is not False or landed is not None:
+        failures.append(
+            f"the read-only mount accepted a write (child reported {attempt}; "
+            f"{'the file is present' if landed is not None else 'the file is absent'} in {SHARE_RO_DIR})")
+
+    if failures:
+        return _share_part(_SHARE_DISHONEST, "; ".join(failures), **evidence)
+    return _share_part(
+        _SHARE_OK,
+        "the child saw the parent's data, the parent saw the child's, and the read-only "
+        "mount refused a write",
+        **evidence)
+
+
+def _probe_granted_share():
+    nonces = {"parent": secrets.token_hex(8), "child": secrets.token_hex(8),
+              "seed": secrets.token_hex(8)}
+    # Seed this side of the share first, and clear anything a previous run left, so that
+    # what the child finds -- and what this service finds afterwards -- is this run's.
+    try:
+        _share_remove(os.path.join(SHARE_DIR, SHARE_CHILD_NONCE_FILE))
+        _share_remove(os.path.join(SHARE_RO_DIR, SHARE_RO_ATTEMPT_FILE))
+        _share_write(os.path.join(SHARE_DIR, SHARE_PARENT_NONCE_FILE), nonces["parent"])
+        _share_write(os.path.join(SHARE_RO_DIR, SHARE_RO_SEED_FILE), nonces["seed"])
+    except OSError as e:
+        # Our own exported directory is unusable: nothing was observed about the node.
+        return _share_part(
+            _SHARE_INFRA,
+            f"this service could not write its own exported directories "
+            f"({SHARE_DIR}, {SHARE_RO_DIR}): {type(e).__name__}: {clip(e)}")
+
+    iface = child_iface("sharefs")
+    inst = None
+    try:
+        inst = _spin_child(iface, "sharefs")
+        r = requests.get(f"http://{inst.uri}/probe", params={"nonce": nonces["child"]}, timeout=45)
+        data = r.json()
+        if not isinstance(data, dict) or data.get("probe") != "shared_filesystem":
+            return _share_part(_SHARE_INCONCLUSIVE,
+                               f"the sharefs child answered with something that is not its report: "
+                               f"{clip(r.text)}")
+        return _judge_granted_share(data, nonces)
+    except ChildLaunchError as e:
+        if _share_refused(e.original, SHARE_GUEST_RW_MOUNT):
+            # The node refused a share this service does export. Either the node refused a
+            # grant it owed, or the packed parent never exported it; from here, both look
+            # the same.
+            return _share_part(
+                _SHARE_INCONCLUSIVE,
+                f"the node refused to launch sharefs for the share at {SHARE_GUEST_RW_MOUNT}: "
+                f"{clip(e)}. This service exports it in its manifest, so either the node "
+                f"refused a grant it owed or the packed parent never exported it. "
+                f"{_PACKAGING_HINT}")
+        return _share_part(_SHARE_INFRA,
+                           f"could not observe the granted share: {e}. No claim is made.")
+    except ChildNotReadyError as e:
+        return _share_part(_SHARE_INFRA,
+                           f"could not observe the granted share: {e}. No claim is made.")
+    except ValueError as e:
+        # requests' JSONDecodeError is a ValueError AND a RequestException; it must be
+        # caught here, as an answer we could not read, before the transport clause.
+        return _share_part(_SHARE_INCONCLUSIVE,
+                           f"the sharefs child's answer was not JSON: {clip(e)}")
+    except requests.RequestException as e:
+        return _share_part(_SHARE_INFRA,
+                           f"could not reach the sharefs child: {type(e).__name__}: {clip(e)}")
+    finally:
+        _release_child(iface, inst, "sharefs")
+
+
+def _probe_denied_share():
+    iface = child_iface("sharefs_denied")
+    inst = None
+    try:
+        # Not waiting for it to come up: an honest node never starts it.
+        inst = _spin_child(iface, "sharefs-denied", wait_ready=False)
+    except ChildLaunchError as e:
+        if _share_refused(e.original, SHARE_DENIED_MOUNT):
+            return _share_part(
+                _SHARE_OK,
+                f"the node refused to launch a service asking for {SHARE_DENIED_MOUNT}, "
+                "a share its parent does not export",
+                refusal=clip(_full_error_text(e.original), 600))
+        # Failing to launch is not the same as refusing the share. A launch that fails
+        # for want of balance, a timeout or a crash says nothing about the node's rules.
+        return _share_part(
+            _SHARE_INFRA,
+            f"the denied child did not launch, but not because of its share: {e}. "
+            "No claim is made.")
+
+    # It launched. Say what the node did about the share it was never granted.
+    try:
+        _wait_until_ready(inst.uri, "sharefs-denied")
+        r = requests.get(f"http://{inst.uri}/plan", timeout=45)
+        data = r.json()
+        if data.get("mounted") is True:
+            return _share_part(
+                _SHARE_DISHONEST,
+                f"the node launched sharefs-denied and attached a share at {SHARE_DENIED_MOUNT}, "
+                "which its parent never exported: only the exporter's children may attach",
+                child_report=data)
+        return _share_part(
+            _SHARE_INCONCLUSIVE,
+            f"the node launched sharefs-denied instead of refusing it, but mounted nothing "
+            f"at {SHARE_DENIED_MOUNT}. A node that honours the invariant refuses the launch; "
+            f"this one did not, though the child's package may simply lack the declaration. "
+            f"{_PACKAGING_HINT}",
+            child_report=data)
+    except (ChildNotReadyError, requests.RequestException, ValueError) as e:
+        return _share_part(
+            _SHARE_INCONCLUSIVE,
+            f"the node launched sharefs-denied instead of refusing it, and it could not be "
+            f"inspected afterwards: {type(e).__name__}: {clip(e)}. {_PACKAGING_HINT}")
+    finally:
+        _release_child(iface, inst, "sharefs-denied")
+
+
+def _run_share_half(name, fn):
+    try:
+        return fn()
+    except Exception as e:
+        return _share_part(_SHARE_INFRA, f"the {name} half could not run: {type(e).__name__}: {clip(e)}")
+
+
+def probe_shared_filesystem():
+    ev = {"probe": "shared_filesystem"}
+    ev["granted"] = _run_share_half("granted", _probe_granted_share)
+    ev["denied"] = _run_share_half("denied", _probe_denied_share)
+    parts = {"granted": ev["granted"], "denied": ev["denied"]}
+
+    # Observed violations outrank halves that could not be observed, as in
+    # dependency_identity: one half proving the node broke the rule is not undone by the
+    # other half being blind.
+    dishonest = {k: p for k, p in parts.items() if p["status"] == _SHARE_DISHONEST}
+    infra = {k: p for k, p in parts.items() if p["status"] == _SHARE_INFRA}
+    inconclusive = {k: p for k, p in parts.items() if p["status"] == _SHARE_INCONCLUSIVE}
+    if dishonest:
+        ev["verdict"] = VERDICT_DISHONEST
+        ev["reason"] = "shared-filesystem rules broken: " + " | ".join(
+            f"{k}: {p['reason']}" for k, p in dishonest.items())
+    elif infra:
+        ev["verdict"] = VERDICT_INFRA_ERROR
+        ev["reason"] = "could not observe shared-filesystem behaviour: " + " | ".join(
+            f"{k}: {p['reason']}" for k, p in infra.items())
+    elif inconclusive:
+        ev["verdict"] = VERDICT_INCONCLUSIVE
+        ev["reason"] = "shared-filesystem behaviour is not decidable: " + " | ".join(
+            f"{k}: {p['reason']}" for k, p in inconclusive.items())
+    else:
+        ev["verdict"] = VERDICT_PASS
+        ev["reason"] = ("the granted child shared data both ways and the read-only mount held; "
+                        "the child asking for an ungranted share was refused")
+    return ev
 
 
 # ----------------------------------------------------------------------------
@@ -1527,6 +1864,7 @@ PROBES = [
     ("dependency_observe", probe_dependency_observe),
     ("memory_ceiling", probe_memory_ceiling),
     ("node_benchmark", probe_node_benchmark),
+    ("shared_filesystem", probe_shared_filesystem),
     ("mu_accounting", probe_mu_accounting),
 ]
 
@@ -1537,7 +1875,7 @@ PROBES = [
 # /__config__, so it stays valid (and can legitimately PASS) with the gateway down.
 GATEWAY_DEPENDENT = ("dependency_identity", "network_isolation",
                      "dependency_observe", "memory_ceiling", "node_benchmark",
-                     "mu_accounting")
+                     "shared_filesystem", "mu_accounting")
 
 
 def _safe_probe(name, fn):
@@ -1631,7 +1969,7 @@ def run_startup_tests():
                 STARTUP_TESTS.update(status="running", started_at=_now())
                 # gateway preflight + resource provisioning + dependency identity +
                 # network isolation (real ping child) + observe + memory ceiling +
-                # node benchmark + MU.
+                # node benchmark + shared filesystem + MU.
                 results = _run_probe_suite()
                 STARTUP_TESTS["results"] = {"summary": summarize_suite(results), "probes": results}
                 starved = list(FUNDING_FAILURES)
@@ -1763,6 +2101,7 @@ PROBE_ENDPOINTS = [
     ("probe_dependency_observe", "/probe/dependency_observe", probe_dependency_observe),
     ("probe_memory_ceiling", "/probe/memory", probe_memory_ceiling),
     ("probe_node_benchmark", "/probe/benchmark", probe_node_benchmark),
+    ("probe_shared_filesystem", "/probe/shared_filesystem", probe_shared_filesystem),
     ("probe_mu_accounting", "/probe/mu_accounting", probe_mu_accounting),
 ]
 # Reads /proc and /__config__ only: it spins nothing and moves nothing, so it
@@ -1907,6 +2246,12 @@ MCP_TOOLS = [
     _tool("probe_node_benchmark",
           "Run the benchmark child (the node's per-core benchmark core service), return its scores "
           "and check it ran under its declared architecture." + _SPENDS, False),
+    _tool("probe_shared_filesystem",
+          "Check the node's shared-filesystem rules: the sharefs child must see what this service "
+          "wrote to the directory it exports and this service what the child wrote back, a "
+          "read-only mount must refuse a write, and sharefs-denied (which asks for a share this "
+          "service does not export) must be refused at launch. A package that does not carry the "
+          "share declarations reports INCONCLUSIVE, never DISHONEST." + _SPENDS, False),
 ]
 
 # Every HTTP route an operator can use, and the MCP tool(s) that give a model the
@@ -2015,7 +2360,7 @@ REPORT_HTML = """
 </style></head>
 <body>
 <h1>Celaut Node-Honesty Verifier</h1>
-<p>Actively probes the node under test for resource, memory-ceiling and network-isolation honesty, and runs its per-core benchmark.</p>
+<p>Actively probes the node under test for resource, memory-ceiling, network-isolation and shared-filesystem honesty, and runs its per-core benchmark.</p>
 <p><small>Absence of evidence is not evidence of dishonesty: probes that could not observe the node
 report <b>INFRA_ERROR</b>, and no attestation hash is minted unless every probe reached a
 conclusive verdict.</small></p>

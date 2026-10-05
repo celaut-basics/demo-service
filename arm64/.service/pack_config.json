@@ -8,7 +8,9 @@
     "TINY": "tiny",
     "HEAVY": "heavy",
     "PING": "ping",
-    "BENCHMARK": "benchmark"
+    "BENCHMARK": "benchmark",
+    "SHAREFS": "sharefs",
+    "SHAREFS_DENIED": "sharefs-denied"
   },
   "dependencies_env": true,
   "include": [
