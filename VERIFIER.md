@@ -2,7 +2,7 @@
 
 This turns the passive `demo-service` into an **active verifier** that checks
 whether the nodo node it is running on is *honest*. It reuses the existing
-`tiny` / `heavy` / `ping` / `benchmark` child scaffolding and the `node_controller` library —
+`tiny` / `heavy` / `ping` / `benchmark` / `sharefs` child scaffolding and the `node_controller` library —
 nothing was rewritten from scratch.
 
 An honest node must:
@@ -16,6 +16,10 @@ An honest node must:
 3. **Provision what it billed** — what the manifest declared and the node
    charged (`initial_mu`, `get_mem_limit_at_start()`) must match what the
    container actually gets (cgroup + `/proc/meminfo`).
+4. **Keep the sharing rules** — a directory a service exports is visible to its
+   own children, both ways and read-only where they asked for it, and to no one
+   else: a child asking for a directory its parent does not export must be
+   refused at launch.
 
 Each observation becomes an explicit verdict with JSON evidence, and the results
 are folded into an attestation **report card** with a content hash that is ready
@@ -61,8 +65,9 @@ Two consequences follow:
 | 4 | `dependency_identity` | all | the dependency requested is the dependency that actually ran |
 | 5 | `dependency_observe` | `ping` | the node's `Observe` stream independently corroborates the dependency's connectivity |
 | 6 | `node_benchmark` | `benchmark` | the node's per-core benchmark runs under its declared architecture and measures every primitive; the scores travel as evidence |
-| 7 | `mu_accounting` | orchestrator (self) | the node spends MUs in line with the resources it provisions |
-| 8 | `attestation` | orchestrator | per-probe verdict + `sha3_256` content hash, as JSON and HTML |
+| 7 | `shared_filesystem` | `sharefs`, `sharefs-denied` | the directory this service exports is shared with its child in both directions, a read-only mount refuses a write, and a child asking for a share its parent does not export is refused at launch |
+| 8 | `mu_accounting` | orchestrator (self) | the node spends MUs in line with the resources it provisions |
+| 9 | `attestation` | orchestrator | per-probe verdict + `sha3_256` content hash, as JSON and HTML |
 
 ### Child readiness — the node's "ready" is not the service's "ready"
 
@@ -302,6 +307,90 @@ service — `DISHONEST`. A run that never started
 or never answered (`BENCHMARK_TIMEOUT_S`, 180 s) is `INFRA_ERROR`; a refused run,
 a missing architecture or an unmeasured primitive is `INCONCLUSIVE`.
 
+### Shared filesystem (`sharefs/`, `sharefs-denied/`)
+
+A shared directory is a communication channel between a parent and its direct
+children, so a node that lets anyone else reach it breaks the isolation
+`Service.Network` otherwise provides. The rules (`docs/SHARED_FILESYSTEMS.md` in
+nodo) are: `shared` belongs to the instance whose image contains the directory,
+`guest` can only be exercised by that instance's direct children, and a service
+that declares an inherited directory it was never granted **cannot run**: the
+node must refuse the launch before anything is spent.
+
+This service exports two directories (`shared_filesystems` in its
+`service.json`), and the probe has two halves.
+
+| | child | declares | an honest node |
+|---|---|---|---|
+| **granted** | `sharefs` | `guest` for `demo-share` at `/mnt/from-parent` (rw) and `demo-share-ro` at `/mnt/readonly` (ro) | launches it; both shares work |
+| **denied** | `sharefs-denied` | `guest` for `demo-share-not-exported` at `/mnt/not-granted` | **refuses to launch it** |
+
+The children mount the shares at paths different from the parent's
+(`/shared`, `/shared-ro`), so what matches the two ends is the tag, never the
+location.
+
+**Granted.** Before the child runs, this service writes a random nonce into
+`/shared` and another into `/shared-ro`, and clears what an earlier run left.
+`sharefs` (`GET /probe?nonce=…`) reads the first, writes its own, and tries to
+write to the read-only mount. The child only *reports*: this service holds the
+other end of the share, so it checks the claims against what really landed on
+disk instead of taking the child's word.
+
+- the child read the parent's nonce → parent → child works;
+- the child's nonce shows up in `/shared` (polled for
+  `SHARE_PROPAGATION_TIMEOUT_S`, 10 s) → child → parent works;
+- the child read the read-only seed → the exporter's content reaches the mount;
+- the child's write to `/mnt/readonly` failed **and** its file is absent from
+  `/shared-ro` → the read-only mount held. The absence on this side is what
+  proves it: a child that says "refused" while its file is there is `DISHONEST`.
+
+**Denied.** `sharefs-denied` is requested on purpose. The pass is the node's own
+refusal, which reads `cannot inherit '/mnt/not-granted': …` and is matched on
+exactly that path. Any other launch failure — no balance, a timeout, a crash, a
+client library that lost the node's text — says nothing about the node's rules
+and is `INFRA_ERROR`, never a pass: counting any failure to launch as "the node
+said no" would let a broken node pass this half. If the node *does* launch it,
+the child reports its mount plan and `/proc/mounts`; a share attached at
+`/mnt/not-granted` is `DISHONEST`.
+
+| observation | verdict |
+|---|---|
+| shared both ways, read-only held, denied child refused | `PASS` |
+| the child's mount plan lists the shares but it cannot see the parent's data, the parent cannot see the child's, or the read-only mount shows no seed or accepts a write | `DISHONEST` |
+| `sharefs-denied` launched with a share attached at `/mnt/not-granted` | `DISHONEST` |
+| this service cannot write its own exported directory, a child never launches or answers, no balance, a transport failure, a launch failure that is not the share's refusal | `INFRA_ERROR` |
+| a child launched with **no mount plan** (or one missing a share), the node refused the *granted* share, `sharefs-denied` launched with nothing mounted, or an answer that is not the child's report | `INCONCLUSIVE` |
+
+Observed violations outrank halves that could not be observed, as in
+`dependency_identity`.
+
+**What the probe cannot see.** Whether the *packed* specs carry the share
+declarations. The packer writes the `shared`/`guest` xattrs from
+`service.json → shared_filesystems`; a nodo whose packer does not know the field
+drops it **without an error**, and the packed children then launch with nothing
+mounted — exactly what they would do on a node that skipped the mount. A guest
+cannot tell the two apart, so every such case is `INCONCLUSIVE` (and so not
+attestable), never `DISHONEST`, and the reason names the cause. The cost is that
+a node that really does drop shares reads `INCONCLUSIVE` rather than
+`DISHONEST` until the declarations can be verified from here.
+
+**Requires** a nodo whose packer supports `shared_filesystems`
+([celaut-project/nodo#474](https://github.com/celaut-project/nodo/issues/474)).
+The field names used in the manifests (`path`, `role`, `tag`, `access`) are the
+ones proposed there and may change with it; `tests/test_shared_filesystem.py`
+holds the manifests, the constants in `app.py` and the paths in the Rust sources
+to one another.
+
+**Cost.** `sharefs` is funded like `tiny`. `sharefs-denied` is not in
+`CHILD_DECLARED_RESOURCES` (it is never meant to start, and a child that is
+never built would be owed to a starved run forever); it is registered at
+`CHILD_MIN_INITIAL_MU`, enough for the probe to inspect it if a node does start
+it. A share is not durable and lives as long as this instance: a restart gives a
+new, empty one, which is why every run writes its own end first.
+
+Exposed as `GET/POST /probe/shared_filesystem` and as the MCP tool
+`probe_shared_filesystem`.
+
 ### 4. Attestation report card
 
 A full run drives every probe — including the memory-ceiling ladder and the
@@ -454,6 +543,12 @@ things.
   errors quoted from the node's own `details`, `SELF_DECLARED_MEM_BYTES`
   corrected to the 2 GB the manifest declares.
 - `tests/harness.py` (stubs shared by the suites), `tests/test_mcp.py`.
+- **1.4.0 — shared filesystems.** `sharefs/` and `sharefs-denied/` (Rust, one
+  pack root per architecture like the other children), the `shared_filesystem`
+  probe in `app.py` (`probe_shared_filesystem`, `/probe/shared_filesystem`, the
+  MCP tool, `DEP_IDENTITY` for `sharefs`), `shared_filesystems` and the
+  `/shared`, `/shared-ro` directories in both parents' `.service/`, the two new
+  `pack_config.json` dependencies, and `tests/test_shared_filesystem.py`.
 
 ## Live validation against a real node
 
@@ -490,7 +585,7 @@ passes to BuildKit as `--opt platform=`), so every service here is maintained
 twice, by hand, and packed from the tree of the architecture wanted:
 
 ```sh
-nodo pack arm64          # demo + tiny/heavy/ping/benchmark, all linux/arm64
+nodo pack arm64          # demo + tiny/heavy/ping/benchmark/sharefs/sharefs-denied, all linux/arm64
 nodo pack amd64          # the same, all linux/amd64
 nodo pack benchmark/amd64   # one service on its own
 ```
@@ -499,8 +594,8 @@ nodo pack benchmark/amd64   # one service on its own
 arm64/  amd64/                  the demo's pack roots
 ├── .service/                   Dockerfile, service.json, pack_config.json — per arch
 ├── app.py      -> ../app.py
-└── tiny heavy ping benchmark   -> ../<svc>/<arch>
-<svc>/                          tiny, heavy, ping, benchmark
+└── tiny heavy ping benchmark sharefs sharefs-denied   -> ../<svc>/<arch>
+<svc>/                          tiny, heavy, ping, benchmark, sharefs, sharefs-denied
 ├── src/ Cargo.* | bench.sh serve www/     shared source
 └── arm64/  amd64/              the service's pack roots
     ├── .service/               per arch

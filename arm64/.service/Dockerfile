@@ -18,3 +18,7 @@ RUN apt-get update --fix-missing && \
         git+https://github.com/bee-rpc-protocol/celaut-service-libraries
 COPY service /service
 RUN chmod +x /service/app.py
+# Directories this service exports to its children. The packer marks them as
+# `shared` from service.json, so they have to exist in the image. The share
+# lives outside the rootfs, and its bytes are charged to this service's disk.
+RUN mkdir -p /shared /shared-ro

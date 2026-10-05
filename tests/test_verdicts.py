@@ -59,7 +59,8 @@ class BlindNodeTests(unittest.TestCase):
         ev = app.probe_dependency_identity()
         self.assertEqual(ev["verdict"], app.VERDICT_INFRA_ERROR)
         self.assertEqual(ev["verified_count"], 0)
-        self.assertEqual(sorted(ev["not_observed"]), ["benchmark", "heavy", "ping", "tiny"])
+        self.assertEqual(sorted(ev["not_observed"]),
+                         ["benchmark", "heavy", "ping", "sharefs", "tiny"])
         self.assertEqual(ev["mismatched"], [])
         for check in ev["checks"]:
             self.assertIsNone(check["match"], "unobserved must be None, not False")
@@ -110,7 +111,8 @@ class BlindNodeTests(unittest.TestCase):
 
         With the node in the observed state (gateway unreachable) the battery
         must report 1 PASS + 6 INFRA_ERROR, attestable: false, content_hash: null --
-        7 INFRA_ERROR now that node_benchmark joined the gateway-dependent probes.
+        8 INFRA_ERROR now that node_benchmark and shared_filesystem joined the
+        gateway-dependent probes.
         The guest's real /proc/meminfo figures are injected because the test host
         is not the microVM.
         """
@@ -126,8 +128,8 @@ class BlindNodeTests(unittest.TestCase):
             self.assertEqual(verdicts[name], app.VERDICT_INFRA_ERROR)
         self.assertEqual(rep["summary"]["pass"], 1)
         self.assertEqual(rep["summary"]["dishonest"], 0)
-        self.assertEqual(rep["summary"]["unobserved"], 7)
-        self.assertEqual(rep["summary"]["total"], 8)
+        self.assertEqual(rep["summary"]["unobserved"], 8)
+        self.assertEqual(rep["summary"]["total"], 9)
         self.assertFalse(rep["summary"]["attestable"])
         self.assertIsNone(rep["content_hash"]["value"])
 
@@ -647,7 +649,7 @@ class FundingTests(unittest.TestCase):
             results = app._run_probe_suite()
         self.assertEqual(results["dependency_identity"]["verdict"], app.VERDICT_INFRA_ERROR)
         for name in ("network_isolation", "dependency_observe", "memory_ceiling",
-                     "node_benchmark", "mu_accounting"):
+                     "node_benchmark", "shared_filesystem", "mu_accounting"):
             self.assertEqual(results[name].get("fault"), "insufficient_funds", name)
         self.assertEqual(results["resource_provisioning"]["verdict"], app.VERDICT_PASS)
         mu.assert_not_called()
@@ -878,7 +880,7 @@ class NodeBenchmarkTests(unittest.TestCase):
         with mock.patch.object(app.requests, "get", side_effect=fake_get):
             ev = app.probe_dependency_identity()
         self.assertEqual(ev["verdict"], app.VERDICT_PASS, ev["reason"])
-        self.assertEqual(ev["verified_count"], 4)
+        self.assertEqual(ev["verified_count"], len(app.DEP_IDENTITY))
 
 
 if __name__ == "__main__":

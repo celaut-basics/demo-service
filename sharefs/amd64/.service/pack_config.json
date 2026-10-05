@@ -1,0 +1,8 @@
+{
+  "workdir": "sharefs-service",
+  "include": [
+    "src",
+    "Cargo.toml",
+    "Cargo.lock"
+  ]
+}

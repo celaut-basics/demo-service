@@ -68,7 +68,8 @@ class PerArchitectureLayoutTests(unittest.TestCase):
         deps = {arch: _json(os.path.join(ROOT, arch, ".service", "pack_config.json"))["dependencies"]
                 for arch in ARCHES}
         self.assertEqual(deps["arm64"], deps["amd64"])
-        self.assertEqual(set(deps["arm64"]), {"TINY", "HEAVY", "PING", "BENCHMARK"})
+        self.assertEqual(set(deps["arm64"]),
+                         {"TINY", "HEAVY", "PING", "BENCHMARK", "SHAREFS", "SHAREFS_DENIED"})
 
     def test_dependencies_resolve_inside_the_pack_root(self):
         # nodo resolves a local dependency inside its cache copy of the pack

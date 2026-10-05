@@ -1,0 +1,39 @@
+{
+    "tag": "sharefs",
+    "api": [
+        {
+            "port": 3030,
+            "protocol": [
+                "http",
+                "tls"
+            ]
+        }
+    ],
+    "architecture": "linux/amd64",
+    "entrypoint": "/sharefs-service",
+    "envs": [],
+    "resources": {
+        "at_init": {
+            "mem_limit": 50000000,
+            "disk_space": 200000000
+        },
+        "at_most": {
+            "mem_limit": 50000000,
+            "disk_space": 200000000
+        }
+    },
+    "shared_filesystems": [
+        {
+            "path": "/mnt/from-parent",
+            "role": "guest",
+            "tag": "demo-share",
+            "access": "rw"
+        },
+        {
+            "path": "/mnt/readonly",
+            "role": "guest",
+            "tag": "demo-share-ro",
+            "access": "ro"
+        }
+    ]
+}
