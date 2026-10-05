@@ -17,13 +17,17 @@
 # celaut-service-libraries declares bee-rpc as an unpinned `git+` requirement,
 # so it is installed with --no-deps after the pinned bee-rpc: otherwise pip
 # would fetch bee-rpc master again. grpcio and protobuf are the versions a
-# current nodo install runs with.
+# current nodo install runs with. The second group pins what Flask and
+# requests pull in, so that no transitive package floats either.
 FROM python:3.11@sha256:7bd2bbe2112147be4dbe68802d60eee6c5e46042f621ffdf2102264aeeba8716
 RUN pip3 install --no-cache-dir \
         requests==2.32.3 \
         Flask==3.0.3 \
         grpcio==1.56.0 \
         protobuf==7.36.2 \
+        Werkzeug==3.1.9 Jinja2==3.1.6 MarkupSafe==3.0.4 itsdangerous==2.2.0 \
+        click==8.5.0 blinker==1.9.0 urllib3==2.8.0 idna==3.20 \
+        charset-normalizer==3.5.2 certifi==2026.7.22 \
         "bee-rpc @ git+https://github.com/bee-rpc-protocol/bee-rpc-over-grpc-py@8049fd86261c0d85445e6c27d363e0c82d5b2958" && \
     pip3 install --no-cache-dir --no-deps \
         "celaut_libs @ git+https://github.com/bee-rpc-protocol/celaut-service-libraries@23459eea47351c75cffffa9318049aad8810ea75"
