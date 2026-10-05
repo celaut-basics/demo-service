@@ -4,13 +4,16 @@
         {
             "port": 3030,
             "protocol": [
-                "http",
-                "tls"
+                "http"
             ]
         }
     ],
     "architecture": "linux/amd64",
-    "entrypoint": "/sharefs-denied-service",
+    "init": {
+        "entry_path": [
+            "sharefs-denied-service"
+        ]
+    },
     "envs": [],
     "resources": {
         "at_init": {

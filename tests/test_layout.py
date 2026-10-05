@@ -39,7 +39,7 @@ class PerArchitectureLayoutTests(unittest.TestCase):
     def test_service_dirs_live_only_under_an_architecture(self):
         # A stray .service at the old places would make `nodo pack .` (or
         # `nodo pack tiny`) pack something no one maintains any more.
-        for d in ("", "tiny", "heavy", "ping", "benchmark"):
+        for d in ("", "tiny", "heavy", "ping", "benchmark", "sharefs", "sharefs-denied"):
             self.assertFalse(os.path.exists(os.path.join(ROOT, d, ".service")), d or ".")
 
     def test_every_service_file_is_maintained_per_architecture(self):
@@ -86,6 +86,21 @@ class PerArchitectureLayoutTests(unittest.TestCase):
                 for item in _json(os.path.join(root, ".service", "pack_config.json")).get("include", []):
                     self.assertTrue(os.path.exists(os.path.join(root, item)),
                                     f"{arch}/{label}: include '{item}' is missing or a broken link")
+
+    def test_every_manifest_uses_the_current_packer_fields(self):
+        # nodo maps the legacy `entrypoint` to init.entry_path and ignores a
+        # pack_config `workdir`. Each child serves plain HTTP, so an api slot
+        # that claims "tls" describes a protocol the service does not speak.
+        for arch in ARCHES:
+            for label, root in _pack_roots(arch):
+                manifest = _json(os.path.join(root, ".service", "service.json"))
+                where = f"{arch}/{label}"
+                self.assertNotIn("entrypoint", manifest, where)
+                self.assertTrue(manifest.get("init", {}).get("entry_path"), where)
+                for slot in manifest.get("api", []):
+                    self.assertNotIn("tls", slot.get("protocol", []), where)
+                pack_config = _json(os.path.join(root, ".service", "pack_config.json"))
+                self.assertNotIn("workdir", pack_config, where)
 
     def test_dockerfiles_copy_only_from_the_build_context(self):
         # The build context is .service/, with the project under service/. nodo

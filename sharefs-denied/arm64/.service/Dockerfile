@@ -7,7 +7,7 @@
 
 FROM rust:1.86.0-bookworm AS builder
 COPY service /sharefs-denied-service
-WORKDIR sharefs-denied-service
+WORKDIR /sharefs-denied-service
 RUN cargo build --release --locked
 
 FROM debian:bookworm-slim
