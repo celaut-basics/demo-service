@@ -16,9 +16,9 @@
 # installs (bash/requirements.txt), so both ends speak the same bee-rpc.
 # celaut-service-libraries declares bee-rpc as an unpinned `git+` requirement,
 # so it is installed with --no-deps after the pinned bee-rpc: otherwise pip
-# would fetch bee-rpc master again. grpcio and protobuf are the versions a
-# current nodo install runs with. The second group pins what Flask and
-# requests pull in, so that no transitive package floats either.
+# would fetch bee-rpc master again. grpcio and protobuf are pinned so they
+# cannot float; nodo's bash/requirements.txt pins bee-rpc only. The second
+# group pins what Flask and requests pull in.
 FROM python:3.11@sha256:7bd2bbe2112147be4dbe68802d60eee6c5e46042f621ffdf2102264aeeba8716
 RUN pip3 install --no-cache-dir \
         requests==2.32.3 \

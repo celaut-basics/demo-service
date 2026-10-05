@@ -4,7 +4,8 @@ Celaut node-honesty verifier (orchestrator).
 
 This service turns the passive "demo" into an ACTIVE verifier that checks whether
 the nodo node it runs on is HONEST. It drives the child services and turns each
-observation into an explicit PASS/FAIL assertion, then assembles a signed-ready
+observation into an explicit PASS / DISHONEST / INFRA_ERROR / INCONCLUSIVE /
+NOT_APPLICABLE verdict, then assembles a signed-ready
 attestation report card:
 
   1. network_isolation   (ping child)   declared egress (google) must succeed and

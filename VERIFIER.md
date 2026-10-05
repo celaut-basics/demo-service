@@ -721,30 +721,31 @@ format skew between the only available packer (`packer-service:10gb`, built
 `service_dir = next(it)` — **identically for the unmodified `tiny` service**, so
 it is a tooling/version mismatch, not a defect in this change.
 
-Each probe was therefore validated against the **same kernel mechanisms nodo
+Each probe was therefore checked against the **same kernel mechanisms nodo
 delegates to** — cgroup memory limits and egress control — by running the packed
-child images directly:
+child images directly. That Docker run is **not** a run on a nodo node, and it
+predates the address-based egress probe (see probe 1). A request to a name that
+the guest cannot resolve never meets the firewall, so isolation-by-name under
+Docker cannot prove the current probe.
 
 - **memory_ceiling** — `heavy` under `--memory=256m --memory-swap=256m`:
   64/128/200/240 MiB → HTTP 200; 256/280/320/400 MiB → OOM-killed (connection
   dropped). Observed ceiling 240 MiB, first kill 256 MiB vs declared 256 MiB →
   **PASS**. `/introspect` reported `cgroup_mem_max = 268435456` (256 MiB).
-- **network_isolation** — `ping` with a crafted `/__config__` declaring google. This
-  run is from before the probe tested amazon by address (see probe 1): it asked for
-  the name, and a request to the name could not tell a block from a failed lookup.
-  - honest node (amazon → `127.0.0.1`): google `honest_allowed`, amazon
-    `honest_blocked`, `honest:true` → **PASS**.
-  - leaky node (unrestricted egress): google `honest_allowed`, amazon
-    `DISHONEST_LEAK`, `honest:false` → correctly **flags the leak**.
+- **network_isolation** — historical Docker check only. The current probe reads
+  `UNDECLARED_ADDRS` and opens TCP to those IPv4 addresses. A real node must
+  confirm that path.
 - **resource_provisioning** — the container's real `cgroup memory.max` matched
-  the declared limit (ratio 1.0) → **PASS**.
+  the declared limit (ratio 1.0) → **PASS**. That cgroup does not exist in a
+  microVM.
 
-Example assembled report card:
+Example assembled report card (`FAIL` is not a verdict):
 
 ```json
 {
   "verifier": "celaut-node-honesty-verifier",
-  "summary": {"node_honest": true, "pass": 3, "fail": 0, "total": 3},
+  "summary": {"node_honest": true, "pass": 3, "dishonest": 0,
+              "unobserved": 0, "total": 3, "attestable": true},
   "content_hash": {"alg": "sha3_256",
     "value": "b5b22156fcb28125e480e98b7dcd8d3f42f8f5118de4aa70d9a7a9bb62520915"}
 }
