@@ -14,7 +14,9 @@
             "ping-service"
         ]
     },
-    "envs": [],
+    "envs": [
+        "UNDECLARED_ADDRS"
+    ],
     "network": [
         {
             "tags": [
