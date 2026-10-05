@@ -13,6 +13,7 @@ Run with:  python3 tests/test_layout.py
 """
 import json
 import os
+import re
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -100,6 +101,32 @@ class PerArchitectureLayoutTests(unittest.TestCase):
                         for src in [p for p in parts[1:-1] if not p.startswith("--")]:
                             self.assertTrue(src == "service" or src.startswith(("service/", "./")),
                                             f"{arch}/{label}: COPY {src}")
+
+
+class RustToolchainTests(unittest.TestCase):
+    """`cargo build --locked` runs in the pinned `rust:<version>` image, not on the machine
+    that wrote the lockfile. A lockfile resolved with a newer cargo can pick crates that
+    need a newer rustc, and compiles fine locally while the pack fails. Declaring
+    `rust-version` makes `cargo generate-lockfile` (with
+    CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS=fallback) stay inside what the image has."""
+
+    CHILDREN = ("sharefs", "sharefs-denied")
+
+    @staticmethod
+    def _version(text):
+        return tuple(int(p) for p in text.split("."))
+
+    def test_each_rust_child_declares_the_toolchain_its_image_builds_with(self):
+        for child in self.CHILDREN:
+            with open(os.path.join(ROOT, child, "Cargo.toml")) as fh:
+                declared = re.search(r'^rust-version = "([\d.]+)"', fh.read(), re.M)
+            self.assertIsNotNone(declared, f"{child}: Cargo.toml declares no rust-version")
+            for arch in ARCHES:
+                with open(os.path.join(ROOT, child, arch, ".service", "Dockerfile")) as fh:
+                    image = re.search(r"^FROM rust:([\d.]+)", fh.read(), re.M)
+                self.assertIsNotNone(image, f"{child}/{arch}: no pinned rust image")
+                self.assertLessEqual(self._version(declared.group(1)), self._version(image.group(1)),
+                                     f"{child}/{arch}: rust-version is newer than its image")
 
 
 if __name__ == "__main__":
