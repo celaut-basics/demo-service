@@ -409,12 +409,16 @@ attestable), never `DISHONEST`, and the reason names the cause. The cost is that
 a node that really does drop shares reads `INCONCLUSIVE` rather than
 `DISHONEST` until the declarations can be verified from here.
 
-**Requires** a nodo whose packer supports `shared_filesystems`
-([celaut-project/nodo#474](https://github.com/celaut-project/nodo/issues/474)).
-The field names used in the manifests (`path`, `role`, `tag`, `access`) are the
-ones proposed there and may change with it; `tests/test_shared_filesystem.py`
-holds the manifests, the constants in `app.py` and the paths in the Rust sources
-to one another.
+**Requires** a nodo whose packer supports `shared_filesystems`. That is nodo
+`dev` from commit `698e658` on
+([celaut-project/nodo#475](https://github.com/celaut-project/nodo/pull/475),
+which closes [#474](https://github.com/celaut-project/nodo/issues/474)). The
+manifests use the field names that #475 accepts: `path`, `role`, `tag` and
+`access` (`_SHARED_ENTRY_FIELDS` in `src/packers/zip_with_dockerfile.py`). That
+packer refuses an unknown field, and it fails the pack when a declared
+directory is not in the image, so each Dockerfile creates its directories.
+`tests/test_shared_filesystem.py` holds the manifests, the constants in `app.py`
+and the paths in the Rust sources to one another.
 
 **Cost.** `sharefs` is funded like `tiny`. `sharefs-denied` is not in
 `CHILD_DECLARED_RESOURCES` (it is never meant to start, and a child that is

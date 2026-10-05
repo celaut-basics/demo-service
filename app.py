@@ -1375,7 +1375,7 @@ _SHARE_INCONCLUSIVE = "inconclusive"
 _PACKAGING_HINT = ("If the packed services do not carry their shared_filesystems declarations "
                    "(a nodo packer older than the one that supports the field drops it without "
                    "an error), this is what a child looks like; repack with a nodo whose packer "
-                   "supports shared_filesystems (celaut-project/nodo#474).")
+                   "supports shared_filesystems (celaut-project/nodo#475).")
 
 
 def _share_refused(exc, guest_path):
