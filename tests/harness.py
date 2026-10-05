@@ -115,6 +115,7 @@ def _install_stubs(tmpdir):
     nc_protos = types.ModuleType("node_controller.gateway.protos")
     celaut_pb2 = types.ModuleType("node_controller.gateway.protos.celaut_pb2")
     celaut_pb2.Configuration = lambda **kw: {"config": kw}
+    celaut_pb2.BytesKeyValue = lambda **kw: dict(kw)
     celaut_pb2.ObserveRequest = lambda **kw: {"observe": kw}
     celaut_pb2.ObserveEvent = object
     nc_protos.celaut_pb2 = celaut_pb2
