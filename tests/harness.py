@@ -7,6 +7,7 @@ Importing this module once per process gives every test file the same app.
 import os
 import socket
 import sys
+import threading
 import types
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -22,6 +23,30 @@ _LISTENER = socket.socket()
 _LISTENER.bind(("127.0.0.1", 0))
 _LISTENER.listen(64)
 LISTENING_URI = "127.0.0.1:%d" % _LISTENER.getsockname()[1]
+
+
+def _drain_ready_listener():
+    """Drop every connection so the accept queue cannot fill.
+
+    `_wait_until_ready` only needs the TCP handshake. Without accept(), each
+    handshake stays in the listen backlog until the process exits. After 64
+    waits, later waits hang for CHILD_READY_TIMEOUT_S (120s) and
+    `unittest discover` never finishes.
+    """
+    while True:
+        try:
+            conn, _ = _LISTENER.accept()
+        except OSError:
+            return
+        try:
+            conn.close()
+        except OSError:
+            pass
+
+
+threading.Thread(
+    target=_drain_ready_listener, name="harness-accept", daemon=True
+).start()
 
 _closed = socket.socket()
 _closed.bind(("127.0.0.1", 0))
