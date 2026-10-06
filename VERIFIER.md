@@ -665,7 +665,8 @@ Why every Dockerfile builds for both architectures:
 - **Every `FROM` is a multi-arch index** with `linux/amd64` and `linux/arm64`,
   pinned by the digest of that index: `python:3.11@sha256:7bd2bb…`,
   `busybox:1.37.0@sha256:bdf57e…`, `rust:1.86.0-bookworm@sha256:300ec5…`,
-  `gcr.io/distroless/cc-debian12@sha256:e5d81d…` and
+  `rust:1.88.0-bookworm@sha256:af306c…` (the two sharefs children: their
+  `Cargo.lock` needs rustc 1.88), `gcr.io/distroless/cc-debian12@sha256:e5d81d…` and
   `debian:bookworm-slim@sha256:3783cc…` (checked against the registries on
   2026-10-05). BuildKit picks the entry for the requested platform, so one pin
   serves both.
