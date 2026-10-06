@@ -156,6 +156,10 @@ def _install_stubs(tmpdir):
     bee_client = types.ModuleType("bee_rpc.client")
     bee_client.client_grpc = lambda **kw: iter(())
     bee.client = bee_client
+    bee_utils = types.ModuleType("bee_rpc.utils")
+    bee_utils.env_calls = []
+    bee_utils.modify_env = lambda **kw: bee_utils.env_calls.append(kw)
+    bee.utils = bee_utils
 
     for name, mod in [
         ("node_controller", nc),
@@ -168,6 +172,7 @@ def _install_stubs(tmpdir):
         ("node_controller.gateway.communication", nc_comm),
         ("bee_rpc", bee),
         ("bee_rpc.client", bee_client),
+        ("bee_rpc.utils", bee_utils),
     ]:
         sys.modules[name] = mod
 

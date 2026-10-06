@@ -35,6 +35,7 @@ import requests
 from flask import Flask, jsonify, render_template_string, request
 from google.protobuf.json_format import MessageToDict
 
+from bee_rpc.utils import modify_env
 from node_controller.controller.controller import Controller
 from node_controller.gateway.protos import celaut_pb2
 from node_controller.gateway.utils import to_amount, from_amount
@@ -223,6 +224,13 @@ logging.basicConfig(filename='app.log', level=logging.DEBUG,
                     format='%(asctime)s - %(levelname)s - %(message)s')
 
 app = Flask(__name__)
+
+# bee-rpc reads the blocks of a child service from <cwd>/__block__/ by default.
+# Under nodo the cwd of this process is /, but the packer puts the blocks in
+# service/__block__/ beside __services__. Without this line, a launch that must
+# send a child service to the node fails with "gRPCbb: Error reading block".
+# node_controller does not set it.
+modify_env(block_dir=os.path.join(os.path.abspath(DIR), "__block__") + "/")
 
 controller = Controller(debug=lambda s: logging.info('Node Controller: %s', s),
                         app_dir=DIR, config_file=CONFIG_FILE)
