@@ -157,7 +157,7 @@ bench_sha256() {
     _start=$NOW
     _end=$(( _start + BENCH_CS ))
     while :; do
-        # shellcheck disable=SC2086 -- the 256 copies are meant to split.
+        # shellcheck disable=SC2086 # the 256 copies are meant to split.
         sha256sum $_args > /dev/null || { rm -f "$_file"; echo "skipped sha256_hashes_per_sec: sha256sum failed"; return; }
         _n=$(( _n + 256 ))
         now_cs
@@ -202,7 +202,7 @@ parse_working_set() {
         return 1
     fi
     _avail_kb=$(awk '/^MemAvailable:/ { print $2; exit }' /proc/meminfo 2>/dev/null)
-    if [ -n "$_avail_kb" ] && [ "$WORKING_SET" -gt $(( _avail_kb * 1024 / 4 * 3 )) ]; then
+    if [ -n "$_avail_kb" ] && [ "$WORKING_SET" -gt $(( _avail_kb * 1024 * 3 / 4 )) ]; then
         WORKING_SET_ERROR="working_set_bytes $WORKING_SET does not fit in 3/4 of the $(( _avail_kb * 1024 )) bytes available"
         return 1
     fi

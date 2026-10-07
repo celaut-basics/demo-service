@@ -300,7 +300,7 @@ class WhatTheProbeCannotSeeTests(Harness):
         ev = app.probe_shared_filesystem()
         self.assertEqual(ev["verdict"], app.VERDICT_INCONCLUSIVE)
         self.assertNotAccusing(ev)
-        self.assertIn("nodo#474", ev["reason"])
+        self.assertIn("nodo#475", ev["reason"])
 
     def test_a_plan_missing_one_of_the_shares_is_inconclusive(self):
         self.plan_paths = [app.SHARE_GUEST_RW_MOUNT]
@@ -323,7 +323,7 @@ class WhatTheProbeCannotSeeTests(Harness):
         ev = app.probe_shared_filesystem()
         self.assertEqual(ev["denied"]["status"], "inconclusive")
         self.assertEqual(ev["verdict"], app.VERDICT_INCONCLUSIVE)
-        self.assertIn("nodo#474", ev["denied"]["reason"])
+        self.assertIn("nodo#475", ev["denied"]["reason"])
         self.assertIn(LISTENING_URI, FakeServiceInterface.stopped, "it must still be released")
 
     def test_a_denied_child_that_launches_and_cannot_be_inspected_is_inconclusive(self):

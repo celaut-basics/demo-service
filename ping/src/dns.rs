@@ -229,13 +229,17 @@ fn parse_instance_message_proto(
 }
 
 /// Parses a `NetworkResolution` message.
-/// message NetworkResolution { repeated string tags = 1; Instance network_client = 2; }
+/// message NetworkResolution { repeated string tags = 1; repeated Instance peer_instances = 2; }
+///
+/// `peer_instances` is repeated: a hostname tag gives one instance, but the
+/// instances this node runs in the same network domain come as more entries.
+/// Keep all of them, not only the last one.
 fn parse_network_resolution_message_proto(
     mut data: &[u8], // Slice representing the NetworkResolution message
     results: &mut Vec<ExtractedInfo>,
 ) -> Result<(), String> {
     let mut current_tags_for_resolution: Vec<String> = Vec::new();
-    let mut network_client_message_bytes_opt: Option<&[u8]> = None;
+    let mut peer_instance_messages: Vec<&[u8]> = Vec::new();
 
     while !data.is_empty() {
         let (field_number, wire_type) = read_tag(&mut data)?;
@@ -248,22 +252,22 @@ fn parse_network_resolution_message_proto(
                 current_tags_for_resolution.push(String::from_utf8(tag_bytes.to_vec())
                     .map_err(|e| format!("NetworkResolution.tags: Invalid UTF-8 string for tag: {}", e))?);
             }
-            2 => { // network_client (Instance message)
+            2 => { // peer_instances (repeated Instance message)
                 if wire_type != WIRE_TYPE_LENGTH_DELIMITED {
-                    return Err(format!("NetworkResolution.network_client: Expected wire type {}, got {}", WIRE_TYPE_LENGTH_DELIMITED, wire_type));
+                    return Err(format!("NetworkResolution.peer_instances: Expected wire type {}, got {}", WIRE_TYPE_LENGTH_DELIMITED, wire_type));
                 }
-                network_client_message_bytes_opt = Some(read_length_delimited(&mut data)?);
+                peer_instance_messages.push(read_length_delimited(&mut data)?);
             }
             _ => skip_field(&mut data, wire_type)
                 .map_err(|e| format!("NetworkResolution: Error skipping field {}: {}", field_number, e))?,
         }
     }
 
-    if let Some(client_bytes) = network_client_message_bytes_opt {
-        // Only proceed if there are tags associated, as per the problem's interest.
-        if !current_tags_for_resolution.is_empty() {
-            parse_instance_message_proto(client_bytes, &current_tags_for_resolution, results)
-                .map_err(|e| format!("NetworkResolution: Error parsing nested Instance (network_client) message: {}", e))?;
+    // Only proceed if there are tags associated, as per the problem's interest.
+    if !current_tags_for_resolution.is_empty() {
+        for instance_bytes in peer_instance_messages {
+            parse_instance_message_proto(instance_bytes, &current_tags_for_resolution, results)
+                .map_err(|e| format!("NetworkResolution: Error parsing nested Instance (peer_instances) message: {}", e))?;
         }
     }
     Ok(())
@@ -796,17 +800,68 @@ pub fn main() {
 // ---------------
 pub fn resolved_tags() -> std::collections::HashSet<String> {
     let mut set = std::collections::HashSet::new();
-    let bytes = match std::fs::read("/__config__") {
-        Ok(b) => b,
-        Err(_) => return set,
-    };
-    if let Ok(list) = parse_configuration_file_proto(&bytes) {
-        for info in list {
-            for t in info.tags {
-                let norm = t.strip_suffix('.').unwrap_or(&t).to_lowercase();
-                set.insert(norm);
-            }
+    for info in read_config_entries() {
+        for t in info.tags {
+            let norm = t.strip_suffix('.').unwrap_or(&t).to_lowercase();
+            set.insert(norm);
         }
     }
     set
+}
+
+/// Every IPv4 address the node granted this instance, under any tag. An
+/// address that the node granted for a declared network is not a leak when
+/// it is also one of the addresses of an undeclared target (one CDN can serve
+/// both), so the isolation probe does not test it.
+pub fn granted_addresses() -> std::collections::HashSet<Ipv4Addr> {
+    read_config_entries()
+        .into_iter()
+        .filter_map(|info| info.ip.parse::<Ipv4Addr>().ok())
+        .collect()
+}
+
+fn read_config_entries() -> Vec<ExtractedInfo> {
+    match std::fs::read("/__config__") {
+        Ok(bytes) => parse_configuration_file_proto(&bytes).unwrap_or_default(),
+        Err(_) => Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_configuration_file_proto;
+
+    // Protobuf encoding helpers for hand-built test messages.
+    fn field(number: u8, payload: &[u8]) -> Vec<u8> {
+        let mut out = vec![(number << 3) | 2, payload.len() as u8];
+        out.extend_from_slice(payload);
+        out
+    }
+
+    fn instance(ip: &str, port: u8) -> Vec<u8> {
+        let mut uri = field(1, ip.as_bytes());
+        uri.extend_from_slice(&[2 << 3, port]); // Uri.port, varint
+        let slot = field(2, &uri); // Uri_Slot.uri
+        field(2, &slot) // Instance.uri_slot
+    }
+
+    #[test]
+    fn every_peer_instance_of_a_network_is_kept() {
+        let mut resolution = field(1, b"google.com");
+        resolution.extend(field(2, &instance("142.250.1.1", 80)));
+        resolution.extend(field(2, &instance("142.250.1.2", 80)));
+        let config = field(3, &resolution); // ConfigurationFile.network_resolution
+
+        let entries = parse_configuration_file_proto(&config).unwrap();
+        let ips: Vec<&str> = entries.iter().map(|e| e.ip.as_str()).collect();
+        assert_eq!(ips, vec!["142.250.1.1", "142.250.1.2"]);
+        assert!(entries.iter().all(|e| e.tags == vec!["google.com".to_string()]));
+    }
+
+    #[test]
+    fn a_network_without_peers_grants_no_address() {
+        // The "*" network: tags, and no peer instances at all.
+        let config = field(3, &field(1, b"*"));
+        assert!(parse_configuration_file_proto(&config).unwrap().is_empty());
+    }
 }

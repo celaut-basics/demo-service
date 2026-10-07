@@ -4,7 +4,8 @@ Celaut node-honesty verifier (orchestrator).
 
 This service turns the passive "demo" into an ACTIVE verifier that checks whether
 the nodo node it runs on is HONEST. It drives the child services and turns each
-observation into an explicit PASS/FAIL assertion, then assembles a signed-ready
+observation into an explicit PASS / DISHONEST / INFRA_ERROR / INCONCLUSIVE /
+NOT_APPLICABLE verdict, then assembles a signed-ready
 attestation report card:
 
   1. network_isolation   (ping child)   declared egress (google) must succeed and
@@ -29,10 +30,12 @@ attestation report card:
 """
 
 import os, json, logging, hashlib, datetime, re, threading, time, socket, platform, contextlib, secrets
+import ipaddress
 import requests
 from flask import Flask, jsonify, render_template_string, request
 from google.protobuf.json_format import MessageToDict
 
+from bee_rpc.utils import modify_env
 from node_controller.controller.controller import Controller
 from node_controller.gateway.protos import celaut_pb2
 from node_controller.gateway.utils import to_amount, from_amount
@@ -222,6 +225,13 @@ logging.basicConfig(filename='app.log', level=logging.DEBUG,
 
 app = Flask(__name__)
 
+# bee-rpc reads the blocks of a child service from <cwd>/__block__/ by default.
+# Under nodo the cwd of this process is /, but the packer puts the blocks in
+# service/__block__/ beside __services__. Without this line, a launch that must
+# send a child service to the node fails with "gRPCbb: Error reading block".
+# node_controller does not set it.
+modify_env(block_dir=os.path.join(os.path.abspath(DIR), "__block__") + "/")
+
 controller = Controller(debug=lambda s: logging.info('Node Controller: %s', s),
                         app_dir=DIR, config_file=CONFIG_FILE)
 node_url: str = controller.get_node_url()
@@ -301,12 +311,115 @@ def child_initial_mu(label, self_rate):
     return max(CHILD_MIN_INITIAL_MU, int(child_rate * CHILD_FUNDED_SECONDS * CHILD_BUDGET_MARGIN))
 
 
+# ----------------------------------------------------------------------------
+# The two egress targets of the network-isolation probe
+# ----------------------------------------------------------------------------
+# The ping child declares google.com and tries amazon.com, which it does not
+# declare. This service declares BOTH (service.json): a child only gets the
+# networks every ancestor also declares, so google.com must be here for ping to
+# get it at all, and amazon.com is here so that the node resolves its addresses
+# for us. The child cannot look amazon.com up itself: its DNS serves only what
+# the node granted it, so a request to the name fails inside the guest before
+# any packet reaches the firewall under test. It gets the addresses from us
+# instead (UNDECLARED_ADDRS) and connects to them directly.
+DECLARED_TARGET = ("google.com", "www.google.com")
+UNDECLARED_TARGET = ("amazon.com", "www.amazon.com")
+UNDECLARED_ADDRS_ENV = "UNDECLARED_ADDRS"
+# A bare hostname tag opens 80 and 443; 443 is the port both ends test.
+TARGET_PORT = 443
+# Matches the bound in ping/src/main.rs: each blocked address costs a timeout.
+MAX_TARGET_ADDRESSES = 4
+CONTROL_TIMEOUT_S = 3
+
+
+def granted_addresses(resolutions, tags):
+    """Public IPv4 addresses the node resolved for any of `tags`, first ones first.
+
+    `resolutions` are ConfigurationFile.NetworkResolution entries. Only global
+    unicast addresses count: a loopback or private address cannot show whether
+    the node leaks egress to the internet.
+    """
+    wanted = set(tags)
+    out = []
+    for res in resolutions:
+        if not wanted & set(res.tags):
+            continue
+        for inst in res.peer_instances:
+            for slot in inst.uri_slot:
+                for uri in slot.uri:
+                    try:
+                        ip = ipaddress.IPv4Address(uri.ip)
+                    except ValueError:
+                        continue
+                    if ip.is_global and str(ip) not in out:
+                        out.append(str(ip))
+    return out
+
+
+def _read_own_resolutions():
+    """This instance's own NetworkResolution entries, from its __config__."""
+    try:
+        cfg = celaut_pb2.ConfigurationFile()
+        with open(CONFIG_FILE, "rb") as fh:
+            cfg.ParseFromString(fh.read())
+        return list(cfg.network_resolution)
+    except Exception as e:
+        logging.warning("Could not read the network resolution from %s: %s", CONFIG_FILE, e)
+        return []
+
+
+def target_addresses(resolutions):
+    """{target: [addresses]} for the isolation probe.
+
+    An address that is also one of the declared target is removed from the
+    undeclared one: one CDN can serve both names, and reaching an address the
+    child was granted is not a leak.
+    """
+    declared = granted_addresses(resolutions, DECLARED_TARGET)
+    undeclared = [ip for ip in granted_addresses(resolutions, UNDECLARED_TARGET)
+                  if ip not in declared]
+    return {DECLARED_TARGET[0]: declared[:MAX_TARGET_ADDRESSES],
+            UNDECLARED_TARGET[0]: undeclared[:MAX_TARGET_ADDRESSES]}
+
+
+TARGET_ADDRESSES = target_addresses(_read_own_resolutions())
+logging.info("Isolation probe targets: %s", TARGET_ADDRESSES)
+
+
+def control_reach(addresses, port=TARGET_PORT, timeout=CONTROL_TIMEOUT_S):
+    """The addresses this service itself can open a TCP connection to.
+
+    This service declared both targets, so the node must let it reach them.
+    When it cannot reach a target either, the target is down or the node's
+    resolution is stale, and a child that cannot reach it proves nothing.
+    """
+    reached = []
+    for ip in addresses:
+        try:
+            with socket.create_connection((ip, port), timeout=timeout):
+                reached.append(ip)
+        except OSError:
+            pass
+    return reached
+
+
+def _child_config(label, initial_mu=None):
+    """The Configuration a child is launched with, or None for the node default."""
+    kwargs = {}
+    if initial_mu is not None:
+        kwargs["initial_mu"] = to_amount(initial_mu)
+    undeclared = TARGET_ADDRESSES[UNDECLARED_TARGET[0]]
+    if label == "ping" and undeclared:
+        kwargs["environment_variables"] = [celaut_pb2.BytesKeyValue(
+            key=UNDECLARED_ADDRS_ENV, value=",".join(undeclared).encode())]
+    return celaut_pb2.Configuration(**kwargs) if kwargs else None
+
+
 def _add_child(label, initial_mu=None):
     # No initial_mu: the node funds the child for INITIAL_RUNTIME_HOURS of its own
     # resources, which is sane until this instance has measured its rate.
-    config = (celaut_pb2.Configuration(initial_mu=to_amount(initial_mu))
-              if initial_mu is not None else None)
-    return controller.add_service(service_hash=_CHILD_HASHES[label], config=config)
+    return controller.add_service(service_hash=_CHILD_HASHES[label],
+                                  config=_child_config(label, initial_mu))
 
 
 tiny_service = _add_child("tiny")
@@ -650,18 +763,49 @@ def probe_network_isolation():
     ev = {"probe": "network_isolation"}
     inst = None
     try:
+        # Control first, from this service, which declared both targets: a
+        # target that nobody can reach cannot show whether the child's egress
+        # is blocked or open.
+        control = {target: {"addresses": addrs, "reached": control_reach(addrs)}
+                   for target, addrs in TARGET_ADDRESSES.items()}
+        ev["control"] = control
         inst = _spin_child(ping_service, "ping")
         r = requests.get(f"http://{inst.uri}", timeout=45)
         data = r.json()
         ev.update(data)
-        honest = bool(data.get("honest", False))
-        # Extra guard: even if the child says honest, fail if any target verdict is bad.
-        bad = [t for t in data.get("targets", []) if t.get("verdict") in ("DISHONEST_LEAK", "BROKEN_DENIED")]
-        verdict = VERDICT_PASS if honest and not bad else VERDICT_DISHONEST
-        ev["verdict"] = verdict
-        ev["reason"] = ("declared egress reachable and undeclared egress blocked"
-                        if verdict == VERDICT_PASS
-                        else f"isolation violated: {[t.get('target')+':'+t.get('verdict') for t in bad]}")
+        targets = data.get("targets", [])
+        leaks = [t for t in targets if t.get("verdict") == "DISHONEST_LEAK"]
+        denied = [t for t in targets if t.get("verdict") == "BROKEN_DENIED"]
+        untested = [t.get("target") for t in targets if t.get("verdict") == "UNTESTED"]
+        # A declared target the child could not reach is only the node's fault
+        # when this service could reach it at the same time.
+        denied_seen = [t for t in denied if control.get(t.get("target"), {}).get("reached")]
+        blocked = [t for t in targets if t.get("verdict") == "honest_blocked"]
+        blocked_unproven = [t.get("target") for t in blocked
+                            if not control.get(t.get("target"), {}).get("reached")]
+        if leaks or denied_seen:
+            ev["verdict"] = VERDICT_DISHONEST
+            ev["reason"] = ("isolation violated: "
+                            f"{[t.get('target') + ':' + t.get('verdict') for t in leaks + denied_seen]}")
+        elif denied:
+            ev["verdict"] = VERDICT_INCONCLUSIVE
+            ev["reason"] = (f"the child could not reach the declared {[t.get('target') for t in denied]}, "
+                            "but neither could this service, which declared it too: the target is "
+                            "down or its addresses are stale. No claim about the node's isolation "
+                            "is made.")
+        elif untested or blocked_unproven or not blocked:
+            ev["verdict"] = VERDICT_INCONCLUSIVE
+            ev["reason"] = ("undeclared egress was not tested against the node's firewall "
+                            f"(untested: {untested}, not reachable even from this service: "
+                            f"{blocked_unproven}). A block that nothing could have passed proves "
+                            "nothing. No claim about the node's isolation is made.")
+        elif data.get("honest") is True:
+            ev["verdict"] = VERDICT_PASS
+            ev["reason"] = ("declared egress reachable and undeclared egress blocked, while this "
+                            "service reached the undeclared target itself")
+        else:
+            ev["verdict"] = VERDICT_INCONCLUSIVE
+            ev["reason"] = f"the ping child gave no usable assertion: {clip(data)}"
     except ChildLaunchError as e:
         # The ping child never ran: we observed nothing about egress isolation.
         ev["verdict"] = VERDICT_INFRA_ERROR
@@ -1240,7 +1384,7 @@ _SHARE_INCONCLUSIVE = "inconclusive"
 _PACKAGING_HINT = ("If the packed services do not carry their shared_filesystems declarations "
                    "(a nodo packer older than the one that supports the field drops it without "
                    "an error), this is what a child looks like; repack with a nodo whose packer "
-                   "supports shared_filesystems (celaut-project/nodo#474).")
+                   "supports shared_filesystems (celaut-project/nodo#475).")
 
 
 def _share_refused(exc, guest_path):
@@ -1573,7 +1717,7 @@ def probe_dependency_observe():
         # 2) Drive the dependency, inside the observed window, and capture its
         #    own account of what it connected to.
         try:
-            self_report = requests.get(f"http://{inst.uri}", timeout=30).json()
+            self_report = requests.get(f"http://{inst.uri}", timeout=45).json()
         except Exception as e:
             self_report = {"error": clip(e)}
         ev["dependency_self_report"] = self_report
@@ -1583,7 +1727,7 @@ def probe_dependency_observe():
         stop_flag[0] = True
         events = list(events)
 
-        packets, sessions, obs_err = [], [], None
+        packets, sessions, degraded, obs_err = [], [], [], None
         for e in events:
             if isinstance(e, tuple) and e and e[0] == "__error__":
                 obs_err = e[1]
@@ -1592,12 +1736,19 @@ def probe_dependency_observe():
                 if e.HasField("packet"):
                     p = e.packet
                     packets.append({"direction": p.direction, "protocol": p.protocol,
-                                    "dst": p.dst, "peer_kind": p.peer_kind,
+                                    "src": p.src, "dst": p.dst, "peer_kind": p.peer_kind,
                                     "peer_tag": p.peer_tag,
                                     "peer_relationship": p.peer_relationship,
-                                    "peer_host": p.peer_host})
+                                    "peer_host": p.peer_host, "source": p.source})
                 elif e.HasField("session"):
-                    sessions.append({"instance_id": e.session.instance_id, "tag": e.session.tag})
+                    sessions.append({"instance_id": e.session.instance_id, "tag": e.session.tag,
+                                     "capture_mode": e.session.capture_mode,
+                                     "degraded_reason": e.session.degraded_reason})
+                    if e.session.degraded_reason:
+                        degraded.append(e.session.degraded_reason)
+                elif e.HasField("notice"):
+                    if e.notice.degraded:
+                        degraded.append(e.notice.message)
             except Exception:
                 pass
 
@@ -1605,6 +1756,10 @@ def probe_dependency_observe():
         ev["packet_count"] = len(packets)
         ev["packets"] = packets[:20]
         ev["sessions"] = sessions[:5]
+        # The node says so when it cannot capture the instance's packets (no
+        # AF_PACKET, no conntrack). No packet is then what it promised, not a
+        # fabrication.
+        ev["observe_degraded"] = degraded[:3]
 
         # Proof of life for the Observe RPC itself: silence only means something
         # if we know the stream was working. Any event at all (a session record
@@ -1614,15 +1769,28 @@ def probe_dependency_observe():
 
         claims_connectivity = isinstance(self_report, dict) and (
             self_report.get("honest") is not None or self_report.get("targets"))
+        # The node tags a packet with the peer it belongs to: "instance" with a
+        # relationship (parent, child, peer), or "external" with the host. A
+        # packet that came IN from an address of the undeclared target can only
+        # reach the guest if the node let that flow through.
+        undeclared_addrs = set(TARGET_ADDRESSES[UNDECLARED_TARGET[0]])
+        ev["undeclared_addresses"] = sorted(undeclared_addrs)
         undeclared = [p for p in packets
-                      if str(p.get("peer_relationship", "")).lower() in ("undeclared", "unauthorized", "leak")]
+                      if p.get("peer_kind") == "external" and p.get("direction") == "IN"
+                      and p.get("peer_host") in undeclared_addrs]
 
         if obs_err and not packets:
             ev["verdict"] = VERDICT_INFRA_ERROR
             ev["reason"] = f"node Observe RPC unavailable/unsupported: {obs_err}"
         elif undeclared:
             ev["verdict"] = VERDICT_DISHONEST
-            ev["reason"] = f"Observe revealed traffic to undeclared/unauthorized peers: {undeclared[:3]}"
+            ev["reason"] = ("Observe shows traffic coming in from an undeclared destination, so the "
+                            f"node let that flow through: {undeclared[:3]}")
+        elif not packets and claims_connectivity and degraded:
+            ev["verdict"] = VERDICT_INCONCLUSIVE
+            ev["reason"] = ("the node reported that its observation of the dependency is degraded "
+                            f"({clip('; '.join(degraded), 200)}), so no packet is what it promised; "
+                            "no claim is made")
         elif not packets and claims_connectivity and stream_alive and armed_before_drive:
             # Only accusable because the stream demonstrably worked BEFORE the
             # dependency made its connection, and still showed nothing for it.

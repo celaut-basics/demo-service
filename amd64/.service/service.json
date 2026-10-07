@@ -10,7 +10,12 @@
         }
     ],
     "architecture": "linux/amd64",
-    "entrypoint": "/service/app.py",
+    "init": {
+        "entry_path": [
+            "service",
+            "app.py"
+        ]
+    },
     "envs": [],
     "resources": {
         "at_init": {

@@ -34,6 +34,15 @@ class BlindNodeTests(unittest.TestCase):
     def setUp(self):
         FakeServiceInterface.launch_mode = "unbound_local"
         FakeController.rpc_mode = "unavailable"
+        # resource_provisioning reads the memory ceiling of the machine the test
+        # runs on; a CI container with a small cgroup limit would make it accuse.
+        # Give every test here a guest that got what the node reported.
+        guest = {"cgroup_memory_max": None, "cgroup_memory_current": None,
+                 "cgroup_cpu_max": None, "proc_meminfo_memtotal_bytes": app.mem_limit}
+        for patch in (mock.patch.object(app, "read_container_limits", return_value=guest),
+                      mock.patch.object(app, "detect_isolation_model", return_value="microvm")):
+            patch.start()
+            self.addCleanup(patch.stop)
 
     # -- D1 ------------------------------------------------------------------
     def test_launch_failure_is_typed_and_explains_the_real_cause(self):
@@ -475,6 +484,125 @@ class ChildReadinessTests(unittest.TestCase):
         self.assertIn("self-contradictory", ev["reason"])
 
 
+def _resolution(tags, *ips):
+    """A ConfigurationFile.NetworkResolution shape: tags, one instance, one slot."""
+    from types import SimpleNamespace as NS
+    uris = [NS(ip=ip, port=port) for ip in ips for port in (80, 443)]
+    return NS(tags=list(tags), peer_instances=[NS(uri_slot=[NS(uri=uris)])])
+
+
+class NetworkIsolationTests(unittest.TestCase):
+    """The undeclared target is tested against the node's firewall, and a block
+    only counts when this service could reach the target itself."""
+
+    AMAZON = ["54.239.28.85", "52.94.236.248"]
+
+    def setUp(self):
+        FakeServiceInterface.launch_mode = "ok"
+        for patch in (mock.patch.dict(app.TARGET_ADDRESSES, {"google.com": ["142.250.1.1"],
+                                                             "amazon.com": self.AMAZON}),):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def _run(self, targets, reachable=("142.250.1.1", "54.239.28.85")):
+        def fake_get(url, timeout=None):
+            r = mock.Mock()
+            r.json.return_value = {
+                "probe": "network_isolation", "targets": targets,
+                "honest": not any(t["verdict"] in ("DISHONEST_LEAK", "BROKEN_DENIED")
+                                  for t in targets)}
+            return r
+
+        def fake_control(addresses, **kw):
+            return [a for a in addresses if a in reachable]
+
+        with mock.patch.object(app.requests, "get", side_effect=fake_get), \
+             mock.patch.object(app, "control_reach", side_effect=fake_control):
+            return app.probe_network_isolation()
+
+    @staticmethod
+    def _google(verdict="honest_allowed"):
+        return {"target": "google.com", "declared": True, "method": "https", "verdict": verdict}
+
+    @staticmethod
+    def _amazon(verdict="honest_blocked"):
+        return {"target": "amazon.com", "declared": False, "method": "tcp_connect",
+                "verdict": verdict}
+
+    def test_a_tested_block_with_a_working_control_passes(self):
+        ev = self._run([self._google(), self._amazon()])
+        self.assertEqual(ev["verdict"], app.VERDICT_PASS, ev["reason"])
+        self.assertEqual(ev["control"]["amazon.com"]["reached"], ["54.239.28.85"])
+
+    def test_a_leak_is_dishonest(self):
+        ev = self._run([self._google(), self._amazon("DISHONEST_LEAK")])
+        self.assertEqual(ev["verdict"], app.VERDICT_DISHONEST)
+
+    def test_a_block_nothing_could_pass_is_not_a_pass(self):
+        # This service, which declared amazon.com, cannot reach it either: the
+        # child's failure says nothing about the node's firewall.
+        ev = self._run([self._google(), self._amazon()], reachable=("142.250.1.1",))
+        self.assertEqual(ev["verdict"], app.VERDICT_INCONCLUSIVE)
+        self.assertNotIn(ev["verdict"], app.ACCUSING_VERDICTS)
+
+    def test_an_untested_target_is_not_a_pass(self):
+        ev = self._run([self._google(), self._amazon("UNTESTED")])
+        self.assertEqual(ev["verdict"], app.VERDICT_INCONCLUSIVE)
+        self.assertIn("amazon.com", ev["reason"])
+
+    def test_a_denied_declared_target_accuses_only_when_the_control_reached_it(self):
+        ev = self._run([self._google("BROKEN_DENIED"), self._amazon()])
+        self.assertEqual(ev["verdict"], app.VERDICT_DISHONEST)
+        ev = self._run([self._google("BROKEN_DENIED"), self._amazon()],
+                       reachable=("54.239.28.85",))
+        self.assertEqual(ev["verdict"], app.VERDICT_INCONCLUSIVE)
+
+    def test_the_child_is_handed_the_undeclared_addresses(self):
+        config = app._child_config("ping", 1000)["config"]
+        self.assertEqual(config["initial_mu"], 1000)
+        self.assertEqual(config["environment_variables"],
+                         [{"key": "UNDECLARED_ADDRS", "value": b"54.239.28.85,52.94.236.248"}])
+        self.assertNotIn("environment_variables", app._child_config("heavy", 1000)["config"])
+        self.assertIsNone(app._child_config("tiny"))
+
+
+class TargetAddressTests(unittest.TestCase):
+    def test_only_global_ipv4_of_the_named_tags(self):
+        resolutions = [
+            _resolution(["amazon.com", "www.amazon.com"], "54.239.28.85", "10.0.0.7",
+                        "127.0.0.1", "not-an-ip", "54.239.28.85", "2600:1f18::1"),
+            _resolution(["example.org"], "93.184.216.34"),
+        ]
+        self.assertEqual(app.granted_addresses(resolutions, app.UNDECLARED_TARGET),
+                         ["54.239.28.85"])
+
+    def test_an_address_shared_with_the_declared_target_is_not_undeclared(self):
+        # One CDN can serve both names; reaching an address the child was
+        # granted is not a leak.
+        resolutions = [_resolution(["www.google.com"], "142.250.1.1", "151.101.1.1"),
+                       _resolution(["amazon.com"], "151.101.1.1", "54.239.28.85")]
+        self.assertEqual(app.target_addresses(resolutions),
+                         {"google.com": ["142.250.1.1", "151.101.1.1"],
+                          "amazon.com": ["54.239.28.85"]})
+
+    def test_the_lists_are_bounded(self):
+        ips = [f"54.239.28.{i}" for i in range(1, 10)]
+        got = app.target_addresses([_resolution(["amazon.com"], *ips)])
+        self.assertEqual(len(got["amazon.com"]), app.MAX_TARGET_ADDRESSES)
+
+    def test_the_verifier_declares_both_targets_for_its_child(self):
+        # A child only gets a network that its parent declares too.
+        for arch in ("amd64", "arm64"):
+            with open(os.path.join(ROOT, arch, ".service", "service.json")) as fh:
+                tags = [set(n["tags"]) for n in json.load(fh)["network"]]
+            for target in (app.DECLARED_TARGET, app.UNDECLARED_TARGET):
+                self.assertIn(set(target), tags, arch)
+            with open(os.path.join(ROOT, "ping", arch, ".service", "service.json")) as fh:
+                ping = json.load(fh)
+            self.assertEqual([set(n["tags"]) for n in ping["network"]], [set(app.DECLARED_TARGET)])
+            self.assertIn(app.UNDECLARED_ADDRS_ENV, ping["envs"])
+
+
 class ObserveCorroborationTests(unittest.TestCase):
     """D8: only accuse of fabricated connectivity if the Observe stream proved it was live."""
 
@@ -500,13 +628,50 @@ class ObserveCorroborationTests(unittest.TestCase):
         self.assertFalse(ev["observe_stream_alive"])
 
     def test_live_stream_with_no_packets_is_dishonest(self):
-        session_evt = mock.Mock()
-        session_evt.HasField.side_effect = lambda f: f == "session"
-        session_evt.session.instance_id = "abc"
-        session_evt.session.tag = "ping"
-        ev = self._run([session_evt])
+        ev = self._run([self._session_evt()])
         self.assertTrue(ev["observe_stream_alive"])
         self.assertEqual(ev["verdict"], app.VERDICT_DISHONEST)
+
+    def test_no_packets_from_a_degraded_observation_is_not_an_accusation(self):
+        # The node said it cannot capture this instance (no AF_PACKET, no
+        # conntrack): an empty packet feed is then what it promised.
+        notice = mock.Mock()
+        notice.HasField.side_effect = lambda f: f == "notice"
+        notice.notice.degraded = True
+        notice.notice.message = "no CAP_NET_RAW; conntrack unavailable"
+        ev = self._run([self._session_evt(), notice])
+        self.assertEqual(ev["verdict"], app.VERDICT_INCONCLUSIVE)
+        self.assertIn("degraded", ev["reason"])
+        ev = self._run([self._session_evt(degraded_reason="no CAP_NET_RAW")])
+        self.assertEqual(ev["verdict"], app.VERDICT_INCONCLUSIVE)
+
+    def test_traffic_in_from_the_undeclared_target_is_dishonest(self):
+        with mock.patch.dict(app.TARGET_ADDRESSES, {"amazon.com": ["54.239.28.85"]}):
+            ev = self._run([self._session_evt(),
+                            self._packet_evt("IN", "54.239.28.85"),
+                            self._packet_evt("OUT", "142.250.1.1")])
+        self.assertEqual(ev["verdict"], app.VERDICT_DISHONEST)
+        self.assertIn("undeclared", ev["reason"])
+
+    def test_an_attempt_out_to_the_undeclared_target_is_not_a_leak(self):
+        # The child tries the undeclared target on purpose; the SYN going out is
+        # seen even when the node drops it. Only a reply proves a leak.
+        with mock.patch.dict(app.TARGET_ADDRESSES, {"amazon.com": ["54.239.28.85"]}):
+            ev = self._run([self._session_evt(),
+                            self._packet_evt("OUT", "54.239.28.85"),
+                            self._packet_evt("IN", "142.250.1.1")])
+        self.assertEqual(ev["verdict"], app.VERDICT_PASS)
+
+    @staticmethod
+    def _packet_evt(direction, host):
+        evt = mock.Mock()
+        evt.HasField.side_effect = lambda f: f == "packet"
+        p = evt.packet
+        p.direction, p.protocol, p.peer_kind, p.peer_host = direction, "TCP", "external", host
+        p.src = p.dst = f"{host}:443"
+        p.peer_tag = p.peer_relationship = ""
+        p.source = "pcap"
+        return evt
 
 
     def test_the_stream_is_opened_before_the_dependency_is_driven(self):
@@ -556,11 +721,13 @@ class ObserveCorroborationTests(unittest.TestCase):
         self.assertEqual(ev["verdict"], app.VERDICT_INCONCLUSIVE)
 
     @staticmethod
-    def _session_evt():
+    def _session_evt(degraded_reason=""):
         evt = mock.Mock()
         evt.HasField.side_effect = lambda f: f == "session"
         evt.session.instance_id = "abc"
         evt.session.tag = "ping"
+        evt.session.capture_mode = "conntrack" if degraded_reason else "pcap"
+        evt.session.degraded_reason = degraded_reason
         return evt
 
 
@@ -642,7 +809,14 @@ class FundingTests(unittest.TestCase):
         exc = RuntimeError('details = "Launch service error charging abc"')
         mu = mock.Mock(side_effect=AssertionError("mu_accounting must not run"))
         preflight = {"probe": "gateway_reachability", "verdict": app.VERDICT_PASS}
+        # resource_provisioning reads the memory ceiling of the machine the test
+        # runs on. Give it a microVM that got what the node reported, so the
+        # assertion below does not depend on the cgroup layout of the host.
+        guest = {"cgroup_memory_max": None, "cgroup_memory_current": None,
+                 "cgroup_cpu_max": None, "proc_meminfo_memtotal_bytes": app.mem_limit}
         with mock.patch.object(FakeServiceInterface, "get_instance", side_effect=exc), \
+             mock.patch.object(app, "read_container_limits", return_value=guest), \
+             mock.patch.object(app, "detect_isolation_model", return_value="microvm"), \
              mock.patch.object(app, "probe_gateway_reachability", return_value=preflight), \
              mock.patch.object(app, "PROBES", [(n, mu if n == "mu_accounting" else f)
                                               for n, f in app.PROBES]):

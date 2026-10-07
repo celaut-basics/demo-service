@@ -1,5 +1,4 @@
 {
-  "workdir": "sharefs-denied-service",
   "include": [
     "src",
     "Cargo.toml",

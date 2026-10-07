@@ -144,16 +144,41 @@ Exposed as `GET/POST /probe/gateway` and as the MCP tool
 `ping/<arch>/.service/service.json` declares an egress allow-list of **only** google.
 `ping/src/main.rs` also tries amazon, which is **not** declared. The probe reads
 the node-provided allow-list from `/__config__` (the `NetworkResolution` entries,
-decoded by the existing `dns.rs` parser — now exposed via `dns::resolved_tags()`)
+decoded by the existing `dns.rs` parser, exposed through `dns::resolved_tags()`)
 instead of hardcoding it, then emits per target:
 
 ```json
-{"target":"amazon.com","declared":false,"connected":true,"verdict":"DISHONEST_LEAK"}
+{"target":"amazon.com","declared":false,"method":"tcp_connect","connected":true,"verdict":"DISHONEST_LEAK"}
 ```
 
 Verdict matrix: `declared&&connected`→`honest_allowed`,
 `!declared&&!connected`→`honest_blocked`, `!declared&&connected`→`DISHONEST_LEAK`,
 `declared&&!connected`→`BROKEN_DENIED`.
+
+The two targets are tested in two ways, because only google can be reached by name:
+
+- **google (declared)**: an HTTPS request to the name. The in-guest DNS answers it
+  with an address the node granted.
+- **amazon (undeclared)**: a TCP connection to port 443 of its addresses. The in-guest
+  DNS serves only the tags the node granted, so a request to the *name* fails inside
+  the guest, before any packet meets the firewall. That "block" would prove nothing.
+
+The verifier declares both google and amazon in its own `service.json`. A child gets
+only the networks that every ancestor declares too, and the node resolves the amazon
+addresses for the verifier. The verifier passes them to `ping` in the
+`UNDECLARED_ADDRS` variable (declared in `ping`'s `envs`). Without an address the
+target is `UNTESTED`, never "blocked".
+
+The verifier also opens a connection to both targets itself, as a control. A block
+that nothing could pass proves nothing:
+
+| child result | control | verdict |
+|---|---|---|
+| amazon reachable | any | `DISHONEST` (leak) |
+| google denied | verifier reached google | `DISHONEST` (shortchanged) |
+| google denied | verifier did not reach it | `INCONCLUSIVE` (target down) |
+| amazon blocked, or `UNTESTED` | verifier did not reach amazon | `INCONCLUSIVE` |
+| google allowed, amazon blocked | verifier reached amazon | `PASS` |
 
 ### 2. Memory ceiling (`heavy/`)
 
@@ -288,6 +313,16 @@ reported as fabricating connectivity. Silence is now an accusation only when the
 stream was demonstrably live **before** the drive (`observe_armed_before_drive`);
 a stream that only woke up afterwards is `INCONCLUSIVE`.
 
+Two more rules keep this probe from accusing without evidence:
+
+- **A leak is a packet that comes IN from an undeclared address.** The child tries
+  the undeclared target on purpose, so the packet going OUT is the test itself, and
+  the capture shows it even when the node drops it. Each packet carries `peer_kind`,
+  `peer_host` and `direction` (`ObserveEvent.Packet`).
+- **A degraded capture is not a verdict.** When the node cannot capture packets (no
+  `AF_PACKET`: the session has a `degraded_reason`, or a notice has `degraded`), an
+  empty feed is what the node promised. The result is `INCONCLUSIVE`.
+
 ### Node benchmark (`benchmark/`)
 
 `benchmark` is the service a node runs as its `benchmark` core service
@@ -374,12 +409,16 @@ attestable), never `DISHONEST`, and the reason names the cause. The cost is that
 a node that really does drop shares reads `INCONCLUSIVE` rather than
 `DISHONEST` until the declarations can be verified from here.
 
-**Requires** a nodo whose packer supports `shared_filesystems`
-([celaut-project/nodo#474](https://github.com/celaut-project/nodo/issues/474)).
-The field names used in the manifests (`path`, `role`, `tag`, `access`) are the
-ones proposed there and may change with it; `tests/test_shared_filesystem.py`
-holds the manifests, the constants in `app.py` and the paths in the Rust sources
-to one another.
+**Requires** a nodo whose packer supports `shared_filesystems`. That is nodo
+`dev` from commit `698e658` on
+([celaut-project/nodo#475](https://github.com/celaut-project/nodo/pull/475),
+which closes [#474](https://github.com/celaut-project/nodo/issues/474)). The
+manifests use the field names that #475 accepts: `path`, `role`, `tag` and
+`access` (`_SHARED_ENTRY_FIELDS` in `src/packers/zip_with_dockerfile.py`). That
+packer refuses an unknown field, and it fails the pack when a declared
+directory is not in the image, so each Dockerfile creates its directories.
+`tests/test_shared_filesystem.py` holds the manifests, the constants in `app.py`
+and the paths in the Rust sources to one another.
 
 **Cost.** `sharefs` is funded like `tiny`. `sharefs-denied` is not in
 `CHILD_DECLARED_RESOURCES` (it is never meant to start, and a child that is
@@ -602,29 +641,42 @@ arm64/  amd64/                  the demo's pack roots
     └── <sources>  -> ../<sources>
 ```
 
-The shape follows from what `nodo pack <dir>` does (`src/commands/packer/
-zip_with_dockerfile/`): it reads only `<dir>/.service/` (the name is fixed),
-copies `<dir>` to its cache **following symlinks**, and resolves each local
+The shape follows from what `nodo pack <dir>` does (`src/packers/zip_with_dockerfile.py`): it
+reads only `<dir>/.service/` (the name is fixed), copies `<dir>` to its cache **following symlinks**, and resolves each local
 dependency as `<copy>/<path>` — so a dependency has to sit inside the pack root
 (a `../tiny` would point outside the copy), and the shared sources reach each
 root as symlinks that the copy turns into real files. `Dockerfile` and
 `pack_config.json` are real files in each `.service/`, edited independently;
 only `architecture` differs today. `tests/test_layout.py` checks the shape.
 
+To run the verifier, pack the tree that matches the node, then start the id that
+`nodo pack` prints (commands as in nodo's `docs/skill/SKILL.md`):
+
+```sh
+nodo pack amd64                     # prints the service id
+nodo estimate <service id>          # memory guard limits and the balance it needs
+nodo execute <service id>           # starts the verifier
+nodo instances                      # shows its API address and balance
+nodo increase_deposit <instance id> <amount>   # if the startup suite waits for funds
+```
+
 Why every Dockerfile builds for both architectures:
 
-- **Every `FROM` is a multi-arch index** with `linux/amd64` and `linux/arm64`:
-  the pinned `python:3.11@sha256:7bd2bb…` and `busybox:1.37.0@sha256:bdf57e…`
-  digests, `rust:1.86.0-bookworm`, `gcr.io/distroless/cc`, `debian:bookworm-slim`
-  (checked against the registries on 2026-10-04). BuildKit picks the entry for
-  the requested platform, so one pin serves both.
+- **Every `FROM` is a multi-arch index** with `linux/amd64` and `linux/arm64`,
+  pinned by the digest of that index: `python:3.11@sha256:7bd2bb…`,
+  `busybox:1.37.0@sha256:bdf57e…`, `rust:1.86.0-bookworm@sha256:300ec5…`,
+  `rust:1.88.0-bookworm@sha256:af306c…` (the two sharefs children: their
+  `Cargo.lock` needs rustc 1.88), `gcr.io/distroless/cc-debian12@sha256:e5d81d…` and
+  `debian:bookworm-slim@sha256:3783cc…` (checked against the registries on
+  2026-10-05). BuildKit picks the entry for the requested platform, so one pin
+  serves both.
 - **Rust children build natively for the target**: `cargo build` without
   `--target` emits a binary for the builder stage's own platform, which is the
   target one. `ring` (ping's only C/asm crate, via rustls) builds with the gcc
   `rust:bookworm` ships for both. `.cargo/config`'s aarch64 linker is not in any
   `include`, so it never reaches a build.
-- **The demo compiles nothing**: its one native dependency, `grpcio==1.56.0`
-  (via bee-rpc), and `protobuf` ship cp311 manylinux wheels for x86_64 and
+- **The demo compiles nothing**: its native dependencies, `grpcio==1.56.0`
+  (via bee-rpc) and `protobuf`, ship cp311 manylinux wheels for x86_64 and
   aarch64.
 - **No source is architecture-specific**: `heavy` touches memory at a 4096-byte
   stride, which reaches every page on both (pages are ≥ 4 KiB), and
@@ -636,12 +688,20 @@ the packer enabled for it (`packer.ARM_PACKER_SUPPORT` / `X86_PACKER_SUPPORT`).
 
 ## Reproducibility
 
-`<arch>/.service/Dockerfile` pins every input: the base image by digest, `requests` and
-`Flask` by version, and `celaut-service-libraries` by commit SHA. This service is
+`<arch>/.service/Dockerfile` pins every input: the base image by digest, `requests`,
+`Flask`, `grpcio`, `protobuf` and each package that Flask and requests pull in by
+version, and `bee-rpc` and `celaut-service-libraries` (`node_controller`) by
+commit SHA. The Rust children pin their builder and runtime images by digest,
+and their crates through `Cargo.lock` (`cargo build --locked`). This service is
 content-addressed, so an unpinned `git+…` install (which resolves to whatever
 `master` happened to be that day) means two packs of the same source tree produce
 different images — and any bug observed in a running instance cannot be traced
 back to a specific library revision.
+
+`celaut-service-libraries` requires `bee-rpc` without a pin, so it is installed
+with `--no-deps` after the pinned `bee-rpc`. Otherwise pip fetches `bee-rpc`
+master again. The `bee-rpc` commit is the one of its `v0.0.1` tag, which nodo
+installs too (`bash/requirements.txt`), so both ends speak the same bee-rpc.
 
 ## Live validation
 
@@ -662,28 +722,31 @@ format skew between the only available packer (`packer-service:10gb`, built
 `service_dir = next(it)` — **identically for the unmodified `tiny` service**, so
 it is a tooling/version mismatch, not a defect in this change.
 
-Each probe was therefore validated against the **same kernel mechanisms nodo
+Each probe was therefore checked against the **same kernel mechanisms nodo
 delegates to** — cgroup memory limits and egress control — by running the packed
-child images directly:
+child images directly. That Docker run is **not** a run on a nodo node, and it
+predates the address-based egress probe (see probe 1). A request to a name that
+the guest cannot resolve never meets the firewall, so isolation-by-name under
+Docker cannot prove the current probe.
 
 - **memory_ceiling** — `heavy` under `--memory=256m --memory-swap=256m`:
   64/128/200/240 MiB → HTTP 200; 256/280/320/400 MiB → OOM-killed (connection
   dropped). Observed ceiling 240 MiB, first kill 256 MiB vs declared 256 MiB →
   **PASS**. `/introspect` reported `cgroup_mem_max = 268435456` (256 MiB).
-- **network_isolation** — `ping` with a crafted `/__config__` declaring google:
-  - honest node (amazon → `127.0.0.1`): google `honest_allowed`, amazon
-    `honest_blocked`, `honest:true` → **PASS**.
-  - leaky node (unrestricted egress): google `honest_allowed`, amazon
-    `DISHONEST_LEAK`, `honest:false` → correctly **flags the leak**.
+- **network_isolation** — historical Docker check only. The current probe reads
+  `UNDECLARED_ADDRS` and opens TCP to those IPv4 addresses. A real node must
+  confirm that path.
 - **resource_provisioning** — the container's real `cgroup memory.max` matched
-  the declared limit (ratio 1.0) → **PASS**.
+  the declared limit (ratio 1.0) → **PASS**. That cgroup does not exist in a
+  microVM.
 
-Example assembled report card:
+Example assembled report card (`FAIL` is not a verdict):
 
 ```json
 {
   "verifier": "celaut-node-honesty-verifier",
-  "summary": {"node_honest": true, "pass": 3, "fail": 0, "total": 3},
+  "summary": {"node_honest": true, "pass": 3, "dishonest": 0,
+              "unobserved": 0, "total": 3, "attestable": true},
   "content_hash": {"alg": "sha3_256",
     "value": "b5b22156fcb28125e480e98b7dcd8d3f42f8f5118de4aa70d9a7a9bb62520915"}
 }
