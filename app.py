@@ -2661,6 +2661,116 @@ def probe_tunnel():
 
 
 # ----------------------------------------------------------------------------
+# Probe — balance statement (nodo #570, #571)
+# ----------------------------------------------------------------------------
+# Every write of a balance goes with a row in balance_movements, and GetBalanceStatement
+# returns the rows of the caller's account, signed by the node: a local instance reads
+# its own account by its address. The rows are a hash chain: each one carries the hash
+# of the row before it, the first one hangs from a genesis hash tied to the account,
+# and the head commits to all of them. The node signs the digest of every field and the
+# hash of every row with the key of its Peer (Ed25519).
+#
+# This probe runs after the others, so the statement holds the whole run: the starts of
+# the children, their refunds, the maintenance ticks, the statement queries. It checks
+# it by the rules of nodo's own reader (statement_check.verify_chain, in nodo_gateway):
+# signature, chain, the rows add up to the balance, the head is the last row. It checks
+# that each statement_query charge is the advertised price, and it ties the statement to
+# the balance that ModifyServiceSystemResources reports.
+def _statement_query_overcharges(rows, rates):
+    """statement_query charges above statement_query_mu + statement_row_mu x rows.
+
+    The node prices a read by the rows it returns, plus the charge row itself when the
+    payer reads its own account (src/database/sql_connection.py, balance_statement).
+    A read of a child's account names the child in instance_ref.
+    """
+    q, r = rates.get("statement_query_mu"), rates.get("statement_row_mu")
+    if q is None or r is None:
+        return None
+    out = []
+    for mv in rows:
+        if mv.kind != "statement_query":
+            continue
+        n = int(gw.detail_of(mv).get("rows", 0))
+        expected = q + r * (n + (0 if mv.instance_ref else 1))
+        if -int(mv.amount.n) > expected:
+            out.append(f"movement {mv.seq}: {-int(mv.amount.n)} MU for {n} rows, the advertised "
+                       f"price is {expected} MU")
+    return out
+
+
+def _peer_rates(peer):
+    """The rates in a Peer (mu_per_call), by name."""
+    out = {}
+    for kv in getattr(peer, "mu_per_call", []):
+        try:
+            out[kv.key] = int(kv.value.n)
+        except (TypeError, ValueError, AttributeError):
+            pass
+    return out
+
+
+def probe_balance_statement():
+    ev = {"probe": "balance_statement"}
+    try:
+        peer = gw.peer_info(node_url)
+        ev["node_public_key"] = peer.public_key
+        pages = gw.full_statement(node_url, from_seq=1)
+        checked = gw.verify_statement(pages, peer.public_key)
+        rows = checked.pop("rows")
+        ev.update(checked)
+        kinds = {}
+        for mv in rows:
+            kinds[mv.kind] = kinds.get(mv.kind, 0) + 1
+        ev["kinds"] = kinds
+        # The rates of the Peer the node signs, and those it wrote in /__config__: the
+        # two should agree, and either one may lack a rate that the node does not charge.
+        rates = dict(_peer_rates(peer), **NODE_RATES)
+        ev["statement_rates"] = {k: rates.get(k) for k in ("statement_query_mu", "statement_row_mu")}
+        overcharges = _statement_query_overcharges(rows, rates)
+        ev["statement_query_overcharges"] = overcharges
+
+        # The balance the gateway reports elsewhere must be a balance of this chain: the
+        # settle charges a resource_change, and its row carries the balance returned.
+        _, reported = controller.modify_resources(
+            {"min": mem_limit or MU_HIGH_CEILING, "max": MU_HIGH_CEILING})
+        after = _own_rows_after(checked.get("last_seq", 0)) if rows else []
+        ev["balance_reported_by_modify_resources"] = reported
+        ev["rows_after_the_settle"] = [_movement_view(mv) for mv in after[:5]]
+        tied = any(int(mv.balance_after.n) == int(reported) for mv in after)
+        ev["balance_tied_to_chain"] = tied
+
+        if checked["signatures_ok"] is None:
+            ev["verdict"] = VERDICT_INCONCLUSIVE
+            ev["reason"] = "no Ed25519 implementation in this image: the signature was not checked"
+        elif not checked["signatures_ok"]:
+            ev["verdict"] = VERDICT_INCONCLUSIVE
+            ev["reason"] = ("a page of the statement does not verify with the node's key, so it "
+                            "cannot be attributed to the node: no claim is made from it")
+        elif checked["problems"] or overcharges or (rows and not tied):
+            reasons = [f"{p['problem']}" for p in checked["problems"]] + list(overcharges or [])
+            if rows and not tied:
+                reasons.append(f"ModifyServiceSystemResources reported a balance of {reported} MU "
+                               "that no movement after the settle carries")
+            ev["verdict"] = VERDICT_DISHONEST
+            ev["reason"] = "the node signed a statement that is false: " + "; ".join(reasons[:6])
+        elif not checked.get("adds_up"):
+            ev["verdict"] = VERDICT_INCONCLUSIVE
+            ev["reason"] = (f"the statement starts at movement {checked.get('first_seq')}: the "
+                            "node deleted the movements before it (its retention), so the sum "
+                            "cannot be checked from the start")
+        else:
+            ev["verdict"] = VERDICT_PASS
+            ev["reason"] = (f"{checked['movements']} movements in {checked['pages']} signed "
+                            f"page(s): the signature, the chain and the head verify, the rows "
+                            f"add up to the balance of {checked['balance_mu']} MU, each statement "
+                            "query was charged at most its price, and the balance that "
+                            "ModifyServiceSystemResources reports is a balance of the chain")
+        return ev
+    except Exception as e:
+        return _infra(ev, "the balance statement", e)
+
+
+# ----------------------------------------------------------------------------
 # Probe — dependency connectivity is not fraudulent (node Observe cross-check)
 # ----------------------------------------------------------------------------
 # A dishonest node could fabricate a dependency's network behaviour (claim it
@@ -3058,6 +3168,7 @@ PROBES = [
     ("network_share", probe_network_share),
     ("tunnel", probe_tunnel),
     ("mu_accounting", probe_mu_accounting),
+    ("balance_statement", probe_balance_statement),
 ]
 
 # Probes that cannot produce any observation without the gateway. When the
@@ -3072,7 +3183,8 @@ GATEWAY_DEPENDENT = ("build_funding", "dependency_identity", "network_isolation"
                      "block_skip",
                      "env_vars",
                      "network_share",
-                     "tunnel")
+                     "tunnel",
+                     "balance_statement")
 
 
 def _safe_probe(name, fn):
@@ -3315,6 +3427,7 @@ PROBE_ENDPOINTS = [
     ("probe_network_share", "/probe/network_share", probe_network_share),
     ("probe_tunnel", "/probe/tunnel", probe_tunnel),
     ("probe_mu_accounting", "/probe/mu_accounting", probe_mu_accounting),
+    ("probe_balance_statement", "/probe/balance_statement", probe_balance_statement),
 ]
 # Reads /proc and /__config__ only: it spins nothing and moves nothing, so it
 # may run beside a suite.
@@ -3458,6 +3571,12 @@ MCP_TOOLS = [
           "Verify the node spends the service's MUs in line with the resources it provisions "
           "(charges, scales with usage beyond the run's own noise, does not drain). Takes three "
           "MU windows (~3 min)." + _SPENDS, False),
+    _tool("probe_balance_statement",
+          "Read this instance's own account with GetBalanceStatement (nodo #570/#571) after the "
+          "other probes, and check it by the rules of nodo's reader: the Ed25519 signature, the "
+          "hash chain, the rows adding up to the balance, the head, the price of each statement "
+          "query, and the balance that ModifyServiceSystemResources reports."
+          + _SPENDS, False),
     _tool("probe_dependency_observe",
           "Use the node Observe RPC to independently watch a dependency's real packets and confirm "
           "its connectivity is genuine, not fabricated by the node." + _SPENDS, False),

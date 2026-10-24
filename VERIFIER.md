@@ -78,6 +78,7 @@ Two consequences follow:
 | 13 | `env_vars` | `tiny` | nodo #574/#582: the packed spec names the declared env vars; a child started with one value given, one empty and one left out gets exactly those, in `/__config__` and in its process environment |
 | 14 | `network_share` | `netshare` ×3 | nodo #268: two members of one network share, with no common exporter, see each other's files; a member of another group does not |
 | 15 | `tunnel` | `tiny` | a `ServiceTunnel` to a child: its throughput against a direct download, and the bill: the bytes billed are the bytes relayed, each charge at most the advertised `net_mu_per_gib` and `tunnel_open_mu` |
+| 16 | `balance_statement` | orchestrator (self) | nodo #570/#571: after the run, this instance's own `GetBalanceStatement` verifies by nodo's `verify_chain` rules (Ed25519 signature, hash chain, rows add up to the balance, head), each statement query costs its advertised price, and the balance that `ModifyServiceSystemResources` reports is in the chain |
 | 9 | `attestation` | orchestrator | per-probe verdict + `sha3_256` content hash, as JSON and HTML |
 
 ### Child readiness — the node's "ready" is not the service's "ready"
@@ -615,6 +616,43 @@ are the node's own, from `/__config__`.
 | more bytes billed than relayed, a charge above the advertised rate, or a dearer opening | `DISHONEST` |
 | no traffic charge after `TUNNEL_SETTLE_S`, or no rates in `/__config__` to compare | `INCONCLUSIVE` |
 | the child, the download or the tunnel failed | `INFRA_ERROR` |
+
+#### Balance statement (orchestrator, nodo #570, #571)
+
+Every write of a balance goes with a row in the node's `balance_movements`, and
+`GetBalanceStatement` returns the rows of the caller's account, signed by the
+node. A local instance reads its own account by its address. The rows are a hash
+chain: each carries the hash of the row before it, the first hangs from a genesis
+hash tied to the account (`account_ref`), and the head commits to all of them. The
+node signs the digest of the statement with the Ed25519 key of its `Peer`.
+
+The probe runs **last**, after `mu_accounting`, so the statement holds the whole
+run. It reads the node's public key (`GetPeerInfo`) and the statement page by page
+from movement 1, and checks it by the rules of nodo's own reader
+(`src/manager/statement_check.py::verify_chain`, ported to `nodo_gateway.py`):
+
+- each page is signed by the node: `celaut-balance-statement:<key>|<digest>`;
+- the statement is dated within 120 s of this clock, the amounts are canonical
+  integers, the seqs follow with no gap, each row hangs from the hash of the one
+  before (across pages too) and adds up, no row is dated after the statement;
+- the first row hangs from the genesis of the account and starts from 0;
+- the last row is the head: its hash and its balance;
+- the rows add up to the balance;
+- each `statement_query` charge is at most `statement_query_mu +
+  statement_row_mu × rows` (plus the charge row itself for a read of the own
+  account), with the rates from `/__config__`;
+- the balance that `ModifyServiceSystemResources` returns right after is the
+  balance of a row after it (the settle is a `resource_change` row).
+
+| observation | verdict |
+|---|---|
+| all of the above hold | `PASS` |
+| a signed page breaks a chain rule, a query costs more than its price, or the reported balance is in no row | `DISHONEST` |
+| a page does not verify with the node's key (it cannot be attributed to the node), or the node deleted the first rows (its retention) | `INCONCLUSIVE` |
+| a read failed | `INFRA_ERROR` |
+
+The other probes use statements too: `build_funding` and `idempotent_start` find
+their starts by `detail.start_ref`, and `tunnel` reads the bill of its child.
 
 ### 4. Attestation report card
 

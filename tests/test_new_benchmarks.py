@@ -532,6 +532,135 @@ class TunnelTests(unittest.TestCase):
         stop.assert_called_once_with("c0", "tiny")
 
 
+def signed_chain(kinds_amounts, account="client-or-token", key=None, pages=1, sign=True,
+                 tamper=None):
+    """A statement of ``account`` as nodo builds it: chained rows, head, signature."""
+    ref = gw.account_ref(account)
+    prev, balance, mvs = gw.genesis_hash_of_ref(ref), 0, []
+    for i, (kind, amt, detail) in enumerate(kinds_amounts, start=1):
+        balance += amt
+        mv = movement(i, kind, amt, balance, detail)
+        mv.prev_hash = prev
+        prev = gw.movement_hash(mv)
+        mvs.append(mv)
+    if tamper:
+        tamper(mvs)
+    head_seq, head_hash = len(mvs), (gw.movement_hash(mvs[-1]) if mvs else prev)
+    out, size = [], -(-len(mvs) // pages)
+    for p in range(pages):
+        chunk = mvs[p * size:(p + 1) * size]
+        st = SimpleNamespace(account_ref=ref, from_seq=chunk[0].seq if chunk else 1, to_seq=0,
+                             movements=chunk, balance=amount(balance), head_seq=head_seq,
+                             head_hash=head_hash, oldest_seq=1, retention_days=30,
+                             ts=int(app.time.time()), signature="")
+        if sign and key is not None:
+            st.signature = key.sign(gw.statement_payload(
+                public_hex(key), gw.statement_digest(st)).encode()).hex()
+        out.append(st)
+    return out
+
+
+def public_hex(key):
+    from cryptography.hazmat.primitives import serialization
+    return key.public_key().public_bytes(serialization.Encoding.Raw,
+                                         serialization.PublicFormat.Raw).hex()
+
+
+try:
+    from cryptography.hazmat.primitives.asymmetric import ed25519
+    HAVE_ED25519 = True
+except ImportError:  # pragma: no cover
+    HAVE_ED25519 = False
+
+RUN = [("start", 14_000_000, None), ("maintenance", -3000, {"seconds": 60}),
+       ("child_start", -2_000_000, {"start_ref": "ab"}), ("refund", 1_900_000, {"refunds_seq": "3"}),
+       ("statement_query", -103, {"rows": "2"})]
+
+
+@unittest.skipUnless(HAVE_ED25519, "cryptography is not installed")
+class StatementReaderTests(unittest.TestCase):
+    def setUp(self):
+        self.key = ed25519.Ed25519PrivateKey.generate()
+
+    def test_a_chain_as_nodo_signs_it_verifies_and_adds_up(self):
+        out = gw.verify_statement(signed_chain(RUN, key=self.key), public_hex(self.key))
+        self.assertEqual(out["problems"], [])
+        self.assertTrue(out["signatures_ok"])
+        self.assertTrue(out["adds_up"])
+        self.assertEqual(out["sum_mu"], out["balance_mu"])
+
+    def test_pages_must_continue_one_another(self):
+        out = gw.verify_statement(signed_chain(RUN, key=self.key, pages=2), public_hex(self.key))
+        self.assertEqual(out["problems"], [])
+        self.assertEqual(out["movements"], len(RUN))
+
+    def test_a_row_changed_after_it_was_chained_breaks_the_chain(self):
+        def bump(mvs):
+            mvs[1].amount = amount(-2000)
+        out = gw.verify_statement(signed_chain(RUN, key=self.key, tamper=bump), public_hex(self.key))
+        self.assertTrue(out["problems"])
+
+    def test_another_key_does_not_verify(self):
+        other = ed25519.Ed25519PrivateKey.generate()
+        out = gw.verify_statement(signed_chain(RUN, key=other), public_hex(self.key))
+        self.assertFalse(out["signatures_ok"])
+
+
+@unittest.skipUnless(HAVE_ED25519, "cryptography is not installed")
+class BalanceStatementProbeTests(unittest.TestCase):
+    RATES = {"statement_query_mu": 100, "statement_row_mu": 1}
+
+    def run_probe(self, pages, reported, after_balance):
+        key = self.key
+        after = [movement(99, "resource_change", -10000, after_balance)]
+        peer = SimpleNamespace(public_key=public_hex(key), mu_per_call=[])
+        with mock.patch.object(gw, "peer_info", return_value=peer), \
+             mock.patch.object(gw, "full_statement", return_value=pages), \
+             mock.patch.object(app.controller, "modify_resources", return_value=({}, reported)), \
+             mock.patch.object(app, "_own_rows_after", return_value=after), \
+             mock.patch.object(app, "NODE_RATES", self.RATES):
+            return app.probe_balance_statement()
+
+    def setUp(self):
+        self.key = ed25519.Ed25519PrivateKey.generate()
+
+    def test_a_true_statement_passes(self):
+        pages = signed_chain(RUN, key=self.key)
+        ev = self.run_probe(pages, 5_000, 5_000)
+        self.assertEqual(ev["verdict"], app.VERDICT_PASS, ev["reason"])
+        self.assertEqual(ev["kinds"]["statement_query"], 1)
+
+    def test_the_rates_of_the_peer_are_used_when_the_config_lacks_them(self):
+        run = RUN[:-1] + [("statement_query", -5000, {"rows": "2"})]
+        pages = signed_chain(run, key=self.key)
+        peer = SimpleNamespace(public_key=public_hex(self.key), mu_per_call=[
+            SimpleNamespace(key="statement_query_mu", value=amount(100)),
+            SimpleNamespace(key="statement_row_mu", value=amount(1))])
+        after = [movement(99, "resource_change", -10000, 5_000)]
+        with mock.patch.object(gw, "peer_info", return_value=peer), \
+             mock.patch.object(gw, "full_statement", return_value=pages), \
+             mock.patch.object(app.controller, "modify_resources", return_value=({}, 5_000)), \
+             mock.patch.object(app, "_own_rows_after", return_value=after), \
+             mock.patch.object(app, "NODE_RATES", {}):
+            ev = app.probe_balance_statement()
+        self.assertEqual(ev["verdict"], app.VERDICT_DISHONEST)
+
+    def test_a_query_charged_above_its_price_is_dishonest(self):
+        run = RUN[:-1] + [("statement_query", -5000, {"rows": "2"})]
+        ev = self.run_probe(signed_chain(run, key=self.key), 5_000, 5_000)
+        self.assertEqual(ev["verdict"], app.VERDICT_DISHONEST)
+
+    def test_a_balance_that_is_not_in_the_chain_is_dishonest(self):
+        ev = self.run_probe(signed_chain(RUN, key=self.key), 5_000, 4_000)
+        self.assertEqual(ev["verdict"], app.VERDICT_DISHONEST)
+
+    def test_an_unsigned_statement_cannot_accuse(self):
+        def bump(mvs):
+            mvs[1].amount = amount(-2000)
+        ev = self.run_probe(signed_chain(RUN, key=self.key, sign=False, tamper=bump), 5_000, 5_000)
+        self.assertEqual(ev["verdict"], app.VERDICT_INCONCLUSIVE)
+
+
 class NeutralVerdictTests(unittest.TestCase):
     def test_not_applicable_probes_are_hashed_but_do_not_block_the_hash(self):
         results = {"x": {"probe": "x", "verdict": app.VERDICT_PASS},
