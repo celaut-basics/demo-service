@@ -79,6 +79,7 @@ Two consequences follow:
 | 14 | `network_share` | `netshare` ×3 | nodo #268: two members of one network share, with no common exporter, see each other's files; a member of another group does not |
 | 15 | `tunnel` | `tiny` | a `ServiceTunnel` to a child: its throughput against a direct download, and the bill: the bytes billed are the bytes relayed, each charge at most the advertised `net_mu_per_gib` and `tunnel_open_mu` |
 | 16 | `balance_statement` | orchestrator (self) | nodo #570/#571: after the run, this instance's own `GetBalanceStatement` verifies by nodo's `verify_chain` rules (Ed25519 signature, hash chain, rows add up to the balance, head), each statement query costs its advertised price, and the balance that `ModifyServiceSystemResources` reports is in the chain |
+| 17 | `delegation_pricing` | `tiny`, on a peer | nodo #577/#586 (and #567 from the client side): a child the node delegates is charged at the delegating node's own advertised price, and the father pays `initial_mu` only. `NOT_APPLICABLE` when no peer takes it |
 | 9 | `attestation` | orchestrator | per-probe verdict + `sha3_256` content hash, as JSON and HTML |
 
 ### Child readiness — the node's "ready" is not the service's "ready"
@@ -653,6 +654,46 @@ from movement 1, and checks it by the rules of nodo's own reader
 
 The other probes use statements too: `build_funding` and `idempotent_start` find
 their starts by `detail.start_ref`, and `tunnel` reads the bill of its child.
+
+#### Delegation pricing (`tiny` on a peer, nodo #577/#586; #567 from the client side)
+
+A node that delegates a child to a peer charges it like a local one: its own
+cost functions, its rates, its scarcity at the launch. The father pays
+`initial_mu`; the node keeps its own build and sends the peer the rest. What the
+peer charges the node is only the cost of the delegation (#577). A peer that
+charges more maintenance than it signed in its quote is scored
+`MAINTENANCE_OVERCHARGED` by the node, and the client's charge does not change:
+the node absorbs the excess (#567).
+
+From inside a service the client side is what can be seen. The probe asks the
+node for its quote (`GetServiceEstimatedCost`, always the node's own price),
+starts `tiny` with a `StartReference`, and tells whether the node delegated it:
+the node gives no statement of an instance it delegated (`GetBalanceStatement`
+answers `UNIMPLEMENTED`). Then it samples the child's balance as the delegating
+node keeps it (`GetMetrics`) every `DELEGATION_SAMPLE_S` (10 s) for
+`DELEGATION_WINDOW_S` (120 s).
+
+The node's own price for the child is its advertised base rates
+(`cpu_mu_per_vcpu_second`, `ram_mu_per_gib_second`, `disk_mu_per_gib_second`, from
+`/__config__`) for the child's resources, times a scarcity multiplier between 1
+and `scarcity_max_multiplier`, fixed at the launch. So the spend per second must
+be at least the base for the declared resources, and at most the base (memory at
+512 MiB, for the node's floor) times `scarcity_max_multiplier`. The quote is
+priced at the scarcity of the moment it was asked, so the ratio to it is evidence
+only (`burn.ratio_to_quote`).
+
+| observation | verdict |
+|---|---|
+| the spend is in that range (within one tick and `DELEGATION_TOLERANCE`, 15%), and the father paid exactly `initial_mu` | `PASS` |
+| it is above the range, or the father paid more than `initial_mu` | `DISHONEST` |
+| it is below the node's own base rates (the peer's price passed on, or time not charged), or it cannot be told whether the child was delegated | `INCONCLUSIVE` |
+| the node ran the child itself: no peer, `network.DELEGATE_EXECUTION` off, no common payment system or deposit, or room of its own | `NOT_APPLICABLE` |
+| the quote, the start or a reading failed | `INFRA_ERROR` |
+
+The score of an overcharging peer is visible only to the operator of the
+delegating node. `tools/two-node/` runs this probe on a node that delegates to a
+second node, once with an honest peer and once with one that overcharges, and
+checks the score from the operator's side.
 
 ### 4. Attestation report card
 

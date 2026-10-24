@@ -2771,6 +2771,167 @@ def probe_balance_statement():
 
 
 # ----------------------------------------------------------------------------
+# Probe — delegation pricing (nodo #577/#586; #567 seen from the client)
+# ----------------------------------------------------------------------------
+# A node that delegates a child to a peer charges it like a local one: its own cost
+# functions, its rates, its scarcity at the launch. The father pays initial_mu, the node
+# keeps its own build and sends the peer the rest; what the peer charges this node is
+# only the cost of the delegation, and the margin is the node's (#577). A peer that
+# charges more maintenance than it signed in its quote is scored MAINTENANCE_OVERCHARGED
+# by the node, and the client's charge does not change: the node absorbs the excess
+# (#567). From inside a service, the client side is what can be seen: the child's
+# balance, as the delegating node keeps it (GetMetrics), must fall at that node's own
+# price: its advertised base rates for the child, times a scarcity multiplier between 1
+# and its scarcity_max_multiplier (fixed at the launch). A peer cheaper than the node
+# (as in tools/two-node/, a third of its rates) shows below that range if the node
+# passed the peer's price on. The quote (GetServiceEstimatedCost, always the node's own
+# price) is priced at the scarcity of the moment it was asked, so it is evidence only.
+#
+# Whether a child was delegated shows in one place a service can read: the node gives
+# no statement of an instance that it delegated (GetBalanceStatement answers
+# UNIMPLEMENTED). A node with no peer, or one that runs the child itself, delegates
+# nothing, and the probe is NOT_APPLICABLE. The scoring of an overcharging peer is
+# visible only to the operator of the delegating node: tools/two-node/ checks it.
+DELEGATION_CHILD = "tiny"
+DELEGATION_WINDOW_S = float(os.environ.get("DELEGATION_WINDOW_S", "120"))
+DELEGATION_SAMPLE_S = float(os.environ.get("DELEGATION_SAMPLE_S", "10"))
+# Room around the bounds before the reading says anything: the ticks are discrete (one
+# tick either way is allowed on top of this).
+DELEGATION_TOLERANCE = float(os.environ.get("DELEGATION_TOLERANCE", "0.15"))
+# The memory the upper bound prices the child at: a node raises a small guest to its own
+# floor (MIN_MEM_MIB), which the child's declaration does not say.
+DELEGATION_MEM_CEILING_BYTES = 512 * 1024 * 1024
+
+
+def _is_delegated(token):
+    """True if the node delegated the instance, False if it runs it, None if unknown."""
+    try:
+        gw.balance_statement(node_url, token=token, from_seq=0)
+        return False
+    except gw.GatewayError as e:
+        if e.code == "UNIMPLEMENTED":
+            return True
+        return None
+
+
+def _burn(token, window, every):
+    """Samples of the child's balance over ``window`` seconds: [(t, balance), ...]."""
+    samples = []
+    t0 = time.monotonic()
+    while True:
+        samples.append((round(time.monotonic() - t0, 2), gw.metrics_balance(node_url, token)))
+        if time.monotonic() - t0 >= window:
+            return samples
+        time.sleep(every)
+
+
+def _price_bounds(label, rates):
+    """(low, high) MU per second that the node's own price for the child can be.
+
+    The node advertises its base rates (cpu_mu_per_vcpu_second, ram_mu_per_gib_second,
+    disk_mu_per_gib_second) and the most its scarcity can multiply them by
+    (scarcity_max_multiplier). A delegated child is charged those rates for the
+    resources it holds, at the multipliers of its launch (#577), so its price per second
+    is at least the base for its declared resources and at most that multiplier times
+    the base with the memory at a node's floor. None when a rate is not advertised.
+    """
+    cpu, ram, disk_rate = (rates.get(k) for k in ("cpu_mu_per_vcpu_second", "ram_mu_per_gib_second",
+                                                   "disk_mu_per_gib_second"))
+    if None in (cpu, ram, disk_rate):
+        return None
+    mem, disk = CHILD_DECLARED_RESOURCES[label]
+    low = cpu + ram * mem / GIB + disk_rate * disk / GIB
+    high = (cpu + ram * max(mem, DELEGATION_MEM_CEILING_BYTES) / GIB + disk_rate * disk / GIB) \
+        * (rates.get("scarcity_max_multiplier") or 10)
+    return low, high
+
+
+def _judge_burn(samples, bounds, loop_s):
+    """(evidence, verdict, reason) of a delegated child's burn against the node's own price."""
+    (t0, b0), (t1, b1) = samples[0], samples[-1]
+    elapsed = t1 - t0
+    spent = b0 - b1
+    evidence = {"window_s": elapsed, "spent_mu": spent, "samples": samples,
+                "mu_per_s": round(spent / elapsed, 1) if elapsed else None}
+    if not bounds or not elapsed:
+        return evidence, VERDICT_INCONCLUSIVE, "the node's base rates are not in /__config__"
+    low, high = bounds
+    tick_low, tick_high = low * (loop_s or 10), high * (loop_s or 10)
+    evidence.update(base_mu_per_s=round(low, 1), ceiling_mu_per_s=round(high, 1),
+                    ratio_to_base=round(spent / (low * elapsed), 3))
+    if spent > high * elapsed * (1 + DELEGATION_TOLERANCE) + tick_high:
+        return evidence, VERDICT_DISHONEST, (
+            f"the delegated child was charged {spent} MU in {elapsed}s ({evidence['mu_per_s']} "
+            f"MU/s), above the node's own base rates times its largest scarcity multiplier "
+            f"({round(high, 1)} MU/s)")
+    if spent < low * elapsed * (1 - DELEGATION_TOLERANCE) - tick_low:
+        return evidence, VERDICT_INCONCLUSIVE, (
+            f"the delegated child was charged {spent} MU in {elapsed}s ({evidence['mu_per_s']} "
+            f"MU/s), below the node's own base rates ({round(low, 1)} MU/s): the client was not "
+            "overcharged, but this is not the node's own price either (the peer's price passed "
+            "on, or time not charged)")
+    return evidence, VERDICT_PASS, (
+        f"the delegated child was charged {evidence['mu_per_s']} MU/s: the node's own price, "
+        f"between its base rates for the child ({round(low, 1)} MU/s) and those rates at its "
+        f"largest scarcity multiplier ({round(high, 1)} MU/s)")
+
+
+def probe_delegation_pricing():
+    label = DELEGATION_CHILD
+    ev = {"probe": "delegation_pricing", "child": label}
+    token = None
+    try:
+        budget = _child_budget(label)
+        config = gw.configuration(initial_mu=budget) if budget is not None else None
+        quote = gw.estimated_cost(node_url, packed(label), config=config)
+        period, loop_s = gw.mu(quote.init_maintenance_cost), int(quote.maintenance_seconds_loop)
+        ev["quote"] = {"cost_mu": gw.mu(quote.cost), "init_maintenance_cost_mu": period,
+                       "max_maintenance_cost_mu": gw.mu(quote.max_maintenance_cost),
+                       "maintenance_seconds_loop": loop_s}
+        head = _own_head()
+        ref = secrets.token_bytes(16)
+        r = _gw_start(label, start_ref=ref, wait_ready=False)
+        token = r.instance.token
+        delegated = _is_delegated(token)
+        ev["delegated"] = delegated
+        if delegated is False:
+            ev["verdict"] = VERDICT_NOT_APPLICABLE
+            ev["reason"] = ("the node ran the child itself (it gives its statement): no peer took "
+                            "it, so there is no delegated price to check. A node delegates only "
+                            "with network.DELEGATE_EXECUTION on, a peer with a common payment "
+                            "system and a deposit there, and no room of its own")
+            return ev
+        if delegated is None:
+            ev["verdict"] = VERDICT_INCONCLUSIVE
+            ev["reason"] = "it could not be told whether the node delegated the child"
+            return ev
+        ev["balance_after_start_mu"] = gw.metrics_balance(node_url, token)
+        evidence, verdict, reason = _judge_burn(_burn(token, DELEGATION_WINDOW_S,
+                                                      DELEGATION_SAMPLE_S),
+                                                _price_bounds(label, NODE_RATES), loop_s)
+        if loop_s and period:
+            # The quote is priced at the scarcity of the moment it was asked, the charge at
+            # that of the launch: evidence only.
+            evidence["ratio_to_quote"] = round(evidence["spent_mu"] / (period * evidence["window_s"]
+                                                                       / loop_s), 3)
+        ev["burn"] = evidence
+        starts = _rows_for_ref(_own_rows_after(head), ref)
+        ev["child_start_rows"] = [_movement_view(mv) for mv in starts]
+        paid = [-int(mv.amount.n) for mv in starts]
+        if budget is not None and paid and paid != [budget]:
+            verdict = VERDICT_DISHONEST
+            reason = (f"the father paid {paid} for a delegated start of initial_mu {budget} MU; "
+                      "#577: the father pays initial_mu and nothing else. " + reason)
+        ev["verdict"], ev["reason"] = verdict, reason
+        return ev
+    except Exception as e:
+        return _infra(ev, "the delegated price", e)
+    finally:
+        if token:
+            ev["refund_mu"] = _gw_stop(token, label)
+
+
+# ----------------------------------------------------------------------------
 # Probe — dependency connectivity is not fraudulent (node Observe cross-check)
 # ----------------------------------------------------------------------------
 # A dishonest node could fabricate a dependency's network behaviour (claim it
@@ -3167,6 +3328,7 @@ PROBES = [
     ("env_vars", probe_env_vars),
     ("network_share", probe_network_share),
     ("tunnel", probe_tunnel),
+    ("delegation_pricing", probe_delegation_pricing),
     ("mu_accounting", probe_mu_accounting),
     ("balance_statement", probe_balance_statement),
 ]
@@ -3184,7 +3346,8 @@ GATEWAY_DEPENDENT = ("build_funding", "dependency_identity", "network_isolation"
                      "env_vars",
                      "network_share",
                      "tunnel",
-                     "balance_statement")
+                     "balance_statement",
+                     "delegation_pricing")
 
 
 def _safe_probe(name, fn):
@@ -3426,6 +3589,7 @@ PROBE_ENDPOINTS = [
     ("probe_env_vars", "/probe/env_vars", probe_env_vars),
     ("probe_network_share", "/probe/network_share", probe_network_share),
     ("probe_tunnel", "/probe/tunnel", probe_tunnel),
+    ("probe_delegation_pricing", "/probe/delegation_pricing", probe_delegation_pricing),
     ("probe_mu_accounting", "/probe/mu_accounting", probe_mu_accounting),
     ("probe_balance_statement", "/probe/balance_statement", probe_balance_statement),
 ]
@@ -3615,6 +3779,12 @@ MCP_TOOLS = [
           "Measure a ServiceTunnel to the tiny child: its throughput (against a direct download),"
           " and the bill on the child's statement: the bytes billed must be the bytes relayed, "
           "and each charge at most the advertised net_mu_per_gib and tunnel_open_mu."
+          + _SPENDS, False),
+    _tool("probe_delegation_pricing",
+          "Check the delegated price of nodo #577/#586 (and, from the client side, #567): a child"
+          " that the node delegates to a peer must be charged at the delegating node's own "
+          "advertised price, and the father pays initial_mu and nothing else. NOT_APPLICABLE when"
+          " the node runs the child itself."
           + _SPENDS, False),
 ]
 

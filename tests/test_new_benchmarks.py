@@ -661,6 +661,69 @@ class BalanceStatementProbeTests(unittest.TestCase):
         self.assertEqual(ev["verdict"], app.VERDICT_INCONCLUSIVE)
 
 
+class DelegationPricingTests(unittest.TestCase):
+    # A default node: 1111 MU/s per vCPU, 277 per GiB of RAM, 27 per GiB of disk. tiny
+    # (1 vCPU, 50 MB, 200 MB) has a base of about 1129 MU/s, and at most 10x that with
+    # the memory at 512 MiB.
+    RATES = {"cpu_mu_per_vcpu_second": 1111, "ram_mu_per_gib_second": 277,
+             "disk_mu_per_gib_second": 27, "scarcity_max_multiplier": 10}
+
+    def run_probe(self, delegated_code, mu_per_s, paid=None):
+        account = FakeAccount()
+        budget = 3_000_000
+
+        def start(label, *, start_ref=None, **kw):
+            account.move("child_start", -(paid or budget), {"start_ref": start_ref.hex()})
+            return started("d0")
+
+        def statement(node_url, token="", **kw):
+            if delegated_code:
+                raise refusal("This node gives no statement of that instance.", delegated_code)
+            return SimpleNamespace(head_seq=0)
+
+        quote = SimpleNamespace(cost=amount(budget), init_maintenance_cost=amount(17824),
+                                max_maintenance_cost=amount(17824), maintenance_seconds_loop=10)
+        with mock.patch.object(app, "_child_budget", return_value=budget), \
+             mock.patch.object(gw, "configuration", side_effect=lambda **kw: kw), \
+             mock.patch.object(gw, "estimated_cost", return_value=quote), \
+             mock.patch.object(app, "_gw_start", side_effect=start), \
+             mock.patch.object(app, "_gw_stop", return_value=123) as stop, \
+             mock.patch.object(gw, "balance_statement", side_effect=statement), \
+             mock.patch.object(gw, "metrics_balance", return_value=2_000_000), \
+             mock.patch.object(app, "_burn", return_value=[(0, 2_000_000),
+                                                           (120, 2_000_000 - 120 * mu_per_s)]), \
+             mock.patch.object(app, "NODE_RATES", self.RATES), \
+             mock.patch.object(app, "_own_head", side_effect=account.head), \
+             mock.patch.object(app, "_own_rows_after", side_effect=account.after):
+            ev = app.probe_delegation_pricing()
+        stop.assert_called_once_with("d0", "tiny")
+        return ev
+
+    def test_a_child_the_node_runs_itself_is_not_applicable(self):
+        self.assertEqual(self.run_probe(None, 1341)["verdict"], app.VERDICT_NOT_APPLICABLE)
+
+    def test_the_node_own_price_at_a_launch_multiplier_passes(self):
+        # Measured on the two-node run: 1341 MU/s, the node's rates at its launch scarcity.
+        ev = self.run_probe("UNIMPLEMENTED", 1341)
+        self.assertEqual(ev["verdict"], app.VERDICT_PASS, ev["reason"])
+        self.assertTrue(ev["delegated"])
+        self.assertAlmostEqual(ev["burn"]["ratio_to_quote"], 0.752, places=2)
+
+    def test_the_peer_price_passed_on_is_not_the_node_price(self):
+        # A third of the node's rates (the peer of tools/two-node/).
+        self.assertEqual(self.run_probe("UNIMPLEMENTED", 384)["verdict"], app.VERDICT_INCONCLUSIVE)
+
+    def test_a_charge_above_the_largest_multiplier_is_dishonest(self):
+        self.assertEqual(self.run_probe("UNIMPLEMENTED", 20000)["verdict"], app.VERDICT_DISHONEST)
+
+    def test_a_father_charged_beyond_initial_mu_is_dishonest(self):
+        ev = self.run_probe("UNIMPLEMENTED", 1341, paid=3_500_000)
+        self.assertEqual(ev["verdict"], app.VERDICT_DISHONEST)
+
+    def test_another_error_does_not_say_whether_it_was_delegated(self):
+        self.assertEqual(self.run_probe("UNAVAILABLE", 1341)["verdict"], app.VERDICT_INCONCLUSIVE)
+
+
 class NeutralVerdictTests(unittest.TestCase):
     def test_not_applicable_probes_are_hashed_but_do_not_block_the_hash(self):
         results = {"x": {"probe": "x", "verdict": app.VERDICT_PASS},
