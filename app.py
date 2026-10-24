@@ -2302,6 +2302,111 @@ def probe_block_skip():
 
 
 # ----------------------------------------------------------------------------
+# Probe — environment variables (nodo #574, #582)
+# ----------------------------------------------------------------------------
+# A service declares the names of its environment variables (`envs` in service.json).
+# Since #582 the packer embeds them in Service.Container.environment_variables, so the
+# spec says what the service asks for; since #574 the node asks the caller for every
+# one and marks none required. At launch the values come from
+# Configuration.environment_variables, and the node gives them to the service on two
+# paths: always in /__config__ (config.environment_variables, the exact bytes), and
+# also as Linux env vars of the entrypoint when the name and value pass
+# src/utils/guest_env.py. The node gives no value of its own: a declared variable the
+# caller leaves out is absent, and the service uses its own default.
+#
+# `tiny` declares three: one the probe gives a random value, one it gives an empty
+# value, one it leaves out. tiny's /env reports both paths, with the values in hex.
+ENV_CHILD = "tiny"
+TINY_DECLARED_ENVS = ("DEMO_ENV_GIVEN", "DEMO_ENV_EMPTY", "DEMO_ENV_UNSET")
+
+
+def _packed_env_names(label):
+    """The env names the packer embedded in a child's spec (#582)."""
+    return [kv.key for kv in packed(label).spec().container.environment_variables]
+
+
+def _judge_env_report(report, sent, unset):
+    """(violations, gaps) between what was sent and what the child received."""
+    violations, gaps = [], []
+    process = report.get("process_env") or {}
+    config = report.get("config_env") or {}
+    if not report.get("config_readable"):
+        gaps.append("the child could not read its /__config__")
+    for name, value in sent.items():
+        want = value.hex()
+        got = config.get(name)
+        if report.get("config_readable"):
+            if got is None:
+                violations.append(f"{name} is not in /__config__, but the caller gave it")
+            elif got != want:
+                violations.append(f"{name} in /__config__ is {got}, the caller gave {want}")
+        env = process.get(name)
+        if env is None:
+            gaps.append(f"{name} is not in the process environment (the second path is "
+                        "additive and a guest may lack it)")
+        elif env != want:
+            violations.append(f"{name} in the process environment is {env}, the caller gave {want}")
+    for name in unset:
+        if process.get(name) is not None or config.get(name) is not None:
+            violations.append(f"{name} has a value ({process.get(name) or config.get(name)}) "
+                              "that nobody gave")
+    return violations, gaps
+
+
+def probe_env_vars():
+    label = ENV_CHILD
+    ev = {"probe": "env_vars", "child": label, "declared": list(TINY_DECLARED_ENVS)}
+    token = None
+    try:
+        try:
+            ev["packed_names"] = _packed_env_names(label)
+        except Exception as e:
+            ev["packed_names"] = None
+            ev["packed_error"] = clip(e)
+        given = "v-" + secrets.token_hex(8)
+        sent = {"DEMO_ENV_GIVEN": given.encode(), "DEMO_ENV_EMPTY": b""}
+        unset = ("DEMO_ENV_UNSET",)
+        ev["sent"] = {k: v.decode() for k, v in sent.items()}
+        ev["left_out"] = list(unset)
+        r = _gw_start(label, envs=sent)
+        token = r.instance.token
+        report = requests.get(f"http://{r.uri}/env", timeout=30).json()
+        ev["child_report"] = report
+        violations, gaps = _judge_env_report(report, sent, unset)
+        if ev["packed_names"] is None:
+            gaps.append(f"the packed spec of the child could not be read: {ev.get('packed_error')}")
+        elif sorted(ev["packed_names"]) != sorted(TINY_DECLARED_ENVS):
+            # The packer keeps the names as a sorted key-value list, so only the set counts.
+            gaps.append(f"the packed spec names {ev['packed_names']}, the manifest declares "
+                        f"{list(TINY_DECLARED_ENVS)}: the packer that packed this service drops "
+                        "envs (before nodo #582)")
+        if violations:
+            ev["verdict"] = VERDICT_DISHONEST
+            ev["reason"] = "the child did not get the configuration it was started with: " + \
+                           "; ".join(violations)
+        elif gaps:
+            ev["verdict"] = VERDICT_INCONCLUSIVE
+            ev["reason"] = "the values that arrived are right, but: " + "; ".join(gaps)
+        else:
+            ev["verdict"] = VERDICT_PASS
+            ev["reason"] = ("the packed spec names the three declared variables; the given and "
+                            "the empty value arrived exactly in /__config__ and in the process "
+                            "environment, and the variable left out has no value (the service's "
+                            "own default applies)")
+        return ev
+    except ValueError as e:
+        ev["verdict"] = VERDICT_INCONCLUSIVE
+        ev["reason"] = f"the child's /env answer was not JSON: {clip(e)}"
+        return ev
+    except (ChildNotReadyError, requests.RequestException) as e:
+        return _infra(ev, "the env vars", e)
+    except Exception as e:
+        return _infra(ev, "the env vars", e)
+    finally:
+        _gw_stop(token, label)
+
+
+# ----------------------------------------------------------------------------
 # Probe — dependency connectivity is not fraudulent (node Observe cross-check)
 # ----------------------------------------------------------------------------
 # A dishonest node could fabricate a dependency's network behaviour (claim it
@@ -2695,6 +2800,7 @@ PROBES = [
     ("shared_filesystem", probe_shared_filesystem),
     ("idempotent_start", probe_idempotent_start),
     ("block_skip", probe_block_skip),
+    ("env_vars", probe_env_vars),
     ("mu_accounting", probe_mu_accounting),
 ]
 
@@ -2707,7 +2813,8 @@ GATEWAY_DEPENDENT = ("build_funding", "dependency_identity", "network_isolation"
                      "dependency_observe", "memory_ceiling", "node_benchmark",
                      "shared_filesystem", "mu_accounting",
                      "idempotent_start",
-                     "block_skip")
+                     "block_skip",
+                     "env_vars")
 
 
 def _safe_probe(name, fn):
@@ -2946,6 +3053,7 @@ PROBE_ENDPOINTS = [
     ("probe_shared_filesystem", "/probe/shared_filesystem", probe_shared_filesystem),
     ("probe_idempotent_start", "/probe/idempotent_start", probe_idempotent_start),
     ("probe_block_skip", "/probe/block_skip", probe_block_skip),
+    ("probe_env_vars", "/probe/env_vars", probe_env_vars),
     ("probe_mu_accounting", "/probe/mu_accounting", probe_mu_accounting),
 ]
 # Reads /proc and /__config__ only: it spins nothing and moves nothing, so it
@@ -3112,6 +3220,12 @@ MCP_TOOLS = [
           "after the node holds its block, and report the request bytes, the time to the instance"
           " and the time until the request was sent. PASS when the skip saves at least half of "
           "the bytes; a node that does not skip is never accused."
+          + _SPENDS, False),
+    _tool("probe_env_vars",
+          "Check the env vars of nodo #574/#582: the packed spec of the tiny child names its "
+          "declared variables, and a child started with one value given, one empty and one left "
+          "out gets exactly those, in /__config__ and in its process environment, with no value "
+          "for the one left out."
           + _SPENDS, False),
 ]
 

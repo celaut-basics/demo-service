@@ -321,6 +321,78 @@ class BlockSkipTests(unittest.TestCase):
         self.assertEqual(ev["verdict"], app.VERDICT_INCONCLUSIVE)
 
 
+class EnvVarsTests(unittest.TestCase):
+    def _run(self, report, names=None):
+        names = list(app.TINY_DECLARED_ENVS) if names is None else names
+        response = mock.Mock()
+        response.json.side_effect = lambda: report(self.sent)
+        captured = {}
+
+        def start(label, *, envs=None, **kw):
+            self.sent = envs
+            captured["envs"] = envs
+            return started("child0")
+
+        with mock.patch.object(app, "_gw_start", side_effect=start), \
+             mock.patch.object(app, "_gw_stop") as stop, \
+             mock.patch.object(app, "_packed_env_names", return_value=names), \
+             mock.patch.object(app.requests, "get", return_value=response):
+            ev = app.probe_env_vars()
+        stop.assert_called_once_with("child0", "tiny")
+        return ev, captured["envs"]
+
+    @staticmethod
+    def honest(sent):
+        values = {k: v.hex() for k, v in sent.items()}
+        return {"config_readable": True, "config_env": dict(values),
+                "process_env": dict(values, DEMO_ENV_UNSET=None)}
+
+    def test_exact_values_on_both_paths_pass(self):
+        # The packer stores the names sorted (keyvalue.from_dict).
+        ev, envs = self._run(self.honest, names=sorted(app.TINY_DECLARED_ENVS))
+        self.assertEqual(ev["verdict"], app.VERDICT_PASS, ev["reason"])
+        self.assertEqual(set(envs), {"DEMO_ENV_GIVEN", "DEMO_ENV_EMPTY"})
+        self.assertEqual(envs["DEMO_ENV_EMPTY"], b"")
+
+    def test_a_changed_value_is_dishonest(self):
+        def tampered(sent):
+            r = self.honest(sent)
+            r["config_env"]["DEMO_ENV_GIVEN"] = b"other".hex()
+            return r
+        self.assertEqual(self._run(tampered)[0]["verdict"], app.VERDICT_DISHONEST)
+
+    def test_a_value_nobody_gave_is_dishonest(self):
+        def invented(sent):
+            r = self.honest(sent)
+            r["process_env"]["DEMO_ENV_UNSET"] = b"x".hex()
+            return r
+        self.assertEqual(self._run(invented)[0]["verdict"], app.VERDICT_DISHONEST)
+
+    def test_a_missing_second_path_is_not_an_accusation(self):
+        def first_path_only(sent):
+            r = self.honest(sent)
+            r["process_env"] = {k: None for k in app.TINY_DECLARED_ENVS}
+            return r
+        self.assertEqual(self._run(first_path_only)[0]["verdict"], app.VERDICT_INCONCLUSIVE)
+
+    def test_a_spec_without_the_names_blames_the_packer_not_the_node(self):
+        ev, _ = self._run(self.honest, names=[])
+        self.assertEqual(ev["verdict"], app.VERDICT_INCONCLUSIVE)
+        self.assertIn("#582", ev["reason"])
+
+
+class TinyManifestTests(unittest.TestCase):
+    def test_the_declared_envs_match_the_manifests_and_the_source(self):
+        for arch in ("amd64", "arm64"):
+            with open(os.path.join(app.os.path.dirname(app.__file__), "tiny", arch,
+                                   ".service", "service.json")) as fh:
+                self.assertEqual(json.load(fh)["envs"], list(app.TINY_DECLARED_ENVS), arch)
+        with open(os.path.join(os.path.dirname(app.__file__), "tiny", "src", "main.rs")) as fh:
+            source = fh.read()
+        for name in app.TINY_DECLARED_ENVS:
+            self.assertIn(f'"{name}"', source)
+
+
 class NeutralVerdictTests(unittest.TestCase):
     def test_not_applicable_probes_are_hashed_but_do_not_block_the_hash(self):
         results = {"x": {"probe": "x", "verdict": app.VERDICT_PASS},

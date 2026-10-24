@@ -75,6 +75,7 @@ Two consequences follow:
 | 10 | `build_funding` | `tiny` | nodo #563: a child funded below its build, or below one maintenance period after it, is refused with the node's message and charged nothing; a funded child starts, this account pays exactly its `initial_mu`, and the build is paid from the child's account |
 | 11 | `idempotent_start` | `tiny` | nodo #578: three StartService requests with one `StartReference` give one instance and one `child_start` charge; the requests after the first send no service and get the same instance |
 | 12 | `block_skip` | `tiny` | nodo #371: a StartService that carries blocks the node holds sends a small part of them (≤ 5%); the bytes and the time to the instance are reported, against this instance's first send of the child |
+| 13 | `env_vars` | `tiny` | nodo #574/#582: the packed spec names the declared env vars; a child started with one value given, one empty and one left out gets exactly those, in `/__config__` and in its process environment |
 | 9 | `attestation` | orchestrator | per-probe verdict + `sha3_256` content hash, as JSON and HTML |
 
 ### Child readiness — the node's "ready" is not the service's "ready"
@@ -537,6 +538,30 @@ The first send carries the blocks only on the first suite after a pack on a node
 the reason says so. The skip of the blocks of a service that the node does not
 hold (#371 proper) shows in `first_send` when the node already holds some of its
 blocks from another service.
+
+#### Environment variables (`tiny`, nodo #574, #582)
+
+A service declares the names of its env vars (`envs` in `service.json`). Since
+#582 the packer embeds them in `Service.Container.environment_variables`; since
+#574 the node asks the caller for every one and marks none required. The node
+gives the values on two paths: always in `/__config__`
+(`config.environment_variables`, the exact bytes), and also as Linux env vars of
+the entrypoint when the name and value pass `src/utils/guest_env.py`. The node
+gives no value of its own: a declared variable that the caller leaves out is
+absent, and the service uses its own default.
+
+`tiny` declares `DEMO_ENV_GIVEN`, `DEMO_ENV_EMPTY` and `DEMO_ENV_UNSET`. The probe
+reads the names in the packed spec of `tiny` (from this service's
+`__services__`), starts it with a random value for the first, an empty value for
+the second and nothing for the third, and reads `GET /env`, which reports both
+paths with the values in hex.
+
+| observation | verdict |
+|---|---|
+| the spec names the three, both given values arrived exactly on both paths, the third has no value | `PASS` |
+| a given value is missing from `/__config__` or changed on either path, or the variable left out has a value | `DISHONEST` |
+| a value is missing from the process environment only (that path is additive), the spec does not name the variables (a packer before #582), or `/__config__` cannot be read | `INCONCLUSIVE` |
+| the child did not start or answer | `INFRA_ERROR` |
 
 ### 4. Attestation report card
 

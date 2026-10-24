@@ -14,7 +14,11 @@
             "tiny-service"
         ]
     },
-    "envs": [],
+    "envs": [
+        "DEMO_ENV_GIVEN",
+        "DEMO_ENV_EMPTY",
+        "DEMO_ENV_UNSET"
+    ],
     "resources": {
         "at_init": {
             "mem_limit": 50000000,
