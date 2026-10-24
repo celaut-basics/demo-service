@@ -205,6 +205,68 @@ class BuildFundingTests(unittest.TestCase):
         self.assertEqual(ev["grpc_code"], "UNAVAILABLE")
 
 
+class FakeNode578:
+    """A node that keys StartReference by the caller (#578), or one that ignores it."""
+
+    def __init__(self, idempotent=True, announces=True):
+        self.idempotent, self.announces = idempotent, announces
+        self.account = FakeAccount()
+        self.by_ref = {}
+        self.stopped = []
+        self.service_sent = []
+
+    def _start(self, ref, initial_mu, send_service=True):
+        if self.idempotent and ref in self.by_ref:
+            return started(self.by_ref[ref])
+        token = f"child{len(self.service_sent)}"
+        self.service_sent.append(send_service)
+        self.account.move("child_start", -(initial_mu or 1000), {"start_ref": ref.hex()})
+        self.by_ref.setdefault(ref, token)
+        return started(token)
+
+    def gw_start(self, label, *, start_ref=None, initial_mu="budget", **kw):
+        return self._start(start_ref, 5000)
+
+    def again(self, node_url, packed, *, start_ref=None, config=None, send_service=True, **kw):
+        result = self._start(start_ref, 7000, send_service)
+        result.instance = SimpleNamespace(token=result.instance.token, instance=None)
+        return result
+
+    def patches(self):
+        peer = SimpleNamespace(SerializeToString=lambda: b"x celaut.StartReference y"
+                               if self.announces else b"x")
+        return [mock.patch.object(app, "_gw_start", side_effect=self.gw_start),
+                mock.patch.object(gw, "start_service", side_effect=self.again),
+                mock.patch.object(gw, "configuration", side_effect=lambda **kw: kw),
+                mock.patch.object(gw, "peer_info", return_value=peer),
+                mock.patch.object(app, "_instance_uri", return_value=LISTENING_URI),
+                mock.patch.object(app, "_gw_stop", side_effect=lambda t, l: self.stopped.append(t)),
+                mock.patch.object(app, "_own_head", side_effect=self.account.head),
+                mock.patch.object(app, "_own_rows_after", side_effect=self.account.after)]
+
+
+class IdempotentStartTests(unittest.TestCase):
+    def test_one_reference_gives_one_instance_and_one_charge(self):
+        node = FakeNode578()
+        ev = run_with(node, app.probe_idempotent_start)
+        self.assertEqual(ev["verdict"], app.VERDICT_PASS, ev["reason"])
+        self.assertEqual(len(ev["child_start_rows"]), 1)
+        self.assertTrue(all(a["token_is_first"] for a in ev["asks"]))
+        self.assertEqual(node.stopped, ["child0"])
+
+    def test_a_second_start_for_an_announced_reference_is_dishonest(self):
+        node = FakeNode578(idempotent=False)
+        ev = run_with(node, app.probe_idempotent_start)
+        self.assertEqual(ev["verdict"], app.VERDICT_DISHONEST)
+        self.assertEqual(len(ev["child_start_rows"]), 3)
+        self.assertEqual(sorted(node.stopped), ["child0", "child1", "child2"],
+                         "every instance it started must be stopped")
+
+    def test_a_node_that_does_not_announce_the_reference_is_not_accused(self):
+        ev = run_with(FakeNode578(idempotent=False, announces=False), app.probe_idempotent_start)
+        self.assertEqual(ev["verdict"], app.VERDICT_INCONCLUSIVE)
+
+
 class NeutralVerdictTests(unittest.TestCase):
     def test_not_applicable_probes_are_hashed_but_do_not_block_the_hash(self):
         results = {"x": {"probe": "x", "verdict": app.VERDICT_PASS},

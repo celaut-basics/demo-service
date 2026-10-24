@@ -73,6 +73,7 @@ Two consequences follow:
 | 7 | `shared_filesystem` | `sharefs`, `sharefs-denied` | the directory this service exports is shared with its child in both directions, a read-only mount refuses a write, and a child asking for a share its parent does not export is refused at launch |
 | 8 | `mu_accounting` | orchestrator (self) | the node spends MUs in line with the resources it provisions |
 | 10 | `build_funding` | `tiny` | nodo #563: a child funded below its build, or below one maintenance period after it, is refused with the node's message and charged nothing; a funded child starts, this account pays exactly its `initial_mu`, and the build is paid from the child's account |
+| 11 | `idempotent_start` | `tiny` | nodo #578: three StartService requests with one `StartReference` give one instance and one `child_start` charge; the requests after the first send no service and get the same instance |
 | 9 | `attestation` | orchestrator | per-probe verdict + `sha3_256` content hash, as JSON and HTML |
 
 ### Child readiness — the node's "ready" is not the service's "ready"
@@ -475,6 +476,31 @@ finds each start by its reference (`detail.start_ref`).
 It runs first of the probes that start children: on a node that has not built
 `tiny` yet, the funded start is the one that pays the build, so both rules are
 exercised. On later runs the image is built and only the period rule applies.
+
+#### Idempotent StartService (`tiny`, nodo #578, PR #585)
+
+A `StartService` with a `StartReference` chosen by the caller is idempotent. The
+node keys the reference by the caller (here, this local instance). A second
+request with the same reference starts nothing and charges nothing: the node
+answers the same `ServiceInstance`, and the reference alone is enough, with no
+service. The `child_start` that paid the start carries the reference in
+`detail.start_ref`.
+
+The probe starts `tiny` with a new reference, then sends two more requests with
+it and the hashes only: one with no `Configuration`, one with another
+`initial_mu`. An `ABORTED` answer (the first start still running) is asked again.
+Then it counts the instances it got and the `child_start` movements of the
+reference in this instance's statement.
+
+| observation | verdict |
+|---|---|
+| one instance, every request got it back, one `child_start` | `PASS` |
+| more than one instance or charge, and the node's signed `Peer` announces `StartReference` in its gateway layer | `DISHONEST` |
+| the same, from a node that does not announce `StartReference` (it made no promise) | `INCONCLUSIVE` |
+| a request with the reference got an error, or the charge cannot be found | `INCONCLUSIVE` |
+| the first start or a statement failed | `INFRA_ERROR` |
+
+Every instance the probe got is stopped.
 
 ### 4. Attestation report card
 

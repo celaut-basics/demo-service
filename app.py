@@ -2070,6 +2070,118 @@ def probe_build_funding():
             _gw_stop(token, label)
 
 
+def _node_claims(feature):
+    """Whether the node's signed Peer names ``feature``, or None when it cannot be read.
+
+    The celaut-gateway layer of each address the node announces lists the message
+    type at each index of each RPC (src/identity/transport_stack.py), so a node whose
+    StartService takes a StartReference names it there. A node that does not name a
+    feature makes no promise about it, and is not accused of breaking it.
+    """
+    try:
+        return feature.encode() in gw.peer_info(node_url).SerializeToString()
+    except Exception as e:
+        logging.warning("Could not read the node's Peer: %s", e)
+        return None
+
+
+# ----------------------------------------------------------------------------
+# Probe — idempotent StartService (nodo #578, PR #585)
+# ----------------------------------------------------------------------------
+# A StartService with a StartReference chosen by the caller is idempotent: the node keys
+# the reference by the caller (a local instance, here), and a second request with the
+# same reference starts nothing and charges nothing. It answers the same
+# ServiceInstance, and needs no service: the reference alone is enough. The child_start
+# that paid the start carries the reference in detail.start_ref, so this account's
+# statement shows how many starts the reference paid for.
+IDEMPOTENT_CHILD = "tiny"
+IDEMPOTENT_ASKS = 3            # the first start and two more requests with its reference
+IDEMPOTENT_RETRY_ABORTED = 5   # ABORTED: the first start is still running; ask again
+IDEMPOTENT_RETRY_SECONDS = 2
+
+
+def _ask_again(label, ref, initial_mu):
+    """A request with the reference and the hashes only. ABORTED is asked again."""
+    for _ in range(IDEMPOTENT_RETRY_ABORTED):
+        try:
+            config = gw.configuration(initial_mu=initial_mu) if initial_mu is not None else None
+            return gw.start_service(node_url, packed(label), start_ref=ref, config=config,
+                                    send_service=False)
+        except gw.GatewayError as e:
+            if e.code != "ABORTED":
+                raise
+            time.sleep(IDEMPOTENT_RETRY_SECONDS)
+    raise RuntimeError(f"the start of the reference was still in progress after "
+                       f"{IDEMPOTENT_RETRY_ABORTED} requests")
+
+
+def probe_idempotent_start():
+    label = IDEMPOTENT_CHILD
+    ev = {"probe": "idempotent_start", "child": label, "asks": []}
+    tokens = []
+    try:
+        head = _own_head()
+        ref = secrets.token_bytes(16)
+        ev["start_ref"] = ref.hex()
+        first = _gw_start(label, start_ref=ref)
+        tokens.append(first.instance.token)
+        ev["first"] = {"uri": first.uri, "seconds_to_instance": first.seconds_to_instance}
+        budget = _child_budget(label)
+        errors = []
+        for i in range(1, IDEMPOTENT_ASKS):
+            # The second request carries no Configuration, the third one another
+            # initial_mu: neither may change what the reference already started.
+            other_mu = None if i == 1 else (budget or 0) + 12345
+            ask = {"ask": i + 1, "initial_mu": other_mu}
+            try:
+                r = _ask_again(label, ref, other_mu)
+                ask.update(token_is_first=(r.instance.token == first.instance.token),
+                           uri=_instance_uri(r.instance), seconds_to_instance=r.seconds_to_instance)
+                if r.instance.token not in tokens:
+                    tokens.append(r.instance.token)
+            except Exception as e:
+                ask["error"] = clip(e)
+                errors.append(f"request {i + 1}: {clip(e)}")
+            ev["asks"].append(ask)
+
+        starts = _rows_for_ref(_own_rows_after(head), ref)
+        ev["child_start_rows"] = [_movement_view(mv) for mv in starts]
+        ev["instances"] = len(tokens)
+        claims = _node_claims("StartReference")
+        ev["node_announces_start_reference"] = claims
+        repeated = len(starts) > 1 or len(tokens) > 1
+        if repeated and claims:
+            ev["verdict"] = VERDICT_DISHONEST
+            ev["reason"] = (f"one StartReference gave {len(tokens)} instance(s) and "
+                            f"{len(starts)} child_start charge(s); the node announces "
+                            "StartReference, and a second request with it must start and "
+                            "charge nothing")
+        elif repeated:
+            ev["verdict"] = VERDICT_INCONCLUSIVE
+            ev["reason"] = (f"one StartReference gave {len(tokens)} instance(s) and "
+                            f"{len(starts)} charge(s), but the node does not announce "
+                            "StartReference (#578), so it made no promise to break")
+        elif errors:
+            ev["verdict"] = VERDICT_INCONCLUSIVE
+            ev["reason"] = ("a request with the reference of a start that succeeded did not "
+                            "get its instance back: " + "; ".join(errors))
+        elif len(starts) != 1:
+            ev["verdict"] = VERDICT_INCONCLUSIVE
+            ev["reason"] = (f"the statement shows {len(starts)} child_start with the reference; "
+                            "the start that it paid for cannot be found")
+        else:
+            ev["verdict"] = VERDICT_PASS
+            ev["reason"] = (f"{IDEMPOTENT_ASKS} requests with one StartReference gave one "
+                            f"instance and one charge of {-int(starts[0].amount.n)} MU; the "
+                            "requests after the first sent no service and got the same instance")
+        return ev
+    except Exception as e:
+        return _infra(ev, "an idempotent start", e)
+    finally:
+        for token in tokens:
+            _gw_stop(token, label)
+
+
 # ----------------------------------------------------------------------------
 # Probe — dependency connectivity is not fraudulent (node Observe cross-check)
 # ----------------------------------------------------------------------------
@@ -2462,6 +2574,7 @@ PROBES = [
     ("memory_ceiling", probe_memory_ceiling),
     ("node_benchmark", probe_node_benchmark),
     ("shared_filesystem", probe_shared_filesystem),
+    ("idempotent_start", probe_idempotent_start),
     ("mu_accounting", probe_mu_accounting),
 ]
 
@@ -2472,7 +2585,8 @@ PROBES = [
 # /__config__, so it stays valid (and can legitimately PASS) with the gateway down.
 GATEWAY_DEPENDENT = ("build_funding", "dependency_identity", "network_isolation",
                      "dependency_observe", "memory_ceiling", "node_benchmark",
-                     "shared_filesystem", "mu_accounting")
+                     "shared_filesystem", "mu_accounting",
+                     "idempotent_start")
 
 
 def _safe_probe(name, fn):
@@ -2709,6 +2823,7 @@ PROBE_ENDPOINTS = [
     ("probe_memory_ceiling", "/probe/memory", probe_memory_ceiling),
     ("probe_node_benchmark", "/probe/benchmark", probe_node_benchmark),
     ("probe_shared_filesystem", "/probe/shared_filesystem", probe_shared_filesystem),
+    ("probe_idempotent_start", "/probe/idempotent_start", probe_idempotent_start),
     ("probe_mu_accounting", "/probe/mu_accounting", probe_mu_accounting),
 ]
 # Reads /proc and /__config__ only: it spins nothing and moves nothing, so it
@@ -2865,6 +2980,11 @@ MCP_TOOLS = [
           "read-only mount must refuse a write, and sharefs-denied (which asks for a share this "
           "service does not export) must be refused at launch. A package that does not carry the "
           "share declarations reports INCONCLUSIVE, never DISHONEST." + _SPENDS, False),
+    _tool("probe_idempotent_start",
+          "Check that StartService with a StartReference is idempotent (nodo #578): the same "
+          "reference twice gives one instance and one charge, and the second request gets the "
+          "same instance back without sending the service."
+          + _SPENDS, False),
 ]
 
 # Every HTTP route an operator can use, and the MCP tool(s) that give a model the
