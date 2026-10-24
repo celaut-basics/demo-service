@@ -3,6 +3,8 @@ use std::fs;
 use std::os::unix::ffi::OsStrExt;
 
 use rand::seq::SliceRandom;
+use warp::hyper::body::Bytes;
+use warp::hyper::Body;
 use warp::Filter;
 
 // The environment variables this service declares (`envs` in its service.json). The
@@ -10,6 +12,11 @@ use warp::Filter;
 // through both paths the node uses: the process environment, and `__config__`.
 const DECLARED_ENVS: [&str; 3] = ["DEMO_ENV_GIVEN", "DEMO_ENV_EMPTY", "DEMO_ENV_UNSET"];
 const CONFIG_FILE: &str = "/__config__";
+
+// /bytes/<n> streams n bytes in chunks of this size, so a large body never has to fit
+// in this service's 50 MB of memory.
+const STREAM_CHUNK: usize = 64 * 1024;
+const MAX_STREAM_BYTES: u64 = 1 << 30;
 
 // ---------------------------------------------------------------------------
 // A minimal protobuf reader, for ConfigurationFile.config.environment_variables:
@@ -163,7 +170,30 @@ async fn main() {
         warp::reply::with_header(env_report(), "content-type", "application/json")
     });
 
+    // n bytes, streamed. The orchestrator reads them through a ServiceTunnel to
+    // measure its throughput and what the node charges for the traffic.
+    let bytes = warp::path!("bytes" / u64).map(|n: u64| {
+        let n = n.min(MAX_STREAM_BYTES);
+        let (mut sender, body) = Body::channel();
+        tokio::spawn(async move {
+            let chunk = Bytes::from(vec![0x5au8; STREAM_CHUNK]);
+            let mut left = n;
+            while left > 0 {
+                let take = std::cmp::min(left, STREAM_CHUNK as u64) as usize;
+                if sender.send_data(chunk.slice(0..take)).await.is_err() {
+                    break;
+                }
+                left -= take as u64;
+            }
+        });
+        warp::http::Response::builder()
+            .header("content-type", "application/octet-stream")
+            .header("content-length", n.to_string())
+            .body(body)
+            .unwrap()
+    });
+
     // Inicia el servidor en el puerto 3030
-    let routes = whoami.or(env).or(random_name);
+    let routes = whoami.or(env).or(bytes).or(random_name);
     warp::serve(routes).run(([0, 0, 0, 0], 3030)).await;
 }

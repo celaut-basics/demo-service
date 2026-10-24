@@ -393,6 +393,145 @@ class TinyManifestTests(unittest.TestCase):
             self.assertIn(f'"{name}"', source)
 
 
+class FakeNode268:
+    """Members of network shares: one directory per group, or a node that breaks that."""
+
+    def __init__(self, mode="honest"):
+        self.mode = mode
+        self.dirs = {}
+        self.members = {}
+        self.stopped = []
+
+    def gw_start(self, label, *, envs=None, **kw):
+        group = envs[app.NETSHARE_GROUP_ENV].decode()
+        uri = f"m{len(self.members)}:3030"
+        key = {"honest": group, "one_dir": "all",
+               "split": f"{group}-{len(self.members)}"}[self.mode]
+        self.members[uri] = key
+        return started(f"t{len(self.members)}", uri=uri)
+
+    def call(self, uri, action, **params):
+        d = self.dirs.setdefault(self.members[uri], {})
+        plan = {"present": True, "raw": '[{"path":"/netshare"}]'}
+        if action == "write":
+            d[params["name"]] = params["nonce"]
+            return {"ok": True, "mount_plan": plan}
+        return {"present": params["name"] in d, "content": d.get(params["name"]), "mount_plan": plan}
+
+    def patches(self):
+        return [mock.patch.object(app, "_gw_start", side_effect=self.gw_start),
+                mock.patch.object(app, "_netshare", side_effect=self.call),
+                mock.patch.object(app, "SHARE_PROPAGATION_TIMEOUT_S", 0),
+                mock.patch.object(app, "_gw_stop", side_effect=lambda t, l: self.stopped.append(t))]
+
+
+class NetworkShareTests(unittest.TestCase):
+    def test_one_share_per_group_passes(self):
+        node = FakeNode268()
+        ev = run_with(node, app.probe_network_share)
+        self.assertEqual(ev["verdict"], app.VERDICT_PASS, ev["reason"])
+        self.assertEqual(sorted(node.stopped), ["t1", "t2", "t3"])
+
+    def test_another_group_seeing_the_share_is_dishonest(self):
+        ev = run_with(FakeNode268("one_dir"), app.probe_network_share)
+        self.assertEqual(ev["verdict"], app.VERDICT_DISHONEST)
+        self.assertIn("another group", ev["reason"])
+
+    def test_two_members_of_one_group_apart_is_dishonest(self):
+        ev = run_with(FakeNode268("split"), app.probe_network_share)
+        self.assertEqual(ev["verdict"], app.VERDICT_DISHONEST)
+
+    def test_a_member_with_no_mount_plan_is_a_packaging_question(self):
+        node = FakeNode268("split")
+        real = node.call
+
+        def no_plan(uri, action, **p):
+            out = real(uri, action, **p)
+            out["mount_plan"] = {"present": False, "raw": None}
+            return out
+        node.call = no_plan
+        self.assertEqual(run_with(node, app.probe_network_share)["verdict"], app.VERDICT_INCONCLUSIVE)
+
+
+class NetshareManifestTests(unittest.TestCase):
+    ROOT = os.path.dirname(HERE)
+
+    def manifest(self, arch, sub=""):
+        with open(os.path.join(self.ROOT, arch, sub, ".service", "service.json")) as fh:
+            return json.load(fh)
+
+    def test_the_share_is_a_share_of_a_network_the_child_and_the_parent_declare(self):
+        for arch in ("amd64", "arm64"):
+            child = self.manifest(arch, "netshare")
+            share, = child["shared_filesystems"]
+            self.assertEqual((share["role"], share["path"]), ("network", app.NETSHARE_MOUNT))
+            network, = [n for n in child["network"] if share["network"] in n["tags"]]
+            self.assertEqual(network["formal"], {"group": "${%s}" % app.NETSHARE_GROUP_ENV})
+            self.assertEqual(child["envs"], [app.NETSHARE_GROUP_ENV])
+            parent_tags = {t for n in self.manifest(arch)["network"] for t in n["tags"]}
+            self.assertIn(share["network"], parent_tags, "a child gets only its ancestors' networks")
+            with open(os.path.join(self.ROOT, arch, "netshare", ".service", "Dockerfile")) as fh:
+                self.assertIn("mkdir -p " + app.NETSHARE_MOUNT, fh.read())
+
+
+class TunnelTests(unittest.TestCase):
+    RATES = {"net_mu_per_gib": 2_000_000, "tunnel_open_mu": 10_000}
+
+    def rows(self, relayed, rate=2_000_000, open_mu=10_000, extra_bytes=0):
+        mib = 1024 * 1024
+        rows = [movement(1, "tunnel", -open_mu, 0, {"open": True})]
+        left, seq = relayed + extra_bytes, 2
+        while left > 0:
+            n = min(mib, left)
+            rows.append(movement(seq, "tunnel", -(rate * n // app.GIB), 0, {"bytes": n}))
+            left -= n
+            seq += 1
+        return rows
+
+    def judge(self, rows, relayed):
+        return app._judge_tunnel_bill(rows, relayed, self.RATES)
+
+    def test_a_bill_at_the_advertised_rate_has_no_violation(self):
+        relayed = 64 * 1024 * 1024 + 300
+        evidence, violations, notes = self.judge(self.rows(relayed), relayed)
+        self.assertEqual(violations, [])
+        self.assertEqual(evidence["billed_bytes"], relayed)
+        self.assertLessEqual(evidence["effective_mu_per_gib"], 2_000_000)
+
+    def test_a_dearer_rate_is_a_violation(self):
+        relayed = 8 * 1024 * 1024
+        _, violations, _ = self.judge(self.rows(relayed, rate=3_000_000), relayed)
+        self.assertTrue(violations)
+
+    def test_bytes_billed_that_were_not_relayed_are_a_violation(self):
+        relayed = 8 * 1024 * 1024
+        _, violations, _ = self.judge(self.rows(relayed, extra_bytes=2 * 1024 * 1024), relayed)
+        self.assertTrue(any("billed for" in v for v in violations))
+
+    def test_a_dearer_opening_is_a_violation(self):
+        relayed = 1024
+        _, violations, _ = self.judge(self.rows(relayed, open_mu=50_000), relayed)
+        self.assertTrue(any("opening" in v for v in violations))
+
+    def test_the_probe_reports_throughput_and_stops_the_child(self):
+        n = 4 * 1024 * 1024
+        sent, received = 60, n + 200
+        tunnel = SimpleNamespace(status=200, body_bytes=n, sent_bytes=sent, received_bytes=received,
+                                 seconds=0.5)
+        with mock.patch.object(app, "_gw_start", return_value=started("c0")), \
+             mock.patch.object(app, "_gw_stop") as stop, \
+             mock.patch.object(app, "_direct_download", return_value=(n, 0.25)), \
+             mock.patch.object(gw, "tunnel_http_get", return_value=tunnel), \
+             mock.patch.object(app, "NODE_RATES", self.RATES), \
+             mock.patch.object(app, "TUNNEL_TEST_BYTES", n), \
+             mock.patch.object(app, "_child_rows", return_value=self.rows(sent + received)):
+            ev = app.probe_tunnel()
+        self.assertEqual(ev["verdict"], app.VERDICT_PASS, ev["reason"])
+        self.assertEqual(ev["tunnel"]["mib_per_s"], 8.0)
+        self.assertEqual(ev["direct"]["mib_per_s"], 16.0)
+        stop.assert_called_once_with("c0", "tiny")
+
+
 class NeutralVerdictTests(unittest.TestCase):
     def test_not_applicable_probes_are_hashed_but_do_not_block_the_hash(self):
         results = {"x": {"probe": "x", "verdict": app.VERDICT_PASS},

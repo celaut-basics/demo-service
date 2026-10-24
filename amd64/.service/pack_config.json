@@ -9,7 +9,8 @@
     "PING": "ping",
     "BENCHMARK": "benchmark",
     "SHAREFS": "sharefs",
-    "SHAREFS_DENIED": "sharefs-denied"
+    "SHAREFS_DENIED": "sharefs-denied",
+    "NETSHARE": "netshare"
   },
   "dependencies_env": true,
   "include": [

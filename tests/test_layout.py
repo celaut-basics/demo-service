@@ -40,7 +40,7 @@ class PerArchitectureLayoutTests(unittest.TestCase):
     def test_service_dirs_live_only_under_an_architecture(self):
         # A stray .service at the old places would make `nodo pack .` (or
         # `nodo pack tiny`) pack something no one maintains any more.
-        for d in ("", "tiny", "heavy", "ping", "benchmark", "sharefs", "sharefs-denied"):
+        for d in ("", "tiny", "heavy", "ping", "benchmark", "sharefs", "sharefs-denied", "netshare"):
             self.assertFalse(os.path.exists(os.path.join(ROOT, d, ".service")), d or ".")
 
     def test_every_service_file_is_maintained_per_architecture(self):
@@ -70,7 +70,7 @@ class PerArchitectureLayoutTests(unittest.TestCase):
                 for arch in ARCHES}
         self.assertEqual(deps["arm64"], deps["amd64"])
         self.assertEqual(set(deps["arm64"]),
-                         {"TINY", "HEAVY", "PING", "BENCHMARK", "SHAREFS", "SHAREFS_DENIED"})
+                         {"TINY", "HEAVY", "PING", "BENCHMARK", "SHAREFS", "SHAREFS_DENIED", "NETSHARE"})
 
     def test_dependencies_resolve_inside_the_pack_root(self):
         # nodo resolves a local dependency inside its cache copy of the pack
@@ -125,7 +125,7 @@ class RustToolchainTests(unittest.TestCase):
     `rust-version` makes `cargo generate-lockfile` (with
     CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS=fallback) stay inside what the image has."""
 
-    CHILDREN = ("sharefs", "sharefs-denied")
+    CHILDREN = ("sharefs", "sharefs-denied", "netshare")
 
     @staticmethod
     def _version(text):

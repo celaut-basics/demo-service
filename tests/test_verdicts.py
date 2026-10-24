@@ -69,7 +69,7 @@ class BlindNodeTests(unittest.TestCase):
         self.assertEqual(ev["verdict"], app.VERDICT_INFRA_ERROR)
         self.assertEqual(ev["verified_count"], 0)
         self.assertEqual(sorted(ev["not_observed"]),
-                         ["benchmark", "heavy", "ping", "sharefs", "tiny"])
+                         ["benchmark", "heavy", "netshare", "ping", "sharefs", "tiny"])
         self.assertEqual(ev["mismatched"], [])
         for check in ev["checks"]:
             self.assertIsNone(check["match"], "unobserved must be None, not False")

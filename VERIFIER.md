@@ -2,7 +2,7 @@
 
 This turns the passive `demo-service` into an **active verifier** that checks
 whether the nodo node it is running on is *honest*. It reuses the existing
-`tiny` / `heavy` / `ping` / `benchmark` / `sharefs` child scaffolding and the `node_controller` library —
+`tiny` / `heavy` / `ping` / `benchmark` / `sharefs` / `netshare` child scaffolding and the `node_controller` library —
 nothing was rewritten from scratch.
 
 An honest node must:
@@ -76,6 +76,8 @@ Two consequences follow:
 | 11 | `idempotent_start` | `tiny` | nodo #578: three StartService requests with one `StartReference` give one instance and one `child_start` charge; the requests after the first send no service and get the same instance |
 | 12 | `block_skip` | `tiny` | nodo #371: a StartService that carries blocks the node holds sends a small part of them (≤ 5%); the bytes and the time to the instance are reported, against this instance's first send of the child |
 | 13 | `env_vars` | `tiny` | nodo #574/#582: the packed spec names the declared env vars; a child started with one value given, one empty and one left out gets exactly those, in `/__config__` and in its process environment |
+| 14 | `network_share` | `netshare` ×3 | nodo #268: two members of one network share, with no common exporter, see each other's files; a member of another group does not |
+| 15 | `tunnel` | `tiny` | a `ServiceTunnel` to a child: its throughput against a direct download, and the bill: the bytes billed are the bytes relayed, each charge at most the advertised `net_mu_per_gib` and `tunnel_open_mu` |
 | 9 | `attestation` | orchestrator | per-probe verdict + `sha3_256` content hash, as JSON and HTML |
 
 ### Child readiness — the node's "ready" is not the service's "ready"
@@ -562,6 +564,57 @@ paths with the values in hex.
 | a given value is missing from `/__config__` or changed on either path, or the variable left out has a value | `DISHONEST` |
 | a value is missing from the process environment only (that path is additive), the spec does not name the variables (a packer before #582), or `/__config__` cannot be read | `INCONCLUSIVE` |
 | the child did not start or answer | `INFRA_ERROR` |
+
+#### Network share (`netshare`, nodo #268)
+
+A network share is a directory that instances with **no common parent** share
+because they declare the same network and the same share
+(`docs/SHARED_FILESYSTEMS.md` in nodo, "Network shares"). `netshare` declares the
+network `celaut-demo-netshare` with the selection key
+`group=${DEMO_NETSHARE_GROUP}`, and `/netshare` as a share of it (`role:
+"network"`). The share id includes the formal after substitution, so each group
+is its own share.
+
+The probe starts three `netshare` instances as siblings: `a` and `b` in one new
+group, `c` in another. This service is the parent of each, but it exports
+nothing to them and is not a member. It declares the network only because a child
+gets only the networks that every ancestor declares. Then `a` writes a nonce,
+`b` must read it (polled for `SHARE_PROPAGATION_TIMEOUT_S`), `b` writes back and
+`a` must read that, and `c` must not see `a`'s file. The three members split the
+runtime budget of one child, so the funding gate still counts one deposit.
+
+| observation | verdict |
+|---|---|
+| `a` and `b` see each other's files, `c` does not | `PASS` |
+| `c` sees `a`'s file (two share ids in one directory), or `a` and `b` do not see each other's files while both have a mount plan for the share | `DISHONEST` |
+| a member has no mount plan for `/netshare` (a packer before #268), or cannot write to it | `INCONCLUSIVE` |
+| a member did not start or answer | `INFRA_ERROR` |
+
+`dependency_identity` checks `netshare` too, in a group of its own (`identity`).
+
+#### Service tunnel (`tiny`)
+
+`Gateway.ServiceTunnel` opens a byte stream to a declared slot of a local
+instance. The node charges the instance `tunnel_open_mu` to open it, then
+`net_mu_per_gib` for the bytes it relays in either direction, per
+`costs.TUNNEL_CHARGE_INTERVAL_KB` and the rest when the tunnel closes. The charge
+is per volume, with no scarcity surcharge: `amount = net_mu_per_gib × bytes //
+GiB`. Each charge is a `tunnel` movement of the instance, with its bytes in the
+detail.
+
+The probe reads `TUNNEL_TEST_BYTES` (64 MiB) from `tiny`'s `GET /bytes/<n>` once
+directly (the control) and once over a `ServiceTunnel` from this service, then
+reads `tiny`'s statement. It reports both throughputs (`direct.mib_per_s`,
+`tunnel.mib_per_s`) and the bill (`bill.billed_bytes`, `bill.relayed_bytes`,
+`bill.effective_mu_per_gib` against `bill.advertised_net_mu_per_gib`). The rates
+are the node's own, from `/__config__`.
+
+| observation | verdict |
+|---|---|
+| the bytes billed are the bytes relayed (within 4 KiB), each charge at most the advertised rate, the opening at most `tunnel_open_mu` | `PASS` |
+| more bytes billed than relayed, a charge above the advertised rate, or a dearer opening | `DISHONEST` |
+| no traffic charge after `TUNNEL_SETTLE_S`, or no rates in `/__config__` to compare | `INCONCLUSIVE` |
+| the child, the download or the tunnel failed | `INFRA_ERROR` |
 
 ### 4. Attestation report card
 

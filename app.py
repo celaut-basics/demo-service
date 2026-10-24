@@ -189,6 +189,7 @@ CHILD_DECLARED_RESOURCES = {           # label -> (mem_limit, disk_space)
     "ping": (50000000, 500000000),
     "benchmark": (2147483648, 200000000),
     "sharefs": (50000000, 200000000),
+    "netshare": (50000000, 200000000),
 }
 # sharefs-denied is deliberately NOT in the table above. It declares the same resources
 # (tests/test_verdicts.py holds it to its manifest), but it is never meant to start: the
@@ -225,6 +226,10 @@ PING_SERVICE = env_vars.get("PING", None)
 BENCHMARK_SERVICE = env_vars.get("BENCHMARK", None)
 SHAREFS_SERVICE = env_vars.get("SHAREFS", None)
 SHAREFS_DENIED_SERVICE = env_vars.get("SHAREFS_DENIED", None)
+NETSHARE_SERVICE = env_vars.get("NETSHARE", None)
+# The variable that selects the network share of a netshare child: it fills
+# ${DEMO_NETSHARE_GROUP} in the formal of its network (netshare/<arch>/.service/service.json).
+NETSHARE_GROUP_ENV = "DEMO_NETSHARE_GROUP"
 
 logging.basicConfig(filename='app.log', level=logging.DEBUG,
                     format='%(asctime)s - %(levelname)s - %(message)s')
@@ -273,9 +278,10 @@ GIB = 1024 ** 3
 CHILD_FUNDED_SECONDS = int(os.environ.get("CHILD_FUNDED_SECONDS", "600"))
 CHILD_BUDGET_MARGIN = float(os.environ.get("CHILD_BUDGET_MARGIN", "2.0"))
 CHILD_MIN_INITIAL_MU = int(os.environ.get("CHILD_MIN_INITIAL_MU", "100000"))
-# One full suite: the three MU windows dominate (3 x MU_WINDOW_SECONDS), the
-# memory ladder and the benchmark take the rest.
-SUITE_EXPECTED_SECONDS = int(os.environ.get("SUITE_EXPECTED_SECONDS", "480"))
+# One full suite: the three MU windows (3 x MU_WINDOW_SECONDS), the memory ladder
+# and the benchmark, and the starts of the newer benchmarks (about 15 of tiny and
+# netshare, a 64 MiB tunnel).
+SUITE_EXPECTED_SECONDS = int(os.environ.get("SUITE_EXPECTED_SECONDS", "720"))
 # Runtime this instance must still have left AFTER a suite, so that verifying
 # the node never leaves the verifier unable to serve the result it produced.
 MIN_RESERVE_SECONDS = int(os.environ.get("MIN_RESERVE_SECONDS", "900"))
@@ -291,7 +297,8 @@ MU_PER_ERG = int(os.environ.get("MU_PER_ERG", str(10 ** 9)))
 
 _CHILD_HASHES = {"tiny": TINY_SERVICE, "heavy": HEAVY_SERVICE,
                  "ping": PING_SERVICE, "benchmark": BENCHMARK_SERVICE,
-                 "sharefs": SHAREFS_SERVICE, "sharefs_denied": SHAREFS_DENIED_SERVICE}
+                 "sharefs": SHAREFS_SERVICE, "sharefs_denied": SHAREFS_DENIED_SERVICE,
+                 "netshare": NETSHARE_SERVICE}
 
 # Where the packer put the children (pack_config.json): the Service of each one, and
 # its Metadata, by service id.
@@ -536,6 +543,12 @@ def _child_config(label, initial_mu=None):
     if label == "ping" and undeclared:
         kwargs["environment_variables"] = [celaut_pb2.BytesKeyValue(
             key=UNDECLARED_ADDRS_ENV, value=",".join(undeclared).encode())]
+    if label == "netshare":
+        # The group fills ${DEMO_NETSHARE_GROUP} in netshare's network: without it the
+        # node refuses the launch. A group of its own, so dependency_identity never joins
+        # the share of network_share.
+        kwargs["environment_variables"] = [celaut_pb2.BytesKeyValue(
+            key=NETSHARE_GROUP_ENV, value=b"identity")]
     return celaut_pb2.Configuration(**kwargs) if kwargs else None
 
 
@@ -551,6 +564,7 @@ heavy_service = _add_child("heavy")
 ping_service = _add_child("ping")
 benchmark_service = _add_child("benchmark")
 sharefs_service = _add_child("sharefs")
+netshare_service = _add_child("netshare")
 # Funded at the floor: an honest node refuses it before anything is spent, and if a node
 # does start it the probe still has to be able to inspect it, not be starved of funds.
 sharefs_denied_service = _add_child("sharefs_denied", CHILD_MIN_INITIAL_MU)
@@ -559,6 +573,7 @@ sharefs_denied_service = _add_child("sharefs_denied", CHILD_MIN_INITIAL_MU)
 def _register_child_budget(label, initial_mu):
     """Re-register one child funded with initial_mu (node_controller keeps the config)."""
     global tiny_service, heavy_service, ping_service, benchmark_service, sharefs_service
+    global netshare_service
     iface = _add_child(label, initial_mu)
     if label == "tiny":
         tiny_service = iface
@@ -570,6 +585,8 @@ def _register_child_budget(label, initial_mu):
         benchmark_service = iface
     elif label == "sharefs":
         sharefs_service = iface
+    elif label == "netshare":
+        netshare_service = iface
     with _funding_lock:
         FUNDING["child_initial_mu"] = dict(FUNDING["child_initial_mu"], **{label: initial_mu})
     return iface
@@ -590,7 +607,8 @@ def child_iface(label):
     """The current interface for a child (budgets re-register them)."""
     return {"tiny": tiny_service, "heavy": heavy_service,
             "ping": ping_service, "benchmark": benchmark_service,
-            "sharefs": sharefs_service, "sharefs_denied": sharefs_denied_service}[label]
+            "sharefs": sharefs_service, "sharefs_denied": sharefs_denied_service,
+            "netshare": netshare_service}[label]
 
 
 def sample_balance():
@@ -637,7 +655,8 @@ def funding_requirement(self_rate):
     largest = max(budgets, key=lambda label: budgets[label])
     parts = {
         # Children run one at a time and are refunded on stop, so only the
-        # largest deposit is ever held at once.
+        # largest deposit is ever held at once. (network_share holds three members,
+        # and splits one child's runtime between them.)
         "largest_child_deposit_mu": budgets[largest],
         "builds_owed_mu": sum(b for label, b in builds.items() if label != largest),
         "suite_upkeep_mu": int(self_rate * SUITE_EXPECTED_SECONDS),
@@ -1362,6 +1381,7 @@ DEP_IDENTITY = [
     ("ping", "celaut-demo-ping", "/whoami"),
     ("benchmark", "celaut-demo-benchmark", "/cgi-bin/whoami"),
     ("sharefs", "celaut-demo-sharefs", "/whoami"),
+    ("netshare", "celaut-demo-netshare", "/whoami"),
 ]
 # sharefs-denied is absent on purpose: a node that honours the share rules never starts it,
 # so there is no identity to read. shared_filesystem is what asks for it.
@@ -2407,6 +2427,240 @@ def probe_env_vars():
 
 
 # ----------------------------------------------------------------------------
+# Probe — network share (nodo #268)
+# ----------------------------------------------------------------------------
+# A network share is a directory that instances with no common parent share because they
+# declare the same network and the same share (docs/SHARED_FILESYSTEMS.md, "Network
+# shares"). netshare declares the network `celaut-demo-netshare` with the selection key
+# group=${DEMO_NETSHARE_GROUP}, and /netshare as a share of it. The share id includes the
+# formal after substitution, so each group is its own share.
+#
+# The probe starts three netshare instances as siblings: two of one group, one of
+# another. This service is the parent of each, but it does not export /netshare and is
+# not a member: it only declares the network, because a child gets only the networks
+# every ancestor declares. Member A writes, member B (same group) must read it, B writes
+# back and A must read that, and member C (other group) must not see A's file.
+NETSHARE_CHILD = "netshare"
+NETSHARE_MOUNT = "/netshare"
+NETSHARE_TIMEOUT_S = 30
+NETSHARE_MEMBERS = 3  # held at once: they share the runtime budget of one child
+
+
+def _netshare_member_mu():
+    """The initial_mu of one member: the build (if still owed) and a third of the runtime.
+
+    Three members run at once, for seconds. One child's runtime split between them keeps
+    what the suite holds at once at the largest single deposit, which is what the
+    funding gate counts on.
+    """
+    rate = FUNDING["self_rate_mu_per_s"]
+    if rate is None:
+        return None
+    runtime = child_runtime_mu(NETSHARE_CHILD, rate) // NETSHARE_MEMBERS
+    return child_build_mu(NETSHARE_CHILD) + max(CHILD_MIN_INITIAL_MU, runtime)
+
+
+def _netshare(uri, action, **params):
+    return requests.get(f"http://{uri}/{action}", params=params, timeout=NETSHARE_TIMEOUT_S).json()
+
+
+def _netshare_wait(uri, name, expected):
+    """Read ``name`` on a member until it holds ``expected``; the last answer."""
+    deadline = time.monotonic() + SHARE_PROPAGATION_TIMEOUT_S
+    while True:
+        answer = _netshare(uri, "read", name=name)
+        if answer.get("content") == expected or time.monotonic() >= deadline:
+            return answer
+        time.sleep(SHARE_PROPAGATION_POLL_S)
+
+
+def _plan_has_share(answer):
+    plan = (answer or {}).get("mount_plan") or {}
+    return bool(plan.get("present")) and NETSHARE_MOUNT in (plan.get("raw") or "")
+
+
+def probe_network_share():
+    label = NETSHARE_CHILD
+    ev = {"probe": "network_share", "child": label}
+    tokens = []
+    try:
+        groups = {"same": "g" + secrets.token_hex(4), "other": "g" + secrets.token_hex(4)}
+        uris = {}
+        for member, group in (("a", groups["same"]), ("b", groups["same"]), ("c", groups["other"])):
+            r = _gw_start(label, initial_mu=_netshare_member_mu(),
+                          envs={NETSHARE_GROUP_ENV: group.encode()})
+            tokens.append(r.instance.token)
+            uris[member] = r.uri
+        ev["groups"] = {"a": groups["same"], "b": groups["same"], "c": groups["other"]}
+        n1, n2 = secrets.token_hex(8), secrets.token_hex(8)
+        answers = {
+            "a_write": _netshare(uris["a"], "write", name="from_a", nonce=n1),
+        }
+        answers["b_read"] = _netshare_wait(uris["b"], "from_a", n1)
+        answers["b_write"] = _netshare(uris["b"], "write", name="from_b", nonce=n2)
+        answers["a_read"] = _netshare_wait(uris["a"], "from_b", n2)
+        answers["c_read"] = _netshare(uris["c"], "read", name="from_a")
+        ev["answers"] = answers
+        plans = {m: _plan_has_share(answers[k]) for m, k in
+                 (("a", "a_write"), ("b", "b_write"), ("c", "c_read"))}
+        ev["mount_plans"] = plans
+
+        if answers["c_read"].get("content") == n1:
+            ev["verdict"] = VERDICT_DISHONEST
+            ev["reason"] = ("a member of another group read what a member of the first group "
+                            "wrote: the node put two shares with different ids in one directory")
+        elif not all(plans.values()):
+            ev["verdict"] = VERDICT_INCONCLUSIVE
+            ev["reason"] = (f"a member launched with no mount plan for {NETSHARE_MOUNT} "
+                            f"({plans}): it was not asked to mount the share. {_PACKAGING_HINT}")
+        elif not (answers["a_write"].get("ok") and answers["b_write"].get("ok")):
+            ev["verdict"] = VERDICT_INCONCLUSIVE
+            ev["reason"] = (f"a member could not write to the share it mounts read-write: "
+                            f"{answers['a_write']}, {answers['b_write']}")
+        elif answers["b_read"].get("content") != n1 or answers["a_read"].get("content") != n2:
+            ev["verdict"] = VERDICT_DISHONEST
+            ev["reason"] = ("two members of one group did not see each other's files: the node "
+                            "gave one network share two directories (B saw "
+                            f"{answers['b_read'].get('content')!r} for {n1!r}, A saw "
+                            f"{answers['a_read'].get('content')!r} for {n2!r})")
+        else:
+            ev["verdict"] = VERDICT_PASS
+            ev["reason"] = ("two members of one group with no common exporter shared /netshare "
+                            "both ways, and a member of another group did not see it")
+        return ev
+    except ValueError as e:
+        ev["verdict"] = VERDICT_INCONCLUSIVE
+        ev["reason"] = f"a member's answer was not JSON: {clip(e)}"
+        return ev
+    except Exception as e:
+        return _infra(ev, "the network share", e)
+    finally:
+        for token in tokens:
+            _gw_stop(token, label)
+
+
+# ----------------------------------------------------------------------------
+# Probe — service tunnel: throughput and price
+# ----------------------------------------------------------------------------
+# Gateway.ServiceTunnel opens a byte stream to a declared slot of a local instance. The
+# node charges the instance tunnel_open_mu to open it, then net_mu_per_gib for the bytes
+# it relays in either direction, billed per costs.TUNNEL_CHARGE_INTERVAL_KB and the rest
+# when the tunnel closes (src/tunneling/rpc_tunnel.py). The charge is per volume, with no
+# scarcity surcharge: amount = net_mu_per_gib * bytes // GiB. Each charge is a "tunnel"
+# movement of the instance, with the bytes it billed in its detail.
+#
+# The probe reads TUNNEL_TEST_BYTES from tiny's /bytes/<n>, once directly (the control)
+# and once over a ServiceTunnel, and then reads tiny's statement: the bytes billed must
+# be the bytes relayed, and each charge at most the advertised rate (from /__config__).
+TUNNEL_CHILD = "tiny"
+TUNNEL_TEST_BYTES = int(os.environ.get("TUNNEL_TEST_BYTES", str(64 * 1024 * 1024)))
+TUNNEL_SETTLE_S = float(os.environ.get("TUNNEL_SETTLE_S", "15"))
+# Bytes billed beyond what was relayed that can still be framing, not an overcharge.
+TUNNEL_BILL_SLACK = 4096
+
+
+def _direct_download(uri, n):
+    t0 = time.monotonic()
+    with requests.get(f"http://{uri}/bytes/{n}", stream=True, timeout=300) as r:
+        got = sum(len(chunk) for chunk in r.iter_content(64 * 1024))
+    return got, time.monotonic() - t0
+
+
+def _tunnel_rows(token, relayed):
+    """The tunnel movements of the child, once the bill of the closed tunnel is in."""
+    deadline = time.monotonic() + TUNNEL_SETTLE_S
+    while True:
+        rows = [mv for mv in _child_rows(token) if mv.kind == "tunnel"]
+        billed = sum(int(gw.detail_of(mv).get("bytes", 0)) for mv in rows)
+        # The last part of a megabyte may cost 0 MU, and a charge of 0 writes no row.
+        if billed >= relayed - TUNNEL_BILL_SLACK or time.monotonic() >= deadline:
+            return rows
+        time.sleep(1)
+
+
+def _judge_tunnel_bill(rows, relayed, rates):
+    """(evidence, violations, notes) for the tunnel movements of the child."""
+    net_rate, open_rate = rates.get("net_mu_per_gib"), rates.get("tunnel_open_mu")
+    opens, traffic, violations, notes = [], [], [], []
+    for mv in rows:
+        detail = gw.detail_of(mv)
+        charged = -int(mv.amount.n)
+        if detail.get("open"):
+            opens.append(charged)
+            if open_rate is not None and charged > open_rate:
+                violations.append(f"the opening cost {charged} MU, the node advertises "
+                                  f"{open_rate} MU")
+            continue
+        n = int(detail.get("bytes", 0))
+        expected = net_rate * n // GIB if net_rate is not None else None
+        traffic.append({"bytes": n, "charged_mu": charged, "advertised_mu": expected})
+        if expected is not None and charged > expected:
+            violations.append(f"{n} bytes cost {charged} MU, the advertised rate gives {expected} MU")
+    billed = sum(t["bytes"] for t in traffic)
+    charged = sum(t["charged_mu"] for t in traffic)
+    if billed > relayed + TUNNEL_BILL_SLACK:
+        violations.append(f"{billed} bytes billed for {relayed} bytes relayed")
+    elif billed < relayed - TUNNEL_BILL_SLACK and net_rate:
+        notes.append(f"{billed} bytes billed for {relayed} relayed: the node charged less")
+    if net_rate is None or open_rate is None:
+        notes.append("the node's rates are not in /__config__: the prices were not compared")
+    evidence = {"open_charges_mu": opens, "traffic_rows": traffic, "billed_bytes": billed,
+                "relayed_bytes": relayed, "traffic_charged_mu": charged,
+                "advertised_net_mu_per_gib": net_rate, "advertised_tunnel_open_mu": open_rate,
+                "effective_mu_per_gib": round(charged * GIB / billed, 1) if billed else None}
+    return evidence, violations, notes
+
+
+def probe_tunnel():
+    label = TUNNEL_CHILD
+    n = TUNNEL_TEST_BYTES
+    ev = {"probe": "tunnel", "child": label, "bytes_asked": n}
+    token = None
+    try:
+        r = _gw_start(label)
+        token = r.instance.token
+        got, direct_s = _direct_download(r.uri, n)
+        ev["direct"] = {"bytes": got, "seconds": round(direct_s, 3),
+                        "mib_per_s": round(got / direct_s / 2 ** 20, 1) if direct_s else None}
+        t = gw.tunnel_http_get(node_url, token, CHILD_PORT, f"/bytes/{n}")
+        relayed = t.sent_bytes + t.received_bytes
+        ev["tunnel"] = {"status": t.status, "body_bytes": t.body_bytes, "sent_bytes": t.sent_bytes,
+                        "received_bytes": t.received_bytes, "seconds": round(t.seconds, 3),
+                        "mib_per_s": round(t.body_bytes / t.seconds / 2 ** 20, 1) if t.seconds else None}
+        if t.status != 200 or t.body_bytes != n:
+            ev["verdict"] = VERDICT_INFRA_ERROR
+            ev["reason"] = (f"the tunnel answered {t.status} with {t.body_bytes} of {n} bytes: the "
+                            "transfer did not complete, so there is no bill to check")
+            return ev
+        evidence, violations, notes = _judge_tunnel_bill(_tunnel_rows(token, relayed), relayed,
+                                                          NODE_RATES)
+        ev["bill"] = evidence
+        ev["notes"] = notes
+        if violations:
+            ev["verdict"] = VERDICT_DISHONEST
+            ev["reason"] = "the node charged the tunnel above what it advertises: " + "; ".join(violations)
+        elif not evidence["traffic_rows"] and NODE_RATES.get("net_mu_per_gib"):
+            ev["verdict"] = VERDICT_INCONCLUSIVE
+            ev["reason"] = (f"the node relayed {relayed} bytes and the statement of the child shows "
+                            f"no traffic charge after {TUNNEL_SETTLE_S}s")
+        elif NODE_RATES.get("net_mu_per_gib") is None:
+            ev["verdict"] = VERDICT_INCONCLUSIVE
+            ev["reason"] = "the tunnel worked, but the node's rates are not in /__config__ to compare"
+        else:
+            ev["verdict"] = VERDICT_PASS
+            ev["reason"] = (f"{n} bytes over the tunnel at {ev['tunnel']['mib_per_s']} MiB/s "
+                            f"(direct {ev['direct']['mib_per_s']} MiB/s); {evidence['billed_bytes']} "
+                            f"bytes billed for {relayed} relayed, at "
+                            f"{evidence['effective_mu_per_gib']} MU/GiB against the advertised "
+                            f"{evidence['advertised_net_mu_per_gib']}")
+        return ev
+    except Exception as e:
+        return _infra(ev, "the tunnel", e)
+    finally:
+        _gw_stop(token, label)
+
+
+# ----------------------------------------------------------------------------
 # Probe — dependency connectivity is not fraudulent (node Observe cross-check)
 # ----------------------------------------------------------------------------
 # A dishonest node could fabricate a dependency's network behaviour (claim it
@@ -2801,6 +3055,8 @@ PROBES = [
     ("idempotent_start", probe_idempotent_start),
     ("block_skip", probe_block_skip),
     ("env_vars", probe_env_vars),
+    ("network_share", probe_network_share),
+    ("tunnel", probe_tunnel),
     ("mu_accounting", probe_mu_accounting),
 ]
 
@@ -2814,7 +3070,9 @@ GATEWAY_DEPENDENT = ("build_funding", "dependency_identity", "network_isolation"
                      "shared_filesystem", "mu_accounting",
                      "idempotent_start",
                      "block_skip",
-                     "env_vars")
+                     "env_vars",
+                     "network_share",
+                     "tunnel")
 
 
 def _safe_probe(name, fn):
@@ -3054,6 +3312,8 @@ PROBE_ENDPOINTS = [
     ("probe_idempotent_start", "/probe/idempotent_start", probe_idempotent_start),
     ("probe_block_skip", "/probe/block_skip", probe_block_skip),
     ("probe_env_vars", "/probe/env_vars", probe_env_vars),
+    ("probe_network_share", "/probe/network_share", probe_network_share),
+    ("probe_tunnel", "/probe/tunnel", probe_tunnel),
     ("probe_mu_accounting", "/probe/mu_accounting", probe_mu_accounting),
 ]
 # Reads /proc and /__config__ only: it spins nothing and moves nothing, so it
@@ -3226,6 +3486,16 @@ MCP_TOOLS = [
           "declared variables, and a child started with one value given, one empty and one left "
           "out gets exactly those, in /__config__ and in its process environment, with no value "
           "for the one left out."
+          + _SPENDS, False),
+    _tool("probe_network_share",
+          "Check the network shares of nodo #268: two netshare children of one group (no common "
+          "exporter) must share /netshare both ways, and a member of another group must not see "
+          "it."
+          + _SPENDS, False),
+    _tool("probe_tunnel",
+          "Measure a ServiceTunnel to the tiny child: its throughput (against a direct download),"
+          " and the bill on the child's statement: the bytes billed must be the bytes relayed, "
+          "and each charge at most the advertised net_mu_per_gib and tunnel_open_mu."
           + _SPENDS, False),
 ]
 
