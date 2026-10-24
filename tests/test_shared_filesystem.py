@@ -493,7 +493,7 @@ class WiringTests(unittest.TestCase):
         self.assertEqual(app.child_iface("sharefs_denied").service_hash, "sharefsdeniedhash")
 
     def test_the_verifier_version_moved(self):
-        self.assertEqual(app.VERIFIER_VERSION, "1.4.0")
+        self.assertEqual(app.VERIFIER_VERSION, "1.5.0")
 
 
 class ManifestAgreementTests(unittest.TestCase):

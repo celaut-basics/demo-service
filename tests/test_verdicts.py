@@ -120,8 +120,8 @@ class BlindNodeTests(unittest.TestCase):
 
         With the node in the observed state (gateway unreachable) the battery
         must report 1 PASS + 6 INFRA_ERROR, attestable: false, content_hash: null --
-        8 INFRA_ERROR now that node_benchmark and shared_filesystem joined the
-        gateway-dependent probes.
+        one INFRA_ERROR for the preflight and one for each gateway-dependent probe,
+        which the newer benchmarks have joined.
         The guest's real /proc/meminfo figures are injected because the test host
         is not the microVM.
         """
@@ -137,8 +137,8 @@ class BlindNodeTests(unittest.TestCase):
             self.assertEqual(verdicts[name], app.VERDICT_INFRA_ERROR)
         self.assertEqual(rep["summary"]["pass"], 1)
         self.assertEqual(rep["summary"]["dishonest"], 0)
-        self.assertEqual(rep["summary"]["unobserved"], 8)
-        self.assertEqual(rep["summary"]["total"], 9)
+        self.assertEqual(rep["summary"]["unobserved"], 1 + len(app.GATEWAY_DEPENDENT))
+        self.assertEqual(rep["summary"]["total"], len(app.PROBES))
         self.assertFalse(rep["summary"]["attestable"])
         self.assertIsNone(rep["content_hash"]["value"])
 

@@ -38,7 +38,7 @@ blind; it must never accuse.
 | `PASS` | behaviour observed and correct | no | yes |
 | `DISHONEST` | behaviour observed and incorrect | **yes** | yes |
 | `INFRA_ERROR` | could not observe (node/network fault) | no | **no** |
-| `NOT_APPLICABLE` | probe does not apply to this environment | no | no |
+| `NOT_APPLICABLE` | probe does not apply to this environment | no | does not block it |
 | `INCONCLUSIVE` | ran, but the result is not decidable | no | **no** |
 
 `FAIL` no longer exists as a verdict: it was ambiguous at exactly the point where
@@ -53,6 +53,11 @@ Two consequences follow:
   verdict** (`summary.attestable`). Otherwise `content_hash.value` is `null` with
   a note explaining which probes were blind. There is no path from an incomplete
   observation to an on-chain opinion.
+- `NOT_APPLICABLE` is not a blind spot: the probe has nothing to observe on this
+  node (a node that runs for free has no build to fund, a node with no peer
+  delegates nothing). It is listed in `summary.not_applicable_probes`, it is in
+  the hashed payload with its verdict, and it does not block the hash. It is
+  never counted as a pass.
 
 ## The probes
 
@@ -67,6 +72,7 @@ Two consequences follow:
 | 6 | `node_benchmark` | `benchmark` | the node's per-core benchmark runs under its declared architecture and measures every primitive; the scores travel as evidence |
 | 7 | `shared_filesystem` | `sharefs`, `sharefs-denied` | the directory this service exports is shared with its child in both directions, a read-only mount refuses a write, and a child asking for a share its parent does not export is refused at launch |
 | 8 | `mu_accounting` | orchestrator (self) | the node spends MUs in line with the resources it provisions |
+| 10 | `build_funding` | `tiny` | nodo #563: a child funded below its build, or below one maintenance period after it, is refused with the node's message and charged nothing; a funded child starts, this account pays exactly its `initial_mu`, and the build is paid from the child's account |
 | 9 | `attestation` | orchestrator | per-probe verdict + `sha3_256` content hash, as JSON and HTML |
 
 ### Child readiness — the node's "ready" is not the service's "ready"
@@ -429,6 +435,46 @@ new, empty one, which is why every run writes its own end first.
 
 Exposed as `GET/POST /probe/shared_filesystem` and as the MCP tool
 `probe_shared_filesystem`.
+
+### The newer benchmarks (nodo dev after v3)
+
+The probes below test what nodo `dev` added after v3. node_controller carries an
+older `celaut.proto`, so these probes start their children and read the node with
+`nodo_gateway.py`, which loads nodo's own descriptor set (`nodo_protos/`, from nodo
+`97906c7c`) into a private descriptor pool. They follow the same rules as the
+other probes: each child is stopped in a `finally`, a start the node refuses for
+funds is recorded as a shortage, and only an observed violation accuses.
+
+#### Build funding (`tiny`, nodo #563)
+
+Since #563 the caller pays `Configuration.initial_mu` and nothing else. The node
+takes the build from it, and refuses a start when the build does not fit, or when
+what is left does not pay one maintenance period. A refused start charges nothing.
+
+The probe asks the node for its quote (`GetServiceEstimatedCost` asking for a
+balance of 1 MU answers the build plus 1 MU; the build is 0 for a built image) and
+starts `tiny` three times, each with its own `StartReference`:
+
+| start | `initial_mu` | an honest node |
+|---|---|---|
+| `below_build` (only when a build is owed) | build − 1 | refuses: `does not cover the build of the service, <build> MU` |
+| `below_one_period` | build + half a period | refuses: `leaves <x> MU after the build of <build> MU. One maintenance period costs <p> MU` |
+| `funded` | build + the child's usual runtime budget (at least 60 periods) | starts it |
+
+Then it reads this instance's statement and the funded child's statement, and
+finds each start by its reference (`detail.start_ref`).
+
+| observation | verdict |
+|---|---|
+| the refusals carry the #563 messages, no refused start left a charge, the funded start charged exactly its `initial_mu`, and the build is on the child's account | `PASS` |
+| a start charged more than its `initial_mu`, a refused start kept MU, or a build was charged to this account | `DISHONEST` |
+| an under-funded start was started, or refused with another message (nothing was charged beyond `initial_mu`) | `INCONCLUSIVE` |
+| the node quotes no build and no maintenance (it runs for free) | `NOT_APPLICABLE` |
+| the quote, the funded start or a statement failed | `INFRA_ERROR` |
+
+It runs first of the probes that start children: on a node that has not built
+`tiny` yet, the funded start is the one that pays the build, so both rules are
+exercised. On later runs the image is built and only the period rule applies.
 
 ### 4. Attestation report card
 

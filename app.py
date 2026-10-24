@@ -50,7 +50,7 @@ if False:  # development mode toggle (unchanged from the original demo)
     DIR = "."
     CONFIG_FILE = "__config__"
 
-VERIFIER_VERSION = "1.4.0"
+VERIFIER_VERSION = "1.5.0"
 
 # ---------------------------------------------------------------------------
 # Verdict taxonomy
@@ -68,6 +68,10 @@ VERDICT_INCONCLUSIVE = "INCONCLUSIVE"      # ran, undecidable
 
 # Only these two mean "we actually observed the node's behaviour".
 CONCLUSIVE_VERDICTS = (VERDICT_PASS, VERDICT_DISHONEST)
+# A probe that does not apply here (a node that runs for free has no build to fund; a
+# node with no peer delegates nothing) left nothing unobserved. It does not block the
+# attestation, and it is never counted as a pass.
+NEUTRAL_VERDICTS = (VERDICT_NOT_APPLICABLE,)
 # Only these may ever be published as an accusation.
 ACCUSING_VERDICTS = (VERDICT_DISHONEST,)
 
@@ -1809,6 +1813,264 @@ def probe_shared_filesystem():
 
 
 # ----------------------------------------------------------------------------
+# The newer benchmarks: children started over nodo_gateway
+# ----------------------------------------------------------------------------
+# node_controller starts a child with its own copy of an older celaut.proto. The
+# benchmarks below need what it cannot send -- an initial_mu per start, a
+# StartReference, env vars per instance, the block skip -- or read what it cannot
+# read (quotes, statements, tunnels), so they start their children with nodo_gateway.
+# They keep the rules of the other probes: every child is stopped in a `finally`, a
+# start the node refuses for want of funds is recorded in FUNDING_FAILURES, and only an
+# observed violation accuses.
+CHILD_PORT = 3030  # every demo child serves http on 3030 (its service.json)
+
+
+def _instance_uri(instance, port=CHILD_PORT):
+    """host:port of a slot of a ServiceInstance, the declared port first."""
+    slots = list(instance.instance.uri_slot)
+    for slot in sorted(slots, key=lambda s: s.internal_port != port):
+        for uri in slot.uri:
+            return f"{uri.ip}:{uri.port}"
+    return None
+
+
+def _child_budget(label):
+    with _funding_lock:
+        return FUNDING["child_initial_mu"].get(label)
+
+
+def _gw_start(label, *, initial_mu="budget", envs=None, start_ref=None, send_service=True,
+              block_skip=True, wait_ready=True, count_funding=True, **kwargs):
+    """Start one child over nodo_gateway; the gw.StartResult, with ``uri``.
+
+    ``initial_mu`` "budget" is what the funding gate sized the child at (its build and
+    its runtime), and None leaves it to the node. A refusal for funds is recorded in
+    FUNDING_FAILURES unless ``count_funding`` is off: build_funding asks for refusals.
+    """
+    if initial_mu == "budget":
+        initial_mu = _child_budget(label)
+    config = gw.configuration(initial_mu=initial_mu, envs=envs) \
+        if (initial_mu is not None or envs) else None
+    try:
+        result = gw.start_service(node_url, packed(label), config=config, start_ref=start_ref,
+                                  send_service=send_service, block_skip=block_skip, **kwargs)
+    except gw.GatewayError as e:
+        if count_funding and _INSUFFICIENT_FUNDS_RE.search(str(e)):
+            learn_from_refusal(label, str(e))
+            FUNDING_FAILURES.append(label)
+        raise
+    _mark_built(label)
+    result.uri = _instance_uri(result.instance)
+    logging.info("Started %s at %s (%d request bytes)", label, result.uri, result.request_bytes)
+    if wait_ready and result.uri:
+        _wait_until_ready(result.uri, label)
+    return result
+
+
+def _gw_stop(token, label):
+    """Stop a child started over nodo_gateway; its refund, or None when it failed."""
+    if not token:
+        return None
+    try:
+        refund = gw.stop_service(node_url, token)
+        logging.info("Stopped %s (refund %s MU)", label, refund)
+        return refund
+    except Exception as e:
+        # A child we could not stop is a leak to report, never a verdict.
+        logging.warning("Could not stop %s: %s", label, e)
+        return None
+
+
+def _own_head():
+    """The seq of the last movement of this instance's account (a statement with no row)."""
+    return int(gw.balance_statement(node_url, from_seq=0).head_seq)
+
+
+def _own_rows_after(seq):
+    """Every movement of this instance's account after ``seq``, from signed statements."""
+    return [mv for page in gw.full_statement(node_url, from_seq=seq + 1) for mv in page.movements]
+
+
+def _child_rows(token):
+    return [mv for page in gw.full_statement(node_url, token=token, from_seq=1)
+            for mv in page.movements]
+
+
+def _rows_for_ref(rows, ref):
+    """The child_start movements that carry a StartReference, in hex (#578)."""
+    return [mv for mv in rows
+            if mv.kind == "child_start" and gw.detail_of(mv).get("start_ref") == ref.hex()]
+
+
+def _movement_view(mv):
+    return {"seq": int(mv.seq), "kind": mv.kind, "amount": int(mv.amount.n),
+            "balance_after": int(mv.balance_after.n), "detail": gw.detail_of(mv)}
+
+
+def _infra(ev, what, e):
+    """INFRA_ERROR for an exception: an RPC that failed observed nothing."""
+    ev["verdict"] = VERDICT_INFRA_ERROR
+    if isinstance(e, gw.GatewayError):
+        ev["grpc_code"] = e.code
+        ev["node_detail"] = e.details
+    ev["reason"] = f"could not observe {what}: {type(e).__name__}: {clip(e)}. No claim is made."
+    if FUNDING_FAILURES:
+        ev["fault"] = "insufficient_funds"
+    return ev
+
+
+# ----------------------------------------------------------------------------
+# Probe — build funding (nodo #563)
+# ----------------------------------------------------------------------------
+# Since nodo #563 the caller pays Configuration.initial_mu and nothing else. The node
+# takes the build of the service out of it, and refuses a start when the build does not
+# fit, or when what is left does not pay one maintenance period. A refused start
+# charges nothing (src/utils/cost_functions/start_funding.py). So:
+#
+#   below the build       -> refused, "does not cover the build of the service, <b> MU"
+#   below one period      -> refused, "leaves <x> MU after the build of <b> MU. One
+#                            maintenance period costs <p> MU."
+#   enough                -> started; this account pays exactly initial_mu, and the build
+#                            shows on the child's account, never on this one.
+#
+# The build is the node's own quote (quote_build: the cost of a quote that asks for a
+# balance of 1 MU, less that MU), and it is 0 once the node has built the image: then
+# only the second rule can be exercised. Each start carries a StartReference, so its child_start (if
+# any) is found in this account's statement by its reference, not by amount or time.
+BUILD_FUNDING_CHILD = "tiny"
+# The funded start: the build plus the runtime the child is funded with anyway, and never
+# less than this many periods. A few periods are a balance that runs out in seconds
+# (MANAGER_ITERATION_TIME is 10 s on a default node), before the child has even booted.
+BUILD_FUNDING_MIN_PERIODS = 60
+_BUILD_RULE_RE = re.compile(r"does not cover the build of the service, (\d+) MU")
+_PERIOD_RULE_RE = re.compile(r"leaves (-?\d+) MU after the build of (\d+) MU\. "
+                             r"One maintenance period costs (\d+) MU")
+
+
+def _judge_build_funding(ev, rows, build, period):
+    """The verdict of build_funding, from its attempts and this account's movements."""
+    ev["build_rows_on_this_account"] = [_movement_view(mv) for mv in rows if mv.kind == "build"]
+    violations, unexpected = [], []
+    for attempt in ev["attempts"]:
+        starts = _rows_for_ref(rows, bytes.fromhex(attempt["start_ref"]))
+        attempt["child_start_rows"] = [_movement_view(mv) for mv in starts]
+        start_seqs = {str(int(mv.seq)) for mv in starts}
+        refunds = [mv for mv in rows if mv.kind == "refund"
+                   and str(gw.detail_of(mv).get("refunds_seq")) in start_seqs]
+        net = sum(int(mv.amount.n) for mv in starts + refunds)
+        attempt["net_charge_mu"] = -net
+        if -net > attempt["initial_mu"]:
+            violations.append(f"{attempt['attempt']}: charged {-net} MU for an initial_mu of "
+                              f"{attempt['initial_mu']} MU")
+        if attempt["expect"] == "start":
+            amounts = [int(mv.amount.n) for mv in starts]
+            if amounts != [-attempt["initial_mu"]]:
+                violations.append(f"funded: the child_start of its reference is {amounts}, "
+                                  f"not [-{attempt['initial_mu']}]")
+            child_rows = attempt.get("child_rows") or []
+            opened = [r["amount"] for r in child_rows if r["kind"] == "start"]
+            attempt["child_build_mu"] = -sum(r["amount"] for r in child_rows if r["kind"] == "build")
+            if opened and opened[0] != attempt["initial_mu"]:
+                violations.append(f"funded: the child's account opened with {opened[0]} MU, not "
+                                  f"the initial_mu {attempt['initial_mu']} MU")
+            if attempt["child_build_mu"] > build:
+                violations.append(f"funded: the child paid a build of {attempt['child_build_mu']} "
+                                  f"MU, above the quote of {build} MU")
+            continue
+        if attempt["outcome"] == "started":
+            unexpected.append(f"{attempt['attempt']}: the node started a child with an initial_mu "
+                              f"of {attempt['initial_mu']} MU (build {build} MU, one period "
+                              f"{period} MU) instead of refusing it")
+            continue
+        if net != 0:
+            violations.append(f"{attempt['attempt']}: the node refused the start and kept "
+                              f"{-net} MU of it")
+        text = attempt.get("node_detail") or ""
+        if attempt["expect"] == "build":
+            m = _BUILD_RULE_RE.search(text)
+            attempt["named_build_mu"] = int(m.group(1)) if m else None
+            if not m:
+                unexpected.append(f"below_build was refused, but not by the build rule: {text}")
+        else:
+            m = _PERIOD_RULE_RE.search(text)
+            if m:
+                attempt["named_build_mu"] = int(m.group(2))
+                attempt["named_period_mu"] = int(m.group(3))
+            else:
+                unexpected.append(f"below_one_period was refused, but not by the period rule: {text}")
+    if ev["build_rows_on_this_account"]:
+        violations.append(f"a build was charged to this account, the caller's: "
+                          f"{ev['build_rows_on_this_account']}")
+
+    if violations:
+        ev["verdict"] = VERDICT_DISHONEST
+        ev["reason"] = "the node broke the start-funding rules of #563: " + "; ".join(violations)
+    elif unexpected:
+        ev["verdict"] = VERDICT_INCONCLUSIVE
+        ev["reason"] = ("the node did not refuse an under-funded start the way #563 says, but it "
+                        "charged nothing beyond initial_mu: " + "; ".join(unexpected))
+    else:
+        rules = [a["attempt"] for a in ev["attempts"] if a["expect"] != "start"]
+        ev["verdict"] = VERDICT_PASS
+        ev["reason"] = (f"refused {rules} with the #563 messages and charged nothing for them; "
+                        f"the funded start (build {build} MU) charged this account exactly its "
+                        f"initial_mu, and the build was paid from the child's account")
+    return ev
+
+
+def probe_build_funding():
+    label = BUILD_FUNDING_CHILD
+    ev = {"probe": "build_funding", "child": label, "attempts": []}
+    tokens = []
+    try:
+        build, quote = quote_build(label)
+        period = gw.mu(quote.max_maintenance_cost)
+        ev["quote"] = {"build_mu": build, "max_maintenance_cost_mu": period,
+                       "init_maintenance_cost_mu": gw.mu(quote.init_maintenance_cost),
+                       "maintenance_seconds_loop": int(quote.maintenance_seconds_loop)}
+        if build == 0 and period == 0:
+            ev["verdict"] = VERDICT_NOT_APPLICABLE
+            ev["reason"] = ("the node quotes no build and no maintenance for the child: it runs "
+                            "for free (free tier), so a start cannot be under-funded")
+            return ev
+        head = _own_head()
+
+        plan = []
+        if build > 0:
+            plan.append(("below_build", build - 1, "build"))
+        plan.append(("below_one_period", build + max(1, period // 2), "period"))
+        rate = FUNDING["self_rate_mu_per_s"]
+        runtime = child_runtime_mu(label, rate) if rate is not None else 0
+        plan.append(("funded", build + max(runtime, BUILD_FUNDING_MIN_PERIODS * max(period, 1)), None))
+        for name, amount, rule in plan:
+            ref = secrets.token_bytes(16)
+            attempt = {"attempt": name, "initial_mu": amount, "expect": rule or "start",
+                       "start_ref": ref.hex()}
+            ev["attempts"].append(attempt)
+            try:
+                r = _gw_start(label, initial_mu=amount, start_ref=ref,
+                              count_funding=(rule is None), wait_ready=(rule is None))
+            except gw.GatewayError as e:
+                attempt["outcome"] = "refused"
+                attempt["grpc_code"] = e.code
+                attempt["node_detail"] = clip(e.details or str(e), 500)
+                if rule is None:
+                    raise
+                continue
+            tokens.append(r.instance.token)
+            attempt["outcome"] = "started"
+            if rule is None:
+                attempt["child_balance_mu"] = gw.metrics_balance(node_url, r.instance.token)
+                attempt["child_rows"] = [_movement_view(mv) for mv in _child_rows(r.instance.token)]
+        return _judge_build_funding(ev, _own_rows_after(head), build, period)
+    except Exception as e:
+        return _infra(ev, "the start-funding rules", e)
+    finally:
+        for token in tokens:
+            _gw_stop(token, label)
+
+
+# ----------------------------------------------------------------------------
 # Probe — dependency connectivity is not fraudulent (node Observe cross-check)
 # ----------------------------------------------------------------------------
 # A dishonest node could fabricate a dependency's network behaviour (claim it
@@ -2191,6 +2453,9 @@ def probe_gateway_reachability():
 PROBES = [
     ("gateway_reachability", probe_gateway_reachability),
     ("resource_provisioning", probe_resource_provisioning),
+    # First of the probes that start children: on a node that has not built `tiny`
+    # yet, this is the start that pays its build, so both #563 rules are exercised.
+    ("build_funding", probe_build_funding),
     ("dependency_identity", probe_dependency_identity),
     ("network_isolation", probe_network_isolation),
     ("dependency_observe", probe_dependency_observe),
@@ -2205,7 +2470,7 @@ PROBES = [
 # report says "could not verify" once rather than six times in six dialects.
 # resource_provisioning is deliberately NOT here: it only reads /proc and
 # /__config__, so it stays valid (and can legitimately PASS) with the gateway down.
-GATEWAY_DEPENDENT = ("dependency_identity", "network_isolation",
+GATEWAY_DEPENDENT = ("build_funding", "dependency_identity", "network_isolation",
                      "dependency_observe", "memory_ceiling", "node_benchmark",
                      "shared_filesystem", "mu_accounting")
 
@@ -2267,12 +2532,17 @@ def _run_probe_suite():
 
 
 def summarize_suite(results):
-    unobserved = [p for p in results.values() if p.get("verdict") not in CONCLUSIVE_VERDICTS]
+    unobserved = [p for p in results.values()
+                  if p.get("verdict") not in CONCLUSIVE_VERDICTS + NEUTRAL_VERDICTS]
+    not_applicable = [p.get("probe") for p in results.values()
+                      if p.get("verdict") in NEUTRAL_VERDICTS]
     summary = {
         "pass": sum(1 for p in results.values() if p.get("verdict") == VERDICT_PASS),
         "dishonest": sum(1 for p in results.values() if p.get("verdict") in ACCUSING_VERDICTS),
         "unobserved": len(unobserved),
         "unobserved_probes": [p.get("probe") for p in unobserved],
+        "not_applicable": len(not_applicable),
+        "not_applicable_probes": not_applicable,
         "total": len(results),
     }
     summary["observation_complete"] = not unobserved
@@ -2345,7 +2615,9 @@ def build_attestation():
     probes = list(_run_probe_suite().values())
     passes = [p for p in probes if p.get("verdict") == VERDICT_PASS]
     dishonest = [p for p in probes if p.get("verdict") in ACCUSING_VERDICTS]
-    unobserved = [p for p in probes if p.get("verdict") not in CONCLUSIVE_VERDICTS]
+    unobserved = [p for p in probes
+                  if p.get("verdict") not in CONCLUSIVE_VERDICTS + NEUTRAL_VERDICTS]
+    not_applicable = [p.get("probe") for p in probes if p.get("verdict") in NEUTRAL_VERDICTS]
 
     # An attestation is only mintable when EVERY probe reached a conclusive
     # verdict. Otherwise we did not measure the node — we measured our own
@@ -2362,6 +2634,8 @@ def build_attestation():
         "dishonest": len(dishonest),
         "unobserved": len(unobserved),
         "unobserved_probes": [p.get("probe") for p in unobserved],
+        "not_applicable": len(not_applicable),
+        "not_applicable_probes": not_applicable,
         "total": len(probes),
     }
 
@@ -2428,6 +2702,7 @@ def attestation_json_run():
 PROBE_ENDPOINTS = [
     ("probe_gateway_reachability", "/probe/gateway", probe_gateway_reachability),
     ("probe_resource_provisioning", "/probe/resources", probe_resource_provisioning),
+    ("probe_build_funding", "/probe/build_funding", probe_build_funding),
     ("probe_dependency_identity", "/probe/dependency_identity", probe_dependency_identity),
     ("probe_network_isolation", "/probe/network", probe_network_isolation),
     ("probe_dependency_observe", "/probe/dependency_observe", probe_dependency_observe),
@@ -2557,6 +2832,11 @@ MCP_TOOLS = [
           True, {"type": "object", "properties": {"refresh": {
               "type": "boolean",
               "description": "settle the account for a live balance (one MODIFY_RESOURCES charge)"}}}),
+    _tool("probe_build_funding",
+          "Check the start-funding rules of nodo #563: a child funded below its build, or below "
+          "one maintenance period after it, must be refused with the node's message and charge "
+          "nothing; a child funded with enough must start, charge this account exactly its "
+          "initial_mu, and pay the build from its own account." + _SPENDS, False),
     _tool("probe_dependency_identity",
           "Execute each dependency and assert the requested dependency is the one that actually ran."
           + _SPENDS, False),
