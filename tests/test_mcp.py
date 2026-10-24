@@ -238,7 +238,7 @@ class FundingOverMcpTests(unittest.TestCase):
     def test_the_startup_suite_waits_for_funds_and_says_so(self):
         seen = []
 
-        def gate(pending_builds=0, timeout=None, on_wait=None):
+        def gate(timeout=None, on_wait=None, requote=False):
             on_wait({"funded": False, "missing_mu": 5})
             seen.append(call("get_startup_tests")["structuredContent"]["status"])
             return True, {"funded": True}
@@ -249,11 +249,11 @@ class FundingOverMcpTests(unittest.TestCase):
             self.assertTrue(wait_for(lambda: app.STARTUP_TESTS["status"] == "done"))
         self.assertEqual(seen, ["waiting_for_funds"])
 
-    def test_a_starved_suite_waits_for_the_builds_and_runs_again(self):
+    def test_a_starved_suite_quotes_the_builds_again_and_runs_again(self):
         gates = []
 
-        def gate(pending_builds=0, timeout=None, on_wait=None):
-            gates.append(pending_builds)
+        def gate(timeout=None, on_wait=None, requote=False):
+            gates.append(requote)
             return True, {"funded": True}
 
         runs = iter([["heavy"], []])
@@ -268,9 +268,8 @@ class FundingOverMcpTests(unittest.TestCase):
             app.start_startup_tests_async()
             self.assertTrue(wait_for(lambda: app.STARTUP_TESTS["status"] in ("done", "error")
                                      and not app._suite_lock.locked()))
-        self.assertEqual(len(gates), 2)
-        self.assertEqual(gates[0], 0)
-        self.assertGreaterEqual(gates[1], 1, "the second wait must include the first builds")
+        self.assertEqual(gates, [False, True],
+                         "the second wait must ask the node for the builds again")
         self.assertEqual(app.STARTUP_TESTS["starved_children"], [])
 
     def test_service_status_matches_the_route_and_reports_funding(self):

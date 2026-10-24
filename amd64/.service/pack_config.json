@@ -13,6 +13,8 @@
   },
   "dependencies_env": true,
   "include": [
-    "app.py"
+    "app.py",
+    "nodo_gateway.py",
+    "nodo_protos"
   ]
 }

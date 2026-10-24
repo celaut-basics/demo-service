@@ -741,25 +741,80 @@ class FundingTests(unittest.TestCase):
         del app.FUNDING_FAILURES[:]
 
     def tearDown(self):
-        app.FUNDING.update(self_rate_mu_per_s=None, child_initial_mu={}, balance_mu=None)
+        app.FUNDING.update(self_rate_mu_per_s=None, child_initial_mu={}, balance_mu=None,
+                           build_quote_mu={}, built_children=[], build_learned_mu=None)
+
+    def _all_built(self):
+        app.FUNDING["build_quote_mu"] = {label: 0 for label in app.CHILD_DECLARED_RESOURCES}
 
     def test_children_are_funded_for_minutes_not_days(self):
         # A default node charges a 2 GB / 8 GB instance ~3950 MU/s (14.2e6 per hour).
-        budgets = {label: app.child_initial_mu(label, 3950.0) for label in app.CHILD_DECLARED_RESOURCES}
+        budgets = {label: app.child_runtime_mu(label, 3950.0) for label in app.CHILD_DECLARED_RESOURCES}
         self.assertLess(max(budgets.values()), 14_000_000 // 2,
                         "the largest child must fit well inside one hour of this instance")
         self.assertEqual(max(budgets, key=budgets.get), "benchmark")
         self.assertGreater(budgets["benchmark"], budgets["tiny"])
 
     def test_one_suite_fits_in_the_funding_the_node_gives_a_new_instance(self):
+        # On a node that has built the children before (the quote says 0 for each).
         rate = 3950.0
         app.FUNDING["child_initial_mu"] = {}
+        self._all_built()
         need = app.funding_requirement(rate)
         self.assertLess(need["required_mu"], int(rate * 3600) * 0.9)
+        self.assertEqual(need["builds_owed_mu"], 0)
 
-    def test_first_builds_are_charged_when_the_node_refused_for_funds(self):
-        need = app.funding_requirement(3950.0, pending_builds=4)
-        self.assertEqual(need["pending_builds_mu"], 4 * app.BUILD_MU_ESTIMATE)
+    def test_a_child_is_funded_with_the_build_the_node_quoted(self):
+        # nodo #563: the build comes out of the child's initial_mu, so a child funded
+        # for its runtime alone is refused ("does not cover the build").
+        self._all_built()
+        app.FUNDING["build_quote_mu"]["tiny"] = 10_000_000
+        self.assertEqual(app.child_initial_mu("tiny", 3950.0),
+                         10_000_000 + app.child_runtime_mu("tiny", 3950.0))
+        self.assertEqual(app.child_initial_mu("heavy", 3950.0), app.child_runtime_mu("heavy", 3950.0))
+
+    def test_without_a_quote_the_build_is_owed_until_the_child_launched(self):
+        self.assertEqual(app.child_build_mu("tiny"), app.build_mu_estimate())
+        app.FUNDING["built_children"] = ["tiny"]
+        self.assertEqual(app.child_build_mu("tiny"), 0)
+
+    def test_the_builds_still_owed_are_part_of_what_a_suite_needs(self):
+        rate = 3950.0
+        app.FUNDING["build_quote_mu"] = {label: 10_000_000 for label in app.CHILD_DECLARED_RESOURCES}
+        need = app.funding_requirement(rate)
+        n = len(app.CHILD_DECLARED_RESOURCES)
+        # The largest deposit holds one build; every other child owes its own.
+        self.assertEqual(need["builds_owed_mu"], (n - 1) * 10_000_000)
+        self.assertEqual(need["largest_child_deposit_mu"],
+                         10_000_000 + app.child_runtime_mu("benchmark", rate))
+        self.assertEqual(need["builds_owed"], sorted(app.CHILD_DECLARED_RESOURCES))
+
+    def test_a_launch_drops_the_build_from_the_next_start(self):
+        app.FUNDING.update(self_rate_mu_per_s=3950.0)
+        app.configure_child_budgets(3950.0)
+        self.assertEqual(app.FUNDING["child_initial_mu"]["tiny"], app.child_initial_mu("tiny", 3950.0))
+        self.assertGreater(app.FUNDING["child_initial_mu"]["tiny"], app.child_runtime_mu("tiny", 3950.0))
+        app._spin_child(app.tiny_service, "tiny")
+        self.assertEqual(app.FUNDING["child_initial_mu"]["tiny"], app.child_runtime_mu("tiny", 3950.0))
+        self.assertIn("tiny", app.FUNDING["built_children"])
+
+    def test_a_build_refusal_is_insufficient_funds_and_names_the_build(self):
+        # Verbatim shape of nodo #563's refusal (src/utils/cost_functions/start_funding.py).
+        exc = RuntimeError(
+            'details = "Exception iterating responses: Unable to launch service 5de95f70. '
+            'Attempt details: local: StartAmountTooSmall: initial_mu 2400000 MU does not '
+            'cover the build of the service, 12000000 MU."')
+        err = app.ChildLaunchError("heavy(64MB)", exc)
+        self.assertTrue(err.insufficient_funds)
+        self.assertIn("INSUFFICIENT FUNDS", str(err))
+        self.assertEqual(app.FUNDING["build_quote_mu"]["heavy"], 12_000_000)
+        self.assertEqual(app.child_build_mu("heavy"), 12_000_000)
+
+    def test_too_little_after_the_build_is_insufficient_funds_too(self):
+        exc = RuntimeError(
+            'details = "initial_mu 10100000 MU leaves 100000 MU after the build of 10000000 MU. '
+            'One maintenance period costs 250000 MU. The least initial_mu is 10250000 MU."')
+        self.assertTrue(app.ChildLaunchError("tiny", exc).insufficient_funds)
 
     def test_a_short_balance_reports_what_is_missing_and_how_to_top_up(self):
         required = app.funding_requirement(3950.0)

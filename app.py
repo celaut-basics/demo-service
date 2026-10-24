@@ -40,6 +40,8 @@ from node_controller.controller.controller import Controller
 from node_controller.gateway.protos import celaut_pb2
 from node_controller.gateway.utils import to_amount, from_amount
 
+import nodo_gateway as gw
+
 
 DIR = "service"
 CONFIG_FILE = "/__config__"
@@ -287,12 +289,45 @@ _CHILD_HASHES = {"tiny": TINY_SERVICE, "heavy": HEAVY_SERVICE,
                  "ping": PING_SERVICE, "benchmark": BENCHMARK_SERVICE,
                  "sharefs": SHAREFS_SERVICE, "sharefs_denied": SHAREFS_DENIED_SERVICE}
 
+# Where the packer put the children (pack_config.json): the Service of each one, and
+# its Metadata, by service id.
+SERVICES_DIR = os.path.join(DIR, "__services__")
+METADATA_DIR = os.path.join(DIR, "__metadata__")
+
+
+def packed(label):
+    """A child as this service holds it, for the calls node_controller cannot make."""
+    return gw.PackedService(_CHILD_HASHES[label], SERVICES_DIR, METADATA_DIR)
+
+
+def _read_node_rates():
+    """The node's rates (build_mu, net_mu_per_gib, ...) from /__config__, or {}.
+
+    The node writes them in the gateway slot of the configuration file of every
+    instance (celaut.proto, ConfigurationFile.gateway). Reading them costs no RPC.
+    """
+    try:
+        return gw.rates_from_config(CONFIG_FILE)
+    except Exception as e:
+        logging.warning("Could not read the node's rates from %s: %s", CONFIG_FILE, e)
+        return {}
+
+
+NODE_RATES = _read_node_rates()
+logging.info("Node rates: %s", NODE_RATES)
+
 FUNDING = {
     "balance_mu": None,          # last balance the node reported
     "sampled_at": None,
     "self_rate_mu_per_s": None,  # measured; None until two samples exist
     "child_initial_mu": {},      # label -> what each child is funded with
     "built_children": [],        # children this instance has seen launch
+    # label -> the build that the node quoted for it (GetServiceEstimatedCost): 0 once
+    # the node has built it. A label that is absent has no quote, and is funded with
+    # the build estimate until this instance has seen it launch.
+    "build_quote_mu": {},
+    # The build that the node named in a refusal, when it is above the estimate.
+    "build_learned_mu": None,
 }
 _funding_lock = threading.Lock()
 
@@ -303,12 +338,88 @@ def price_weight(mem_bytes, disk_bytes, vcpus=1.0):
             + disk_bytes / GIB * PRICE_WEIGHT_DISK_GIB)
 
 
-def child_initial_mu(label, self_rate):
-    """MU to fund one child with: CHILD_FUNDED_SECONDS of its own resources."""
+def build_mu_estimate():
+    """What the node charges for one build: what it named in a refusal, else its rate
+    in /__config__, else BUILD_MU_ESTIMATE."""
+    learned = FUNDING.get("build_learned_mu")
+    rate = NODE_RATES.get("build_mu")
+    return max(learned or 0, rate if rate is not None else BUILD_MU_ESTIMATE)
+
+
+def child_build_mu(label):
+    """The build that a start of this child takes out of its initial_mu (#563).
+
+    Since nodo #563 the node takes the build from the initial_mu of the child, not
+    from the balance of the parent, and refuses a start whose initial_mu does not
+    cover it. The quote of the node is exact. Without one, the build is owed until
+    this instance has seen the child launch: after that the node has a built image.
+    """
+    with _funding_lock:
+        quoted = FUNDING["build_quote_mu"].get(label)
+        built = label in FUNDING["built_children"]
+    if quoted is not None:
+        return quoted
+    return 0 if built else build_mu_estimate()
+
+
+def child_runtime_mu(label, self_rate):
+    """MU of runtime to fund one child with: CHILD_FUNDED_SECONDS of its own resources."""
     mem, disk = CHILD_DECLARED_RESOURCES[label]
     self_weight = price_weight(mem_limit or SELF_DECLARED_MEM_BYTES, SELF_DECLARED_DISK_BYTES)
     child_rate = self_rate * price_weight(mem, disk) / self_weight
     return max(CHILD_MIN_INITIAL_MU, int(child_rate * CHILD_FUNDED_SECONDS * CHILD_BUDGET_MARGIN))
+
+
+def child_initial_mu(label, self_rate):
+    """MU to fund one child with: its build, if one is owed, and its runtime."""
+    return child_build_mu(label) + child_runtime_mu(label, self_rate)
+
+
+# The balance a build quote asks for. The cost that GetServiceEstimatedCost answers is
+# the least initial_mu: the build plus the balance asked for (#563). A request with no
+# initial_mu gets the node's default balance filled in (estimated_cost_iterable.py), so
+# the quote asks for 1 MU, and the build is the cost less that.
+BUILD_QUOTE_BALANCE_MU = 1
+
+
+def quote_build(label):
+    """(build in MU, EstimatedCost) of one child, as the node quotes it now."""
+    quote = gw.estimated_cost(node_url, packed(label),
+                              config=gw.configuration(initial_mu=BUILD_QUOTE_BALANCE_MU))
+    return max(0, gw.mu(quote.cost) - BUILD_QUOTE_BALANCE_MU), quote
+
+
+def quote_child_builds():
+    """Ask the node what the build of each child costs (GetServiceEstimatedCost).
+
+    0 for an image the node has built. A child the node does not hold yet goes with
+    the request, with the block skip on, and the node keeps it, so the start that
+    follows does not send it again. A failed quote leaves that child on the estimate.
+    """
+    quotes = {}
+    for label in CHILD_DECLARED_RESOURCES:
+        try:
+            quotes[label] = quote_build(label)[0]
+        except Exception as e:
+            logging.warning("No build quote for %s: %s", label, e)
+    with _funding_lock:
+        FUNDING["build_quote_mu"].update(quotes)
+    return quotes
+
+
+def _mark_built(label):
+    """A child launched here: the node has its image, and the next start owes no build."""
+    base = label.split("(", 1)[0]
+    with _funding_lock:
+        if base not in CHILD_DECLARED_RESOURCES or base in FUNDING["built_children"]:
+            return
+        FUNDING["built_children"].append(base)
+        FUNDING["build_quote_mu"][base] = 0
+        rate = FUNDING["self_rate_mu_per_s"]
+        refund_build = bool(FUNDING["child_initial_mu"]) and rate is not None
+    if refund_build:
+        # Fund the next start of this child without the build.
+        _register_child_budget(base, child_initial_mu(base, rate))
 
 
 # ----------------------------------------------------------------------------
@@ -432,16 +543,32 @@ sharefs_service = _add_child("sharefs")
 sharefs_denied_service = _add_child("sharefs_denied", CHILD_MIN_INITIAL_MU)
 
 
-def configure_child_budgets(self_rate):
-    """Re-register every child funded for CHILD_FUNDED_SECONDS at this rate."""
+def _register_child_budget(label, initial_mu):
+    """Re-register one child funded with initial_mu (node_controller keeps the config)."""
     global tiny_service, heavy_service, ping_service, benchmark_service, sharefs_service
+    iface = _add_child(label, initial_mu)
+    if label == "tiny":
+        tiny_service = iface
+    elif label == "heavy":
+        heavy_service = iface
+    elif label == "ping":
+        ping_service = iface
+    elif label == "benchmark":
+        benchmark_service = iface
+    elif label == "sharefs":
+        sharefs_service = iface
+    with _funding_lock:
+        FUNDING["child_initial_mu"] = dict(FUNDING["child_initial_mu"], **{label: initial_mu})
+    return iface
+
+
+def configure_child_budgets(self_rate):
+    """Re-register every child funded for CHILD_FUNDED_SECONDS at this rate, plus its build."""
     budgets = {label: child_initial_mu(label, self_rate) for label in CHILD_DECLARED_RESOURCES}
-    tiny_service = _add_child("tiny", budgets["tiny"])
-    heavy_service = _add_child("heavy", budgets["heavy"])
-    ping_service = _add_child("ping", budgets["ping"])
-    benchmark_service = _add_child("benchmark", budgets["benchmark"])
-    sharefs_service = _add_child("sharefs", budgets["sharefs"])
-    FUNDING["child_initial_mu"] = budgets
+    for label, initial_mu in budgets.items():
+        _register_child_budget(label, initial_mu)
+    with _funding_lock:
+        FUNDING["child_initial_mu"] = dict(budgets)
     logging.info("Child budgets at %.1f MU/s: %s", self_rate, budgets)
     return budgets
 
@@ -483,19 +610,28 @@ def measure_self_rate():
     return rate
 
 
-def funding_requirement(self_rate, pending_builds=0):
-    """MU this instance needs on hand before a suite may start."""
+def funding_requirement(self_rate):
+    """MU this instance needs on hand before a suite may start.
+
+    Each child is funded with its build and its runtime (#563). The runtime comes back
+    when the child stops; the build does not. So the balance must hold the largest
+    deposit at once, plus the builds of the other children that the node has not
+    built yet.
+    """
     budgets = FUNDING["child_initial_mu"] or {
         label: child_initial_mu(label, self_rate) for label in CHILD_DECLARED_RESOURCES}
+    builds = {label: child_build_mu(label) for label in budgets}
+    largest = max(budgets, key=lambda label: budgets[label])
     parts = {
         # Children run one at a time and are refunded on stop, so only the
         # largest deposit is ever held at once.
-        "largest_child_deposit_mu": max(budgets.values()),
+        "largest_child_deposit_mu": budgets[largest],
+        "builds_owed_mu": sum(b for label, b in builds.items() if label != largest),
         "suite_upkeep_mu": int(self_rate * SUITE_EXPECTED_SECONDS),
         "reserve_after_suite_mu": int(self_rate * MIN_RESERVE_SECONDS),
-        "pending_builds_mu": pending_builds * BUILD_MU_ESTIMATE,
     }
     parts["required_mu"] = sum(parts.values())
+    parts["builds_owed"] = sorted(label for label, b in builds.items() if b)
     return parts
 
 
@@ -521,8 +657,34 @@ def funding_status(required=None):
 # balance. A probe reports them as INFRA_ERROR like any launch failure; the
 # suite runner reads this to know the run was starved, not blind.
 FUNDING_FAILURES = []
-_INSUFFICIENT_FUNDS_RE = re.compile(r"error charging|insufficient balance|not enough balance",
-                                    re.IGNORECASE)
+# The last three are the refusals of nodo #563: the initial_mu of a child does not
+# cover its build, or leaves less than one maintenance period after it
+# (src/utils/cost_functions/start_funding.py). Both mean the child was funded too
+# low, which is a shortage like the others: nothing was observed about the node.
+_INSUFFICIENT_FUNDS_RE = re.compile(
+    r"error charging|insufficient balance|not enough balance"
+    r"|does not cover the build|after the build of|least initial_mu",
+    re.IGNORECASE)
+# "initial_mu 2000000 MU does not cover the build of the service, 10000000 MU."
+_BUILD_REFUSAL_RE = re.compile(r"does not cover the build of (?:the service|this node), (\d+) MU")
+
+
+def learn_from_refusal(label, text):
+    """Take the build that a #563 refusal names as the build of that child.
+
+    The node names the figure it wanted, so the next start of the child is funded with
+    it instead of the estimate. Returns the build, or None.
+    """
+    match = _BUILD_REFUSAL_RE.search(text or "")
+    if not match:
+        return None
+    build = int(match.group(1))
+    base = label.split("(", 1)[0]
+    with _funding_lock:
+        FUNDING["build_learned_mu"] = max(FUNDING.get("build_learned_mu") or 0, build)
+        if base in CHILD_DECLARED_RESOURCES:
+            FUNDING["build_quote_mu"][base] = build
+    return build
 
 services = []
 logging.info('Gateway main directory: %s', node_url)
@@ -605,6 +767,8 @@ class ChildLaunchError(RuntimeError):
         self.label = label
         self.original = original
         self.insufficient_funds = bool(_INSUFFICIENT_FUNDS_RE.search(_full_error_text(original)))
+        if self.insufficient_funds:
+            learn_from_refusal(label, _full_error_text(original))
         msg = f"could not launch child '{label}': {_describe_launch_failure(original)}"
         if self.insufficient_funds:
             msg = (f"INSUFFICIENT FUNDS: the node refused to charge this instance for child "
@@ -704,10 +868,7 @@ def _spin_child(service_iface, label, wait_ready=True):
             FUNDING_FAILURES.append(label)
         raise err from e
     logging.info('Spun %s child at %s', label, inst.uri)
-    base = label.split("(", 1)[0]
-    with _funding_lock:
-        if base in CHILD_DECLARED_RESOURCES and base not in FUNDING["built_children"]:
-            FUNDING["built_children"].append(base)
+    _mark_built(label)
     if wait_ready:
         _wait_until_ready(inst.uri, label)
     return inst
@@ -1869,13 +2030,15 @@ def exclusive(name, wait=False):
         _suite_lock.release()
 
 
-def ensure_funded(pending_builds=0, timeout=None, on_wait=None):
+def ensure_funded(timeout=None, on_wait=None, requote=False):
     """Wait until the balance covers one suite. Returns (funded, funding snapshot).
 
-    The first call measures what the node charges this instance and sizes every
-    child from it. When the rate cannot be measured -- the gateway is down, or
-    the node charges nothing -- there is nothing to wait for: the suite runs and
-    its preflight reports the gateway, or the node is free.
+    The first call measures what the node charges this instance, asks the node what
+    the build of each child costs, and sizes every child from both. ``requote`` asks
+    again (after the node refused a start for funds). When the rate cannot be
+    measured -- the gateway is down, or the node charges nothing -- there is nothing
+    to wait for: the suite runs and its preflight reports the gateway, or the node is
+    free.
     Call with the suite lock held: sampling settles this instance's resources.
     """
     timeout = FUNDING_WAIT_TIMEOUT_SECONDS if timeout is None else timeout
@@ -1887,10 +2050,11 @@ def ensure_funded(pending_builds=0, timeout=None, on_wait=None):
         if rate is None:
             return True, dict(funding_status(), note="rate unknown (no charge, or a top-up "
                                                      "during sampling); not gating on funds")
-        if not FUNDING["child_initial_mu"]:
+        if not FUNDING["child_initial_mu"] or requote:
+            quote_child_builds()
             configure_child_budgets(rate)
         while True:
-            required = funding_requirement(rate, pending_builds)
+            required = funding_requirement(rate)
             sample_balance()
             snap = funding_status(required)
             if snap["funded"] or time.monotonic() >= deadline:
@@ -2123,10 +2287,10 @@ def run_startup_tests():
     try:
         # Waits for an attestation or probe already running instead of colliding.
         with exclusive("startup_tests", wait=True):
-            pending_builds = 0
+            starved = []
             for attempt in range(1, STARTUP_MAX_ATTEMPTS + 1):
                 STARTUP_TESTS["attempt"] = attempt
-                funded, snap = ensure_funded(pending_builds, on_wait=waiting)
+                funded, snap = ensure_funded(on_wait=waiting, requote=bool(starved))
                 STARTUP_TESTS["funding"] = snap
                 if not funded:
                     STARTUP_TESTS["status"] = "unfunded"
@@ -2145,12 +2309,12 @@ def run_startup_tests():
                 STARTUP_TESTS["status"] = "done"
                 if not starved:
                     break
-                # The node refused a launch for want of balance: children that have
-                # never launched here still owe their first build. Wait for that too.
-                pending_builds = max(1, sum(1 for c in CHILD_DECLARED_RESOURCES
-                                            if c not in FUNDING["built_children"]))
-                logging.info("Startup suite starved of funds (%s); waiting for %d build(s)",
-                             starved, pending_builds)
+                # The node refused a launch for want of balance, or because a child's
+                # initial_mu did not cover its build. Ask for the builds again (a
+                # refusal that named its build already raised that child's) and wait
+                # until the balance covers them.
+                logging.info("Startup suite starved of funds (%s); quoting the builds again",
+                             starved)
     except Exception as e:
         STARTUP_TESTS["status"] = "error"
         STARTUP_TESTS["error"] = f"{type(e).__name__}: {clip(e)}"
@@ -2331,6 +2495,7 @@ def service_status(refresh=False):
         "version": VERIFIER_VERSION,
         "node_url": node_url,
         "mem_limit_bytes": mem_limit,
+        "node_rates": dict(NODE_RATES),
         "funding": funding_status(required),
         "balance_note": note,
         "running": dict(CURRENT_WORK),

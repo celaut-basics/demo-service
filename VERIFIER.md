@@ -477,10 +477,13 @@ or an MCP call gets `busy` and the name of what is running.
 ## Funding the instance
 
 Every child is paid for out of **this** instance's balance: the node charges the
-parent `BUILD_MU` (10 000 000 on a default node) the first time a child is built,
-plus the child's `initial_mu`, and refunds whatever the child did not spend when
-it is stopped. The node itself funds this instance for
-`deposits.INITIAL_RUNTIME_HOURS` of its own resources — about 14e6 MU on a
+parent the child's `initial_mu`, and refunds whatever the child did not spend when
+it is stopped. Since nodo #563 the node takes the **build** of a child (`BUILD_MU`,
+10 000 000 on a default node, the first time it builds that image) out of the
+child's own `initial_mu`. A start whose `initial_mu` does not cover the build, or
+leaves less than one maintenance period after it, is refused and charges nothing
+(`src/utils/cost_functions/start_funding.py`). The node itself funds this instance
+for `deposits.INITIAL_RUNTIME_HOURS` of its own resources — about 14e6 MU on a
 default node.
 
 The children used to ask for a flat 2e8-5e8 MU each (`HEAVY_INITIAL_MU` etc.):
@@ -488,14 +491,22 @@ The children used to ask for a flat 2e8-5e8 MU each (`HEAVY_INITIAL_MU` etc.):
 executed verifier was refused (`Insufficient balance … needed 0.51 ERG`), its
 startup suite reported five `INFRA_ERROR`s, and it never tried again. Now:
 
-1. **Children are funded for minutes, not days.** On the first suite the
-   verifier measures the rate the node really charges it (two settled balances,
-   `FUNDING_RATE_SAMPLE_SECONDS` apart) and funds each child for
+1. **Children are funded for minutes, not days, plus their build.** On the first
+   suite the verifier measures the rate the node really charges it (two settled
+   balances, `FUNDING_RATE_SAMPLE_SECONDS` apart) and funds each child for
    `CHILD_FUNDED_SECONDS` (600) × `CHILD_BUDGET_MARGIN` (2) of the child's own
    resources, priced from that rate with the node's shipped RAM/vCPU/disk price
-   ratios. The largest (`benchmark`, 2 GiB) comes to ~4e6 MU on a default node.
+   ratios. The largest (`benchmark`, 2 GiB) comes to ~4e6 MU on a default node. To
+   that it adds the **build** of the child: the node's own quote
+   (`GetServiceEstimatedCost` asking for a balance of 1 MU answers the build plus 1
+   MU, and the build is 0 for an image the node has built; with no `initial_mu` the
+   node would fill in its default balance). Without a quote, the build is the node's `build_mu`
+   rate from `/__config__` (else `BUILD_MU_ESTIMATE`) until this instance has seen
+   the child launch. After a child launches, its next starts are funded without the
+   build.
 2. **The suite only starts once the balance covers it**: the largest child
-   deposit (children run one at a time and are refunded), the suite's own upkeep
+   deposit (children run one at a time and are refunded), the builds of the other
+   children that the node has not built yet, the suite's own upkeep
    (`SUITE_EXPECTED_SECONDS`), and `MIN_RESERVE_SECONDS` (900) of runtime left
    afterwards. On a node that has built the children before, the default funding
    of a new instance covers that, so the startup suite runs straight away.
@@ -503,14 +514,14 @@ startup suite reported five `INFRA_ERROR`s, and it never tried again. Now:
    showing the balance, what is required and the shortfall with the exact
    command; an attestation is refused as `insufficient_funds` instead of running
    into `INFRA_ERROR`s. `GET /status` (MCP `get_service_status`) shows the same.
-4. **A refused launch is named.** When the node refuses to charge for a child,
-   the probe's `INFRA_ERROR` says `INSUFFICIENT FUNDS` and quotes the node
-   (`Launch service error charging …`) instead of a reason cut off at
-   `Unable to l`. The rest of that run is skipped (`fault:
-   "insufficient_funds"`) rather than launching children the node will refuse
-   or spending three MU windows on a run that will be repeated. The startup
-   suite then waits for the first builds
-   (`BUILD_MU_ESTIMATE` per child not yet launched here) and runs again, up to
+4. **A refused launch is named.** When the node refuses to charge for a child, or
+   refuses its `initial_mu` because it does not cover the build (`does not cover the
+   build`, `after the build of`), the probe's `INFRA_ERROR` says `INSUFFICIENT FUNDS`
+   and quotes the node instead of a reason cut off at `Unable to l`. A refusal that
+   names the build makes that figure the build of the child. The rest of that run is
+   skipped (`fault: "insufficient_funds"`) rather than launching children the node
+   will refuse or spending three MU windows on a run that will be repeated. The
+   startup suite then asks the node for the builds again and runs again, up to
    `STARTUP_MAX_ATTEMPTS` (3).
 
 Validated on a real node (`ch`, amd64): a fresh instance with no deposit
