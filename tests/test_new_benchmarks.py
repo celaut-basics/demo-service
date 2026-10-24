@@ -267,6 +267,60 @@ class IdempotentStartTests(unittest.TestCase):
         self.assertEqual(ev["verdict"], app.VERDICT_INCONCLUSIVE)
 
 
+class FakeNode371:
+    """A node that holds tiny: it stops the sender (signal or #371 skip), or does not."""
+
+    BLOCK = 27_000_000
+
+    def __init__(self, stops=True):
+        self.stops = stops
+        self.n = 0
+
+    def gw_start(self, label, *, block_skip=True, **kw):
+        self.n += 1
+        sent = 600 if self.stops else self.BLOCK + 900
+        r = started(f"child{self.n}", request_bytes=sent)
+        r.seconds_to_instance = 0.9 if self.stops else 1.6
+        return r
+
+    def patches(self, first=None):
+        return [mock.patch.object(app, "_gw_start", side_effect=self.gw_start),
+                mock.patch.object(app, "_gw_stop"),
+                mock.patch.dict(app.FIRST_SENDS, first or {}, clear=True),
+                mock.patch.object(app, "_packed_block_bytes", return_value=self.BLOCK)]
+
+
+class BlockSkipTests(unittest.TestCase):
+    def run_probe(self, node, first=None):
+        patches = node.patches(first)
+        for p in patches:
+            p.start()
+        try:
+            return app.probe_block_skip()
+        finally:
+            for p in patches:
+                p.stop()
+
+    def test_later_starts_without_the_blocks_pass_and_compare_with_the_first_send(self):
+        first = {"tiny": {"request_bytes": FakeNode371.BLOCK + 2000, "seconds": 4.2}}
+        ev = self.run_probe(FakeNode371(), first)
+        self.assertEqual(ev["verdict"], app.VERDICT_PASS, ev["reason"])
+        self.assertEqual(ev["request_bytes_with_skip"], 600)
+        self.assertTrue(ev["first_send_carried_the_blocks"])
+        self.assertGreater(ev["bytes_saved_against_first_send"], 0.99)
+        self.assertIn("first send", ev["reason"])
+
+    def test_a_node_that_held_the_child_before_still_passes_and_says_so(self):
+        ev = self.run_probe(FakeNode371(), {"tiny": {"request_bytes": 700, "seconds": 0.5}})
+        self.assertEqual(ev["verdict"], app.VERDICT_PASS)
+        self.assertFalse(ev["first_send_carried_the_blocks"])
+        self.assertIn("already held", ev["reason"])
+
+    def test_a_node_that_makes_the_client_send_the_blocks_is_never_accused(self):
+        ev = self.run_probe(FakeNode371(stops=False))
+        self.assertEqual(ev["verdict"], app.VERDICT_INCONCLUSIVE)
+
+
 class NeutralVerdictTests(unittest.TestCase):
     def test_not_applicable_probes_are_hashed_but_do_not_block_the_hash(self):
         results = {"x": {"probe": "x", "verdict": app.VERDICT_PASS},

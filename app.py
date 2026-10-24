@@ -386,10 +386,19 @@ def child_initial_mu(label, self_rate):
 BUILD_QUOTE_BALANCE_MU = 1
 
 
+# label -> the first request of this instance that carried the child: its bytes and
+# seconds. block_skip compares the later starts with it.
+FIRST_SENDS = {}
+
+
 def quote_build(label):
     """(build in MU, EstimatedCost) of one child, as the node quotes it now."""
+    measure = {}
     quote = gw.estimated_cost(node_url, packed(label),
-                              config=gw.configuration(initial_mu=BUILD_QUOTE_BALANCE_MU))
+                              config=gw.configuration(initial_mu=BUILD_QUOTE_BALANCE_MU),
+                              measure=measure)
+    if label not in FIRST_SENDS:
+        FIRST_SENDS[label] = dict(measure, via="GetServiceEstimatedCost", at=_now())
     return max(0, gw.mu(quote.cost) - BUILD_QUOTE_BALANCE_MU), quote
 
 
@@ -2183,6 +2192,116 @@ def probe_idempotent_start():
 
 
 # ----------------------------------------------------------------------------
+# Probe — block skip on StartService (nodo #371, commit 7375f37)
+# ----------------------------------------------------------------------------
+# A StartService carries the Service, and the Service carries its blocks: tiny's image
+# is one block of tens of MB. A node that already holds what arrives stops the sender:
+# for a service it holds, at the first hash (bee-rpc's signal), and since #371 also for
+# each block it holds of a service it does not hold yet (a skip request in the response
+# direction, honoured by a sender with bee-rpc `block_skip`). Before #371 the node read
+# every block of such a service from the wire and dropped the ones it held.
+#
+# What a client sees is the first request that carries a service and the requests after
+# it. The first one is this instance's first send of tiny (quote_child_builds asks for
+# a quote with the service before any start): it carries the blocks the node does not
+# hold. The probe then starts tiny again, with the skip off and on, and counts the bytes
+# of each request the way nodo's own test does (the Buffers handed to gRPC), with the
+# time to the instance. A node that makes a client send blocks it holds costs bandwidth,
+# not money: that is never an accusation.
+BLOCK_SKIP_CHILD = "tiny"
+BLOCK_SKIP_ROUNDS = 2  # pairs of (skip off, skip on)
+# A start that sends less than this share of the blocks did not send them.
+BLOCK_SKIP_MAX_SHARE = 0.05
+
+
+def _packed_block_bytes(label):
+    """Bytes of the blocks of a packed child: what a request that carries them sends."""
+    p = packed(label)
+    try:
+        with open(os.path.join(p.service_path, "_.json")) as fh:
+            layout = json.load(fh)
+    except Exception:
+        return None
+    total = 0
+    block_dir = os.path.join(DIR, "__block__")
+    for entry in layout:
+        if isinstance(entry, list) and entry and isinstance(entry[0], str):
+            path = os.path.join(block_dir, entry[0])
+            if os.path.isfile(path):
+                total += os.path.getsize(path)
+            elif os.path.isdir(path):
+                for root, _, files in os.walk(path):
+                    total += sum(os.path.getsize(os.path.join(root, f)) for f in files)
+    return total
+
+
+def _median(values):
+    values = sorted(values)
+    if not values:
+        return None
+    mid = len(values) // 2
+    return values[mid] if len(values) % 2 else (values[mid - 1] + values[mid]) / 2
+
+
+def _timed_start(label, block_skip):
+    r = _gw_start(label, block_skip=block_skip, wait_ready=False)
+    try:
+        return {"block_skip": block_skip, "request_bytes": r.request_bytes,
+                "seconds_to_instance": r.seconds_to_instance,
+                "seconds_to_request_sent": r.seconds_to_complete}
+    finally:
+        _gw_stop(r.instance.token, label)
+
+
+def probe_block_skip():
+    label = BLOCK_SKIP_CHILD
+    ev = {"probe": "block_skip", "child": label, "starts": []}
+    try:
+        blocks = _packed_block_bytes(label)
+        first = FIRST_SENDS.get(label)
+        ev["packed_block_bytes"] = blocks
+        ev["first_send"] = first
+        off, on = [], []
+        for _ in range(BLOCK_SKIP_ROUNDS):
+            off.append(_timed_start(label, False))
+            on.append(_timed_start(label, True))
+        ev["starts"] = off + on
+        sent_on, sent_off = _median([s["request_bytes"] for s in on]), _median([s["request_bytes"] for s in off])
+        i_on, i_off = _median([s["seconds_to_instance"] for s in on]), _median([s["seconds_to_instance"] for s in off])
+        first_carried = bool(first and blocks and first.get("request_bytes", 0) >= blocks / 2)
+        ev.update({
+            "request_bytes_with_skip": sent_on,
+            "request_bytes_without_skip": sent_off,
+            "seconds_to_instance_with_skip": i_on,
+            "seconds_to_instance_without_skip": i_off,
+            "first_send_carried_the_blocks": first_carried,
+            "bytes_saved_against_first_send": (round(1 - sent_on / first["request_bytes"], 4)
+                                               if first_carried else None),
+        })
+        if not blocks:
+            ev["verdict"] = VERDICT_INCONCLUSIVE
+            ev["reason"] = "the blocks of the packed child could not be sized"
+        elif sent_on > blocks * BLOCK_SKIP_MAX_SHARE:
+            ev["verdict"] = VERDICT_INCONCLUSIVE
+            ev["reason"] = (f"a start of a child the node holds sent {sent_on} bytes of {blocks} "
+                            "bytes of blocks: the node did not stop the sender. It costs "
+                            "bandwidth, not money; no claim is made")
+        else:
+            compare = (f"; the first send of this child carried {first['request_bytes']} bytes "
+                       f"in {first['seconds']}s" if first_carried else
+                       "; the node already held the child at this instance's first send, so "
+                       "there is no full send to compare with")
+            ev["verdict"] = VERDICT_PASS
+            ev["reason"] = (f"a StartService for a child whose blocks the node holds sent "
+                            f"{sent_on} bytes of {blocks} bytes of blocks with the skip "
+                            f"({sent_off} without), and got its instance in {i_on}s "
+                            f"({i_off}s without){compare}")
+        return ev
+    except Exception as e:
+        return _infra(ev, "the block skip", e)
+
+
+# ----------------------------------------------------------------------------
 # Probe — dependency connectivity is not fraudulent (node Observe cross-check)
 # ----------------------------------------------------------------------------
 # A dishonest node could fabricate a dependency's network behaviour (claim it
@@ -2575,6 +2694,7 @@ PROBES = [
     ("node_benchmark", probe_node_benchmark),
     ("shared_filesystem", probe_shared_filesystem),
     ("idempotent_start", probe_idempotent_start),
+    ("block_skip", probe_block_skip),
     ("mu_accounting", probe_mu_accounting),
 ]
 
@@ -2586,7 +2706,8 @@ PROBES = [
 GATEWAY_DEPENDENT = ("build_funding", "dependency_identity", "network_isolation",
                      "dependency_observe", "memory_ceiling", "node_benchmark",
                      "shared_filesystem", "mu_accounting",
-                     "idempotent_start")
+                     "idempotent_start",
+                     "block_skip")
 
 
 def _safe_probe(name, fn):
@@ -2824,6 +2945,7 @@ PROBE_ENDPOINTS = [
     ("probe_node_benchmark", "/probe/benchmark", probe_node_benchmark),
     ("probe_shared_filesystem", "/probe/shared_filesystem", probe_shared_filesystem),
     ("probe_idempotent_start", "/probe/idempotent_start", probe_idempotent_start),
+    ("probe_block_skip", "/probe/block_skip", probe_block_skip),
     ("probe_mu_accounting", "/probe/mu_accounting", probe_mu_accounting),
 ]
 # Reads /proc and /__config__ only: it spins nothing and moves nothing, so it
@@ -2984,6 +3106,12 @@ MCP_TOOLS = [
           "Check that StartService with a StartReference is idempotent (nodo #578): the same "
           "reference twice gives one instance and one charge, and the second request gets the "
           "same instance back without sending the service."
+          + _SPENDS, False),
+    _tool("probe_block_skip",
+          "Measure the block skip of nodo #371: start the tiny child with the skip off and on, "
+          "after the node holds its block, and report the request bytes, the time to the instance"
+          " and the time until the request was sent. PASS when the skip saves at least half of "
+          "the bytes; a node that does not skip is never accused."
           + _SPENDS, False),
 ]
 

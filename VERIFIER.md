@@ -74,6 +74,7 @@ Two consequences follow:
 | 8 | `mu_accounting` | orchestrator (self) | the node spends MUs in line with the resources it provisions |
 | 10 | `build_funding` | `tiny` | nodo #563: a child funded below its build, or below one maintenance period after it, is refused with the node's message and charged nothing; a funded child starts, this account pays exactly its `initial_mu`, and the build is paid from the child's account |
 | 11 | `idempotent_start` | `tiny` | nodo #578: three StartService requests with one `StartReference` give one instance and one `child_start` charge; the requests after the first send no service and get the same instance |
+| 12 | `block_skip` | `tiny` | nodo #371: a StartService that carries blocks the node holds sends a small part of them (≤ 5%); the bytes and the time to the instance are reported, against this instance's first send of the child |
 | 9 | `attestation` | orchestrator | per-probe verdict + `sha3_256` content hash, as JSON and HTML |
 
 ### Child readiness — the node's "ready" is not the service's "ready"
@@ -501,6 +502,41 @@ reference in this instance's statement.
 | the first start or a statement failed | `INFRA_ERROR` |
 
 Every instance the probe got is stopped.
+
+#### Block skip on StartService (`tiny`, nodo #371, commit `7375f37`)
+
+A `StartService` carries the `Service`, and the `Service` carries its blocks:
+`tiny`'s image is one block of tens of MB. A node that already holds what arrives
+stops the sender. For a service it holds, it does so at the first hash (bee-rpc's
+signal). Since #371 it also does so for each block it holds of a service it does
+not hold yet: it sends a skip request in the response direction, and a sender
+with bee-rpc `block_skip` stops that block. Before #371 the node read every block
+of such a service and dropped the ones it held.
+
+What a client sees is the first request that carries a service, and the requests
+after it. The first one is this instance's first send of `tiny`:
+`quote_child_builds` asks for a quote with the service before any start, and
+records its bytes and seconds (`first_send`). It carries the blocks that the node
+does not hold. The probe then starts `tiny` twice with the skip off and twice with
+it on, and counts the bytes of each request (the Buffers handed to gRPC, the
+measure of nodo's own test) and the time to the instance.
+
+It reports `first_send` (bytes, seconds), `request_bytes_with_skip`,
+`request_bytes_without_skip`, `seconds_to_instance_with_skip`,
+`seconds_to_instance_without_skip` and `bytes_saved_against_first_send`.
+
+| observation | verdict |
+|---|---|
+| a start of the child the node holds sends at most 5% of the bytes of its blocks | `PASS` |
+| it sends more: the node did not stop the sender. It costs bandwidth, not money | `INCONCLUSIVE` |
+| the blocks of the packed child cannot be sized | `INCONCLUSIVE` |
+| a start failed | `INFRA_ERROR` |
+
+The first send carries the blocks only on the first suite after a pack on a node
+(after that, the node holds the child). On later suites `first_send` is small and
+the reason says so. The skip of the blocks of a service that the node does not
+hold (#371 proper) shows in `first_send` when the node already holds some of its
+blocks from another service.
 
 ### 4. Attestation report card
 
