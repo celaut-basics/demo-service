@@ -695,6 +695,92 @@ delegating node. `tools/two-node/` runs this probe on a node that delegates to a
 second node, once with an honest peer and once with one that overcharges, and
 checks the score from the operator's side.
 
+#### Results on nodo dev `97906c7c` (2026-10-24)
+
+Packed from commit `f07f032` with `nodo pack amd64 --local` on the test node
+(Alienware, WSL2 Ubuntu 22.04, `ch`, amd64). Service ids:
+
+| service | id |
+|---|---|
+| verifier (`celaut-node-honesty-verifier`) | `0c8de510b37b822118811e433395a07e16bfb478f062cf1ce9db922e70298162` |
+| tiny | `8c60438af63475d71a8efe94d7532930944a0f83bceb8748078ffd641c325ce1` |
+| heavy | `361d1afc25e621d36331c65dd9c9cc325baeba268ef7e315ca00d9998b0284d6` |
+| ping | `71e78ad6fd060bb3faeaaac516047ce8ef1e9673706d05a1b24e4c7c2e0a8d28` |
+| benchmark | `ce3925f31524c506c1a07c8350ad862d908ce699fe0b2ef1de7adc63258d9bab` |
+| sharefs | `73e30da6554bf33e497ecf59ddaae74b9fa4f3425d983271032ad72d331b5bc6` |
+| sharefs-denied | `a914815d9a8394a73fcde609f4e22d5cc5ca632fadb7e7b14414e00e7ffca1cb` |
+| netshare | `452dfa49fa5a2b31a905576391ac2d5d01c887c4d51e8ae098211d8d93fdda30` |
+
+Three runs of the startup suite, with no env override. Each first suite after a
+pack owes the 6 builds (6e7 MU). The gate waited for them and showed the exact
+shortfall, and one local top-up (`nodo increase_deposit`) let it run.
+
+- **packing node**: the node that packed it (it holds every child already);
+- **clean node**: a new node (node B of `tools/two-node/`) that imported only the
+  exported `0c8de5.celaut.bee`, so each child reached it only through the
+  verifier's own requests (the release rule's clean-registry import test);
+- **two-node**: `delegation_pricing` on node A, which delegates its child to node B.
+
+| probe | packing node | clean node | two-node |
+|---|---|---|---|
+| gateway_reachability | PASS | PASS | |
+| resource_provisioning | PASS | PASS | |
+| build_funding | PASS | PASS | |
+| dependency_identity | PASS | PASS | |
+| network_isolation | PASS | PASS | |
+| dependency_observe | PASS (58 packets) | PASS (53 packets) | |
+| memory_ceiling | PASS (240 MiB ok, 300 MiB killed) | PASS (same) | |
+| node_benchmark | PASS | PASS | |
+| shared_filesystem | PASS | PASS | |
+| idempotent_start | PASS | PASS | |
+| block_skip | PASS | PASS | |
+| env_vars | PASS | PASS | |
+| network_share | PASS | PASS | |
+| tunnel | PASS | PASS | |
+| delegation_pricing | NOT_APPLICABLE (no peer) | NOT_APPLICABLE (room of its own) | PASS, honest peer; PASS, overcharging peer |
+| mu_accounting | PASS | PASS | |
+| balance_statement | PASS | PASS | |
+| **summary** | 16 PASS, 1 N/A, `all_passed` | 16 PASS, 1 N/A, `all_passed` | |
+| suite time | 11.9 min | 12.2 min | |
+
+The numbers:
+
+- **build_funding**: quote build 10 000 000 MU. `initial_mu` 9 999 999 was refused:
+  `does not cover the build of the service, 10000000 MU`. 10 020 764 was refused:
+  `leaves 20764 MU after the build of 10000000 MU. One maintenance period costs 62685
+  MU`. 12 693 742 started; this account paid exactly that, and the child's account
+  shows the build of 10 000 000.
+- **idempotent_start**: the first start took 3.9 s; the two requests with the
+  reference only took 0.49 s and 0.46 s and got the same instance; one
+  `child_start` (2 693 742 MU).
+- **block_skip**: a start of `tiny` that the node holds sent 586 bytes (skip on and
+  off) and got its instance in 3.6 s / 4.0 s. On the clean node the first send of
+  `tiny` (the quote of the funding gate) carried 27 076 270 bytes in 1.6 s; the
+  later starts sent 585 bytes (skip on) and 572 bytes (off), and got the instance in
+  4.4 s / 3.8 s. The node answers at the first hash of a service it holds, so the
+  time to the instance is the boot of the child either way.
+- **tunnel**: 64 MiB over a `ServiceTunnel` at 3.7 MiB/s (17.5 s); directly, 1284
+  MiB/s. The bill: 10 000 MU to open, then 64 rows of 1 953 MU per MiB (124 992 MU):
+  67 108 864 bytes billed for 67 109 051 relayed (the last 187 bytes cost 0 MU and
+  write no row), 1 999 872 MU/GiB against the advertised 2 000 000.
+- **balance_statement**: 167 movements in one signed page, Ed25519 signature valid,
+  the chain verifies, the rows add up to the balance (22 907 555 MU), and the balance
+  that `ModifyServiceSystemResources` returned is the balance of the next row. The
+  packing node has no statement price (see below), so no `statement_query` row; on
+  the clean node 9 queries cost 100 + 1 per row each, as advertised.
+- **network_share**: two members of group `gf15cd18d` saw each other's files; the
+  member of group `g177ca48c` did not.
+- **delegation_pricing** (two nodes; B at a third of A's rates): A delegated `tiny`
+  to B, kept its own build (10 000 000 MU) from `initial_mu` and sent B the rest.
+  With an honest B, the client paid 2 119.9 MU/s (A's base for `tiny` is 1 128.9
+  MU/s, its ceiling 12 545.3 MU/s; 1.02× A's quote), while B charged A 55 155 MU over
+  the child's two minutes. With B patched to charge 5× on its tick, the client paid
+  1 500.0 MU/s, B charged A 340 760 MU (about 3.5× the maximum B signed), and A scored
+  B `maintenance_overcharged` −1000, once (`reputation_events`, `statement_faults`).
+
+What a node owes for these runs was local only: free credit and local top-ups.
+Nothing was paid on a ledger.
+
 ### 4. Attestation report card
 
 A full run drives every probe — including the memory-ceiling ladder and the
@@ -864,6 +950,13 @@ things.
   MCP tool, `DEP_IDENTITY` for `sharefs`), `shared_filesystems` and the
   `/shared`, `/shared-ro` directories in both parents' `.service/`, the two new
   `pack_config.json` dependencies, and `tests/test_shared_filesystem.py`.
+- **1.5.0 — the nodo features after v3.** The funding fix of #563 (each child is
+  funded with its build, from the node's quote), and the probes `build_funding`,
+  `idempotent_start`, `block_skip`, `env_vars`, `network_share`, `tunnel`,
+  `balance_statement` and `delegation_pricing`. `nodo_gateway.py` and
+  `nodo_protos/` (the client for the current gateway protocol), the `netshare` child,
+  `tiny`'s `GET /env` and `GET /bytes/<n>`, `tests/test_new_benchmarks.py`, and
+  `tools/two-node/` (the two-node harness).
 
 ## Live validation against a real node
 
