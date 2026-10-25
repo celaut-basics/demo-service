@@ -89,6 +89,8 @@ print([i["id"] for i in (d if isinstance(d, list) else d.get("instances", [])) i
 probe)
   LABEL=${2:-honest}
   URI=$(verifier_uri)
+  # The node reports the instance before its HTTP server listens.
+  in_ct $A "timeout 180 bash -c 'until curl -s -m 5 -o /dev/null http://$URI/status; do sleep 5; done'"
   in_ct $A "curl -s --max-time 900 -X POST http://$URI/probe/delegation_pricing" > "$OUT/delegation-$LABEL.json"
   python3 -c "import json; d=json.load(open('$OUT/delegation-$LABEL.json')); print(d['verdict'], '-', d['reason'])"
   ;;
