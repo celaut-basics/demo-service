@@ -181,7 +181,8 @@ def _install_stubs(tmpdir):
     os.makedirs(svc, exist_ok=True)
     with open(os.path.join(svc, ".dependencies"), "w") as fh:
         fh.write("TINY=tinyhash\nHEAVY=heavyhash\nPING=pinghash\nBENCHMARK=benchmarkhash\n"
-                 "SHAREFS=sharefshash\nSHAREFS_DENIED=sharefsdeniedhash\n")
+                 "SHAREFS=sharefshash\nSHAREFS_DENIED=sharefsdeniedhash\n"
+                 "NETSHARE=netsharehash\n")
 
     return FakeServiceInterface, FakeController
 

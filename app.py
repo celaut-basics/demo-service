@@ -40,6 +40,8 @@ from node_controller.controller.controller import Controller
 from node_controller.gateway.protos import celaut_pb2
 from node_controller.gateway.utils import to_amount, from_amount
 
+import nodo_gateway as gw
+
 
 DIR = "service"
 CONFIG_FILE = "/__config__"
@@ -48,7 +50,7 @@ if False:  # development mode toggle (unchanged from the original demo)
     DIR = "."
     CONFIG_FILE = "__config__"
 
-VERIFIER_VERSION = "1.4.0"
+VERIFIER_VERSION = "1.5.0"
 
 # ---------------------------------------------------------------------------
 # Verdict taxonomy
@@ -66,6 +68,10 @@ VERDICT_INCONCLUSIVE = "INCONCLUSIVE"      # ran, undecidable
 
 # Only these two mean "we actually observed the node's behaviour".
 CONCLUSIVE_VERDICTS = (VERDICT_PASS, VERDICT_DISHONEST)
+# A probe that does not apply here (a node that runs for free has no build to fund; a
+# node with no peer delegates nothing) left nothing unobserved. It does not block the
+# attestation, and it is never counted as a pass.
+NEUTRAL_VERDICTS = (VERDICT_NOT_APPLICABLE,)
 # Only these may ever be published as an accusation.
 ACCUSING_VERDICTS = (VERDICT_DISHONEST,)
 
@@ -183,6 +189,7 @@ CHILD_DECLARED_RESOURCES = {           # label -> (mem_limit, disk_space)
     "ping": (50000000, 500000000),
     "benchmark": (2147483648, 200000000),
     "sharefs": (50000000, 200000000),
+    "netshare": (50000000, 200000000),
 }
 # sharefs-denied is deliberately NOT in the table above. It declares the same resources
 # (tests/test_verdicts.py holds it to its manifest), but it is never meant to start: the
@@ -219,6 +226,10 @@ PING_SERVICE = env_vars.get("PING", None)
 BENCHMARK_SERVICE = env_vars.get("BENCHMARK", None)
 SHAREFS_SERVICE = env_vars.get("SHAREFS", None)
 SHAREFS_DENIED_SERVICE = env_vars.get("SHAREFS_DENIED", None)
+NETSHARE_SERVICE = env_vars.get("NETSHARE", None)
+# The variable that selects the network share of a netshare child: it fills
+# ${DEMO_NETSHARE_GROUP} in the formal of its network (netshare/<arch>/.service/service.json).
+NETSHARE_GROUP_ENV = "DEMO_NETSHARE_GROUP"
 
 logging.basicConfig(filename='app.log', level=logging.DEBUG,
                     format='%(asctime)s - %(levelname)s - %(message)s')
@@ -267,9 +278,10 @@ GIB = 1024 ** 3
 CHILD_FUNDED_SECONDS = int(os.environ.get("CHILD_FUNDED_SECONDS", "600"))
 CHILD_BUDGET_MARGIN = float(os.environ.get("CHILD_BUDGET_MARGIN", "2.0"))
 CHILD_MIN_INITIAL_MU = int(os.environ.get("CHILD_MIN_INITIAL_MU", "100000"))
-# One full suite: the three MU windows dominate (3 x MU_WINDOW_SECONDS), the
-# memory ladder and the benchmark take the rest.
-SUITE_EXPECTED_SECONDS = int(os.environ.get("SUITE_EXPECTED_SECONDS", "480"))
+# One full suite: the three MU windows (3 x MU_WINDOW_SECONDS), the memory ladder
+# and the benchmark, and the starts of the newer benchmarks (about 15 of tiny and
+# netshare, a 64 MiB tunnel).
+SUITE_EXPECTED_SECONDS = int(os.environ.get("SUITE_EXPECTED_SECONDS", "720"))
 # Runtime this instance must still have left AFTER a suite, so that verifying
 # the node never leaves the verifier unable to serve the result it produced.
 MIN_RESERVE_SECONDS = int(os.environ.get("MIN_RESERVE_SECONDS", "900"))
@@ -285,7 +297,35 @@ MU_PER_ERG = int(os.environ.get("MU_PER_ERG", str(10 ** 9)))
 
 _CHILD_HASHES = {"tiny": TINY_SERVICE, "heavy": HEAVY_SERVICE,
                  "ping": PING_SERVICE, "benchmark": BENCHMARK_SERVICE,
-                 "sharefs": SHAREFS_SERVICE, "sharefs_denied": SHAREFS_DENIED_SERVICE}
+                 "sharefs": SHAREFS_SERVICE, "sharefs_denied": SHAREFS_DENIED_SERVICE,
+                 "netshare": NETSHARE_SERVICE}
+
+# Where the packer put the children (pack_config.json): the Service of each one, and
+# its Metadata, by service id.
+SERVICES_DIR = os.path.join(DIR, "__services__")
+METADATA_DIR = os.path.join(DIR, "__metadata__")
+
+
+def packed(label):
+    """A child as this service holds it, for the calls node_controller cannot make."""
+    return gw.PackedService(_CHILD_HASHES[label], SERVICES_DIR, METADATA_DIR)
+
+
+def _read_node_rates():
+    """The node's rates (build_mu, net_mu_per_gib, ...) from /__config__, or {}.
+
+    The node writes them in the gateway slot of the configuration file of every
+    instance (celaut.proto, ConfigurationFile.gateway). Reading them costs no RPC.
+    """
+    try:
+        return gw.rates_from_config(CONFIG_FILE)
+    except Exception as e:
+        logging.warning("Could not read the node's rates from %s: %s", CONFIG_FILE, e)
+        return {}
+
+
+NODE_RATES = _read_node_rates()
+logging.info("Node rates: %s", NODE_RATES)
 
 FUNDING = {
     "balance_mu": None,          # last balance the node reported
@@ -293,6 +333,12 @@ FUNDING = {
     "self_rate_mu_per_s": None,  # measured; None until two samples exist
     "child_initial_mu": {},      # label -> what each child is funded with
     "built_children": [],        # children this instance has seen launch
+    # label -> the build that the node quoted for it (GetServiceEstimatedCost): 0 once
+    # the node has built it. A label that is absent has no quote, and is funded with
+    # the build estimate until this instance has seen it launch.
+    "build_quote_mu": {},
+    # The build that the node named in a refusal, when it is above the estimate.
+    "build_learned_mu": None,
 }
 _funding_lock = threading.Lock()
 
@@ -303,12 +349,97 @@ def price_weight(mem_bytes, disk_bytes, vcpus=1.0):
             + disk_bytes / GIB * PRICE_WEIGHT_DISK_GIB)
 
 
-def child_initial_mu(label, self_rate):
-    """MU to fund one child with: CHILD_FUNDED_SECONDS of its own resources."""
+def build_mu_estimate():
+    """What the node charges for one build: what it named in a refusal, else its rate
+    in /__config__, else BUILD_MU_ESTIMATE."""
+    learned = FUNDING.get("build_learned_mu")
+    rate = NODE_RATES.get("build_mu")
+    return max(learned or 0, rate if rate is not None else BUILD_MU_ESTIMATE)
+
+
+def child_build_mu(label):
+    """The build that a start of this child takes out of its initial_mu (#563).
+
+    Since nodo #563 the node takes the build from the initial_mu of the child, not
+    from the balance of the parent, and refuses a start whose initial_mu does not
+    cover it. The quote of the node is exact. Without one, the build is owed until
+    this instance has seen the child launch: after that the node has a built image.
+    """
+    with _funding_lock:
+        quoted = FUNDING["build_quote_mu"].get(label)
+        built = label in FUNDING["built_children"]
+    if quoted is not None:
+        return quoted
+    return 0 if built else build_mu_estimate()
+
+
+def child_runtime_mu(label, self_rate):
+    """MU of runtime to fund one child with: CHILD_FUNDED_SECONDS of its own resources."""
     mem, disk = CHILD_DECLARED_RESOURCES[label]
     self_weight = price_weight(mem_limit or SELF_DECLARED_MEM_BYTES, SELF_DECLARED_DISK_BYTES)
     child_rate = self_rate * price_weight(mem, disk) / self_weight
     return max(CHILD_MIN_INITIAL_MU, int(child_rate * CHILD_FUNDED_SECONDS * CHILD_BUDGET_MARGIN))
+
+
+def child_initial_mu(label, self_rate):
+    """MU to fund one child with: its build, if one is owed, and its runtime."""
+    return child_build_mu(label) + child_runtime_mu(label, self_rate)
+
+
+# The balance a build quote asks for. The cost that GetServiceEstimatedCost answers is
+# the least initial_mu: the build plus the balance asked for (#563). A request with no
+# initial_mu gets the node's default balance filled in (estimated_cost_iterable.py), so
+# the quote asks for 1 MU, and the build is the cost less that.
+BUILD_QUOTE_BALANCE_MU = 1
+
+
+# label -> the first request of this instance that carried the child: its bytes and
+# seconds. block_skip compares the later starts with it.
+FIRST_SENDS = {}
+
+
+def quote_build(label):
+    """(build in MU, EstimatedCost) of one child, as the node quotes it now."""
+    measure = {}
+    quote = gw.estimated_cost(node_url, packed(label),
+                              config=gw.configuration(initial_mu=BUILD_QUOTE_BALANCE_MU),
+                              measure=measure)
+    if label not in FIRST_SENDS:
+        FIRST_SENDS[label] = dict(measure, via="GetServiceEstimatedCost", at=_now())
+    return max(0, gw.mu(quote.cost) - BUILD_QUOTE_BALANCE_MU), quote
+
+
+def quote_child_builds():
+    """Ask the node what the build of each child costs (GetServiceEstimatedCost).
+
+    0 for an image the node has built. A child the node does not hold yet goes with
+    the request, with the block skip on, and the node keeps it, so the start that
+    follows does not send it again. A failed quote leaves that child on the estimate.
+    """
+    quotes = {}
+    for label in CHILD_DECLARED_RESOURCES:
+        try:
+            quotes[label] = quote_build(label)[0]
+        except Exception as e:
+            logging.warning("No build quote for %s: %s", label, e)
+    with _funding_lock:
+        FUNDING["build_quote_mu"].update(quotes)
+    return quotes
+
+
+def _mark_built(label):
+    """A child launched here: the node has its image, and the next start owes no build."""
+    base = label.split("(", 1)[0]
+    with _funding_lock:
+        if base not in CHILD_DECLARED_RESOURCES or base in FUNDING["built_children"]:
+            return
+        FUNDING["built_children"].append(base)
+        FUNDING["build_quote_mu"][base] = 0
+        rate = FUNDING["self_rate_mu_per_s"]
+        refund_build = bool(FUNDING["child_initial_mu"]) and rate is not None
+    if refund_build:
+        # Fund the next start of this child without the build.
+        _register_child_budget(base, child_initial_mu(base, rate))
 
 
 # ----------------------------------------------------------------------------
@@ -412,6 +543,12 @@ def _child_config(label, initial_mu=None):
     if label == "ping" and undeclared:
         kwargs["environment_variables"] = [celaut_pb2.BytesKeyValue(
             key=UNDECLARED_ADDRS_ENV, value=",".join(undeclared).encode())]
+    if label == "netshare":
+        # The group fills ${DEMO_NETSHARE_GROUP} in netshare's network: without it the
+        # node refuses the launch. A group of its own, so dependency_identity never joins
+        # the share of network_share.
+        kwargs["environment_variables"] = [celaut_pb2.BytesKeyValue(
+            key=NETSHARE_GROUP_ENV, value=b"identity")]
     return celaut_pb2.Configuration(**kwargs) if kwargs else None
 
 
@@ -427,21 +564,41 @@ heavy_service = _add_child("heavy")
 ping_service = _add_child("ping")
 benchmark_service = _add_child("benchmark")
 sharefs_service = _add_child("sharefs")
+netshare_service = _add_child("netshare")
 # Funded at the floor: an honest node refuses it before anything is spent, and if a node
 # does start it the probe still has to be able to inspect it, not be starved of funds.
 sharefs_denied_service = _add_child("sharefs_denied", CHILD_MIN_INITIAL_MU)
 
 
-def configure_child_budgets(self_rate):
-    """Re-register every child funded for CHILD_FUNDED_SECONDS at this rate."""
+def _register_child_budget(label, initial_mu):
+    """Re-register one child funded with initial_mu (node_controller keeps the config)."""
     global tiny_service, heavy_service, ping_service, benchmark_service, sharefs_service
+    global netshare_service
+    iface = _add_child(label, initial_mu)
+    if label == "tiny":
+        tiny_service = iface
+    elif label == "heavy":
+        heavy_service = iface
+    elif label == "ping":
+        ping_service = iface
+    elif label == "benchmark":
+        benchmark_service = iface
+    elif label == "sharefs":
+        sharefs_service = iface
+    elif label == "netshare":
+        netshare_service = iface
+    with _funding_lock:
+        FUNDING["child_initial_mu"] = dict(FUNDING["child_initial_mu"], **{label: initial_mu})
+    return iface
+
+
+def configure_child_budgets(self_rate):
+    """Re-register every child funded for CHILD_FUNDED_SECONDS at this rate, plus its build."""
     budgets = {label: child_initial_mu(label, self_rate) for label in CHILD_DECLARED_RESOURCES}
-    tiny_service = _add_child("tiny", budgets["tiny"])
-    heavy_service = _add_child("heavy", budgets["heavy"])
-    ping_service = _add_child("ping", budgets["ping"])
-    benchmark_service = _add_child("benchmark", budgets["benchmark"])
-    sharefs_service = _add_child("sharefs", budgets["sharefs"])
-    FUNDING["child_initial_mu"] = budgets
+    for label, initial_mu in budgets.items():
+        _register_child_budget(label, initial_mu)
+    with _funding_lock:
+        FUNDING["child_initial_mu"] = dict(budgets)
     logging.info("Child budgets at %.1f MU/s: %s", self_rate, budgets)
     return budgets
 
@@ -450,7 +607,8 @@ def child_iface(label):
     """The current interface for a child (budgets re-register them)."""
     return {"tiny": tiny_service, "heavy": heavy_service,
             "ping": ping_service, "benchmark": benchmark_service,
-            "sharefs": sharefs_service, "sharefs_denied": sharefs_denied_service}[label]
+            "sharefs": sharefs_service, "sharefs_denied": sharefs_denied_service,
+            "netshare": netshare_service}[label]
 
 
 def sample_balance():
@@ -483,19 +641,29 @@ def measure_self_rate():
     return rate
 
 
-def funding_requirement(self_rate, pending_builds=0):
-    """MU this instance needs on hand before a suite may start."""
+def funding_requirement(self_rate):
+    """MU this instance needs on hand before a suite may start.
+
+    Each child is funded with its build and its runtime (#563). The runtime comes back
+    when the child stops; the build does not. So the balance must hold the largest
+    deposit at once, plus the builds of the other children that the node has not
+    built yet.
+    """
     budgets = FUNDING["child_initial_mu"] or {
         label: child_initial_mu(label, self_rate) for label in CHILD_DECLARED_RESOURCES}
+    builds = {label: child_build_mu(label) for label in budgets}
+    largest = max(budgets, key=lambda label: budgets[label])
     parts = {
         # Children run one at a time and are refunded on stop, so only the
-        # largest deposit is ever held at once.
-        "largest_child_deposit_mu": max(budgets.values()),
+        # largest deposit is ever held at once. (network_share holds three members,
+        # and splits one child's runtime between them.)
+        "largest_child_deposit_mu": budgets[largest],
+        "builds_owed_mu": sum(b for label, b in builds.items() if label != largest),
         "suite_upkeep_mu": int(self_rate * SUITE_EXPECTED_SECONDS),
         "reserve_after_suite_mu": int(self_rate * MIN_RESERVE_SECONDS),
-        "pending_builds_mu": pending_builds * BUILD_MU_ESTIMATE,
     }
     parts["required_mu"] = sum(parts.values())
+    parts["builds_owed"] = sorted(label for label, b in builds.items() if b)
     return parts
 
 
@@ -521,8 +689,34 @@ def funding_status(required=None):
 # balance. A probe reports them as INFRA_ERROR like any launch failure; the
 # suite runner reads this to know the run was starved, not blind.
 FUNDING_FAILURES = []
-_INSUFFICIENT_FUNDS_RE = re.compile(r"error charging|insufficient balance|not enough balance",
-                                    re.IGNORECASE)
+# The last three are the refusals of nodo #563: the initial_mu of a child does not
+# cover its build, or leaves less than one maintenance period after it
+# (src/utils/cost_functions/start_funding.py). Both mean the child was funded too
+# low, which is a shortage like the others: nothing was observed about the node.
+_INSUFFICIENT_FUNDS_RE = re.compile(
+    r"error charging|insufficient balance|not enough balance"
+    r"|does not cover the build|after the build of|least initial_mu",
+    re.IGNORECASE)
+# "initial_mu 2000000 MU does not cover the build of the service, 10000000 MU."
+_BUILD_REFUSAL_RE = re.compile(r"does not cover the build of (?:the service|this node), (\d+) MU")
+
+
+def learn_from_refusal(label, text):
+    """Take the build that a #563 refusal names as the build of that child.
+
+    The node names the figure it wanted, so the next start of the child is funded with
+    it instead of the estimate. Returns the build, or None.
+    """
+    match = _BUILD_REFUSAL_RE.search(text or "")
+    if not match:
+        return None
+    build = int(match.group(1))
+    base = label.split("(", 1)[0]
+    with _funding_lock:
+        FUNDING["build_learned_mu"] = max(FUNDING.get("build_learned_mu") or 0, build)
+        if base in CHILD_DECLARED_RESOURCES:
+            FUNDING["build_quote_mu"][base] = build
+    return build
 
 services = []
 logging.info('Gateway main directory: %s', node_url)
@@ -605,6 +799,8 @@ class ChildLaunchError(RuntimeError):
         self.label = label
         self.original = original
         self.insufficient_funds = bool(_INSUFFICIENT_FUNDS_RE.search(_full_error_text(original)))
+        if self.insufficient_funds:
+            learn_from_refusal(label, _full_error_text(original))
         msg = f"could not launch child '{label}': {_describe_launch_failure(original)}"
         if self.insufficient_funds:
             msg = (f"INSUFFICIENT FUNDS: the node refused to charge this instance for child "
@@ -704,10 +900,7 @@ def _spin_child(service_iface, label, wait_ready=True):
             FUNDING_FAILURES.append(label)
         raise err from e
     logging.info('Spun %s child at %s', label, inst.uri)
-    base = label.split("(", 1)[0]
-    with _funding_lock:
-        if base in CHILD_DECLARED_RESOURCES and base not in FUNDING["built_children"]:
-            FUNDING["built_children"].append(base)
+    _mark_built(label)
     if wait_ready:
         _wait_until_ready(inst.uri, label)
     return inst
@@ -1188,6 +1381,7 @@ DEP_IDENTITY = [
     ("ping", "celaut-demo-ping", "/whoami"),
     ("benchmark", "celaut-demo-benchmark", "/cgi-bin/whoami"),
     ("sharefs", "celaut-demo-sharefs", "/whoami"),
+    ("netshare", "celaut-demo-netshare", "/whoami"),
 ]
 # sharefs-denied is absent on purpose: a node that honours the share rules never starts it,
 # so there is no identity to read. shared_filesystem is what asks for it.
@@ -1648,6 +1842,1096 @@ def probe_shared_filesystem():
 
 
 # ----------------------------------------------------------------------------
+# The newer benchmarks: children started over nodo_gateway
+# ----------------------------------------------------------------------------
+# node_controller starts a child with its own copy of an older celaut.proto. The
+# benchmarks below need what it cannot send -- an initial_mu per start, a
+# StartReference, env vars per instance, the block skip -- or read what it cannot
+# read (quotes, statements, tunnels), so they start their children with nodo_gateway.
+# They keep the rules of the other probes: every child is stopped in a `finally`, a
+# start the node refuses for want of funds is recorded in FUNDING_FAILURES, and only an
+# observed violation accuses.
+CHILD_PORT = 3030  # every demo child serves http on 3030 (its service.json)
+
+
+def _instance_uri(instance, port=CHILD_PORT):
+    """host:port of a slot of a ServiceInstance, the declared port first."""
+    slots = list(instance.instance.uri_slot)
+    for slot in sorted(slots, key=lambda s: s.internal_port != port):
+        for uri in slot.uri:
+            return f"{uri.ip}:{uri.port}"
+    return None
+
+
+def _child_budget(label):
+    with _funding_lock:
+        return FUNDING["child_initial_mu"].get(label)
+
+
+def _gw_start(label, *, initial_mu="budget", envs=None, start_ref=None, send_service=True,
+              block_skip=True, wait_ready=True, count_funding=True, **kwargs):
+    """Start one child over nodo_gateway; the gw.StartResult, with ``uri``.
+
+    ``initial_mu`` "budget" is what the funding gate sized the child at (its build and
+    its runtime), and None leaves it to the node. A refusal for funds is recorded in
+    FUNDING_FAILURES unless ``count_funding`` is off: build_funding asks for refusals.
+    """
+    if initial_mu == "budget":
+        initial_mu = _child_budget(label)
+    config = gw.configuration(initial_mu=initial_mu, envs=envs) \
+        if (initial_mu is not None or envs) else None
+    try:
+        result = gw.start_service(node_url, packed(label), config=config, start_ref=start_ref,
+                                  send_service=send_service, block_skip=block_skip, **kwargs)
+    except gw.GatewayError as e:
+        if count_funding and _INSUFFICIENT_FUNDS_RE.search(str(e)):
+            learn_from_refusal(label, str(e))
+            FUNDING_FAILURES.append(label)
+        raise
+    _mark_built(label)
+    result.uri = _instance_uri(result.instance)
+    logging.info("Started %s at %s (%d request bytes)", label, result.uri, result.request_bytes)
+    if wait_ready and result.uri:
+        _wait_until_ready(result.uri, label)
+    return result
+
+
+def _gw_stop(token, label):
+    """Stop a child started over nodo_gateway; its refund, or None when it failed."""
+    if not token:
+        return None
+    try:
+        refund = gw.stop_service(node_url, token)
+        logging.info("Stopped %s (refund %s MU)", label, refund)
+        return refund
+    except Exception as e:
+        # A child we could not stop is a leak to report, never a verdict.
+        logging.warning("Could not stop %s: %s", label, e)
+        return None
+
+
+def _own_head():
+    """The seq of the last movement of this instance's account (a statement with no row)."""
+    return int(gw.balance_statement(node_url, from_seq=0).head_seq)
+
+
+def _own_rows_after(seq):
+    """Every movement of this instance's account after ``seq``, from signed statements."""
+    return [mv for page in gw.full_statement(node_url, from_seq=seq + 1) for mv in page.movements]
+
+
+def _child_rows(token):
+    return [mv for page in gw.full_statement(node_url, token=token, from_seq=1)
+            for mv in page.movements]
+
+
+def _rows_for_ref(rows, ref):
+    """The child_start movements that carry a StartReference, in hex (#578)."""
+    return [mv for mv in rows
+            if mv.kind == "child_start" and gw.detail_of(mv).get("start_ref") == ref.hex()]
+
+
+def _movement_view(mv):
+    return {"seq": int(mv.seq), "kind": mv.kind, "amount": int(mv.amount.n),
+            "balance_after": int(mv.balance_after.n), "detail": gw.detail_of(mv)}
+
+
+def _infra(ev, what, e):
+    """INFRA_ERROR for an exception: an RPC that failed observed nothing."""
+    ev["verdict"] = VERDICT_INFRA_ERROR
+    if isinstance(e, gw.GatewayError):
+        ev["grpc_code"] = e.code
+        ev["node_detail"] = e.details
+    ev["reason"] = f"could not observe {what}: {type(e).__name__}: {clip(e)}. No claim is made."
+    if FUNDING_FAILURES:
+        ev["fault"] = "insufficient_funds"
+    return ev
+
+
+# ----------------------------------------------------------------------------
+# Probe — build funding (nodo #563)
+# ----------------------------------------------------------------------------
+# Since nodo #563 the caller pays Configuration.initial_mu and nothing else. The node
+# takes the build of the service out of it, and refuses a start when the build does not
+# fit, or when what is left does not pay one maintenance period. A refused start
+# charges nothing (src/utils/cost_functions/start_funding.py). So:
+#
+#   below the build       -> refused, "does not cover the build of the service, <b> MU"
+#   below one period      -> refused, "leaves <x> MU after the build of <b> MU. One
+#                            maintenance period costs <p> MU."
+#   enough                -> started; this account pays exactly initial_mu, and the build
+#                            shows on the child's account, never on this one.
+#
+# The build is the node's own quote (quote_build: the cost of a quote that asks for a
+# balance of 1 MU, less that MU), and it is 0 once the node has built the image: then
+# only the second rule can be exercised. Each start carries a StartReference, so its child_start (if
+# any) is found in this account's statement by its reference, not by amount or time.
+BUILD_FUNDING_CHILD = "tiny"
+# The funded start: the build plus the runtime the child is funded with anyway, and never
+# less than this many periods. A few periods are a balance that runs out in seconds
+# (MANAGER_ITERATION_TIME is 10 s on a default node), before the child has even booted.
+BUILD_FUNDING_MIN_PERIODS = 60
+_BUILD_RULE_RE = re.compile(r"does not cover the build of the service, (\d+) MU")
+_PERIOD_RULE_RE = re.compile(r"leaves (-?\d+) MU after the build of (\d+) MU\. "
+                             r"One maintenance period costs (\d+) MU")
+
+
+def _judge_build_funding(ev, rows, build, period):
+    """The verdict of build_funding, from its attempts and this account's movements."""
+    ev["build_rows_on_this_account"] = [_movement_view(mv) for mv in rows if mv.kind == "build"]
+    violations, unexpected = [], []
+    for attempt in ev["attempts"]:
+        starts = _rows_for_ref(rows, bytes.fromhex(attempt["start_ref"]))
+        attempt["child_start_rows"] = [_movement_view(mv) for mv in starts]
+        start_seqs = {str(int(mv.seq)) for mv in starts}
+        refunds = [mv for mv in rows if mv.kind == "refund"
+                   and str(gw.detail_of(mv).get("refunds_seq")) in start_seqs]
+        net = sum(int(mv.amount.n) for mv in starts + refunds)
+        attempt["net_charge_mu"] = -net
+        if -net > attempt["initial_mu"]:
+            violations.append(f"{attempt['attempt']}: charged {-net} MU for an initial_mu of "
+                              f"{attempt['initial_mu']} MU")
+        if attempt["expect"] == "start":
+            amounts = [int(mv.amount.n) for mv in starts]
+            if amounts != [-attempt["initial_mu"]]:
+                violations.append(f"funded: the child_start of its reference is {amounts}, "
+                                  f"not [-{attempt['initial_mu']}]")
+            child_rows = attempt.get("child_rows") or []
+            opened = [r["amount"] for r in child_rows if r["kind"] == "start"]
+            attempt["child_build_mu"] = -sum(r["amount"] for r in child_rows if r["kind"] == "build")
+            if opened and opened[0] != attempt["initial_mu"]:
+                violations.append(f"funded: the child's account opened with {opened[0]} MU, not "
+                                  f"the initial_mu {attempt['initial_mu']} MU")
+            if attempt["child_build_mu"] > build:
+                violations.append(f"funded: the child paid a build of {attempt['child_build_mu']} "
+                                  f"MU, above the quote of {build} MU")
+            continue
+        if attempt["outcome"] == "started":
+            unexpected.append(f"{attempt['attempt']}: the node started a child with an initial_mu "
+                              f"of {attempt['initial_mu']} MU (build {build} MU, one period "
+                              f"{period} MU) instead of refusing it")
+            continue
+        if net != 0:
+            violations.append(f"{attempt['attempt']}: the node refused the start and kept "
+                              f"{-net} MU of it")
+        text = attempt.get("node_detail") or ""
+        if attempt["expect"] == "build":
+            m = _BUILD_RULE_RE.search(text)
+            attempt["named_build_mu"] = int(m.group(1)) if m else None
+            if not m:
+                unexpected.append(f"below_build was refused, but not by the build rule: {text}")
+        else:
+            m = _PERIOD_RULE_RE.search(text)
+            if m:
+                attempt["named_build_mu"] = int(m.group(2))
+                attempt["named_period_mu"] = int(m.group(3))
+            else:
+                unexpected.append(f"below_one_period was refused, but not by the period rule: {text}")
+    if ev["build_rows_on_this_account"]:
+        violations.append(f"a build was charged to this account, the caller's: "
+                          f"{ev['build_rows_on_this_account']}")
+
+    if violations:
+        ev["verdict"] = VERDICT_DISHONEST
+        ev["reason"] = "the node broke the start-funding rules of #563: " + "; ".join(violations)
+    elif unexpected:
+        ev["verdict"] = VERDICT_INCONCLUSIVE
+        ev["reason"] = ("the node did not refuse an under-funded start the way #563 says, but it "
+                        "charged nothing beyond initial_mu: " + "; ".join(unexpected))
+    else:
+        rules = [a["attempt"] for a in ev["attempts"] if a["expect"] != "start"]
+        ev["verdict"] = VERDICT_PASS
+        ev["reason"] = (f"refused {rules} with the #563 messages and charged nothing for them; "
+                        f"the funded start (build {build} MU) charged this account exactly its "
+                        f"initial_mu, and the build was paid from the child's account")
+    return ev
+
+
+def probe_build_funding():
+    label = BUILD_FUNDING_CHILD
+    ev = {"probe": "build_funding", "child": label, "attempts": []}
+    tokens = []
+    try:
+        build, quote = quote_build(label)
+        period = gw.mu(quote.max_maintenance_cost)
+        ev["quote"] = {"build_mu": build, "max_maintenance_cost_mu": period,
+                       "init_maintenance_cost_mu": gw.mu(quote.init_maintenance_cost),
+                       "maintenance_seconds_loop": int(quote.maintenance_seconds_loop)}
+        if build == 0 and period == 0:
+            ev["verdict"] = VERDICT_NOT_APPLICABLE
+            ev["reason"] = ("the node quotes no build and no maintenance for the child: it runs "
+                            "for free (free tier), so a start cannot be under-funded")
+            return ev
+        head = _own_head()
+
+        plan = []
+        if build > 0:
+            plan.append(("below_build", build - 1, "build"))
+        plan.append(("below_one_period", build + max(1, period // 2), "period"))
+        rate = FUNDING["self_rate_mu_per_s"]
+        runtime = child_runtime_mu(label, rate) if rate is not None else 0
+        plan.append(("funded", build + max(runtime, BUILD_FUNDING_MIN_PERIODS * max(period, 1)), None))
+        for name, amount, rule in plan:
+            ref = secrets.token_bytes(16)
+            attempt = {"attempt": name, "initial_mu": amount, "expect": rule or "start",
+                       "start_ref": ref.hex()}
+            ev["attempts"].append(attempt)
+            try:
+                r = _gw_start(label, initial_mu=amount, start_ref=ref,
+                              count_funding=(rule is None), wait_ready=(rule is None))
+            except gw.GatewayError as e:
+                attempt["outcome"] = "refused"
+                attempt["grpc_code"] = e.code
+                attempt["node_detail"] = clip(e.details or str(e), 500)
+                if rule is None:
+                    raise
+                continue
+            tokens.append(r.instance.token)
+            attempt["outcome"] = "started"
+            if rule is None:
+                attempt["child_balance_mu"] = gw.metrics_balance(node_url, r.instance.token)
+                attempt["child_rows"] = [_movement_view(mv) for mv in _child_rows(r.instance.token)]
+        return _judge_build_funding(ev, _own_rows_after(head), build, period)
+    except Exception as e:
+        return _infra(ev, "the start-funding rules", e)
+    finally:
+        for token in tokens:
+            _gw_stop(token, label)
+
+
+def _node_claims(feature):
+    """Whether the node's signed Peer names ``feature``, or None when it cannot be read.
+
+    The celaut-gateway layer of each address the node announces lists the message
+    type at each index of each RPC (src/identity/transport_stack.py), so a node whose
+    StartService takes a StartReference names it there. A node that does not name a
+    feature makes no promise about it, and is not accused of breaking it.
+    """
+    try:
+        return feature.encode() in gw.peer_info(node_url).SerializeToString()
+    except Exception as e:
+        logging.warning("Could not read the node's Peer: %s", e)
+        return None
+
+
+# ----------------------------------------------------------------------------
+# Probe — idempotent StartService (nodo #578, PR #585)
+# ----------------------------------------------------------------------------
+# A StartService with a StartReference chosen by the caller is idempotent: the node keys
+# the reference by the caller (a local instance, here), and a second request with the
+# same reference starts nothing and charges nothing. It answers the same
+# ServiceInstance, and needs no service: the reference alone is enough. The child_start
+# that paid the start carries the reference in detail.start_ref, so this account's
+# statement shows how many starts the reference paid for.
+IDEMPOTENT_CHILD = "tiny"
+IDEMPOTENT_ASKS = 3            # the first start and two more requests with its reference
+IDEMPOTENT_RETRY_ABORTED = 5   # ABORTED: the first start is still running; ask again
+IDEMPOTENT_RETRY_SECONDS = 2
+
+
+def _ask_again(label, ref, initial_mu):
+    """A request with the reference and the hashes only. ABORTED is asked again."""
+    for _ in range(IDEMPOTENT_RETRY_ABORTED):
+        try:
+            config = gw.configuration(initial_mu=initial_mu) if initial_mu is not None else None
+            return gw.start_service(node_url, packed(label), start_ref=ref, config=config,
+                                    send_service=False)
+        except gw.GatewayError as e:
+            if e.code != "ABORTED":
+                raise
+            time.sleep(IDEMPOTENT_RETRY_SECONDS)
+    raise RuntimeError(f"the start of the reference was still in progress after "
+                       f"{IDEMPOTENT_RETRY_ABORTED} requests")
+
+
+def probe_idempotent_start():
+    label = IDEMPOTENT_CHILD
+    ev = {"probe": "idempotent_start", "child": label, "asks": []}
+    tokens = []
+    try:
+        head = _own_head()
+        ref = secrets.token_bytes(16)
+        ev["start_ref"] = ref.hex()
+        first = _gw_start(label, start_ref=ref)
+        tokens.append(first.instance.token)
+        ev["first"] = {"uri": first.uri, "seconds_to_instance": first.seconds_to_instance}
+        budget = _child_budget(label)
+        errors = []
+        for i in range(1, IDEMPOTENT_ASKS):
+            # The second request carries no Configuration, the third one another
+            # initial_mu: neither may change what the reference already started.
+            other_mu = None if i == 1 else (budget or 0) + 12345
+            ask = {"ask": i + 1, "initial_mu": other_mu}
+            try:
+                r = _ask_again(label, ref, other_mu)
+                ask.update(token_is_first=(r.instance.token == first.instance.token),
+                           uri=_instance_uri(r.instance), seconds_to_instance=r.seconds_to_instance)
+                if r.instance.token not in tokens:
+                    tokens.append(r.instance.token)
+            except Exception as e:
+                ask["error"] = clip(e)
+                errors.append(f"request {i + 1}: {clip(e)}")
+            ev["asks"].append(ask)
+
+        starts = _rows_for_ref(_own_rows_after(head), ref)
+        ev["child_start_rows"] = [_movement_view(mv) for mv in starts]
+        ev["instances"] = len(tokens)
+        claims = _node_claims("StartReference")
+        ev["node_announces_start_reference"] = claims
+        repeated = len(starts) > 1 or len(tokens) > 1
+        if repeated and claims:
+            ev["verdict"] = VERDICT_DISHONEST
+            ev["reason"] = (f"one StartReference gave {len(tokens)} instance(s) and "
+                            f"{len(starts)} child_start charge(s); the node announces "
+                            "StartReference, and a second request with it must start and "
+                            "charge nothing")
+        elif repeated:
+            ev["verdict"] = VERDICT_INCONCLUSIVE
+            ev["reason"] = (f"one StartReference gave {len(tokens)} instance(s) and "
+                            f"{len(starts)} charge(s), but the node does not announce "
+                            "StartReference (#578), so it made no promise to break")
+        elif errors:
+            ev["verdict"] = VERDICT_INCONCLUSIVE
+            ev["reason"] = ("a request with the reference of a start that succeeded did not "
+                            "get its instance back: " + "; ".join(errors))
+        elif len(starts) != 1:
+            ev["verdict"] = VERDICT_INCONCLUSIVE
+            ev["reason"] = (f"the statement shows {len(starts)} child_start with the reference; "
+                            "the start that it paid for cannot be found")
+        else:
+            ev["verdict"] = VERDICT_PASS
+            ev["reason"] = (f"{IDEMPOTENT_ASKS} requests with one StartReference gave one "
+                            f"instance and one charge of {-int(starts[0].amount.n)} MU; the "
+                            "requests after the first sent no service and got the same instance")
+        return ev
+    except Exception as e:
+        return _infra(ev, "an idempotent start", e)
+    finally:
+        for token in tokens:
+            _gw_stop(token, label)
+
+
+# ----------------------------------------------------------------------------
+# Probe — block skip on StartService (nodo #371, commit 7375f37)
+# ----------------------------------------------------------------------------
+# A StartService carries the Service, and the Service carries its blocks: tiny's image
+# is one block of tens of MB. A node that already holds what arrives stops the sender:
+# for a service it holds, at the first hash (bee-rpc's signal), and since #371 also for
+# each block it holds of a service it does not hold yet (a skip request in the response
+# direction, honoured by a sender with bee-rpc `block_skip`). Before #371 the node read
+# every block of such a service from the wire and dropped the ones it held.
+#
+# What a client sees is the first request that carries a service and the requests after
+# it. The first one is this instance's first send of tiny (quote_child_builds asks for
+# a quote with the service before any start): it carries the blocks the node does not
+# hold. The probe then starts tiny again, with the skip off and on, and counts the bytes
+# of each request the way nodo's own test does (the Buffers handed to gRPC), with the
+# time to the instance. A node that makes a client send blocks it holds costs bandwidth,
+# not money: that is never an accusation.
+BLOCK_SKIP_CHILD = "tiny"
+BLOCK_SKIP_ROUNDS = 2  # pairs of (skip off, skip on)
+# A start that sends less than this share of the blocks did not send them.
+BLOCK_SKIP_MAX_SHARE = 0.05
+
+
+def _packed_block_bytes(label):
+    """Bytes of the blocks of a packed child: what a request that carries them sends."""
+    p = packed(label)
+    try:
+        with open(os.path.join(p.service_path, "_.json")) as fh:
+            layout = json.load(fh)
+    except Exception:
+        return None
+    total = 0
+    block_dir = os.path.join(DIR, "__block__")
+    for entry in layout:
+        if isinstance(entry, list) and entry and isinstance(entry[0], str):
+            path = os.path.join(block_dir, entry[0])
+            if os.path.isfile(path):
+                total += os.path.getsize(path)
+            elif os.path.isdir(path):
+                for root, _, files in os.walk(path):
+                    total += sum(os.path.getsize(os.path.join(root, f)) for f in files)
+    return total
+
+
+def _median(values):
+    values = sorted(values)
+    if not values:
+        return None
+    mid = len(values) // 2
+    return values[mid] if len(values) % 2 else (values[mid - 1] + values[mid]) / 2
+
+
+def _timed_start(label, block_skip):
+    r = _gw_start(label, block_skip=block_skip, wait_ready=False)
+    try:
+        return {"block_skip": block_skip, "request_bytes": r.request_bytes,
+                "seconds_to_instance": r.seconds_to_instance,
+                "seconds_to_request_sent": r.seconds_to_complete}
+    finally:
+        _gw_stop(r.instance.token, label)
+
+
+def probe_block_skip():
+    label = BLOCK_SKIP_CHILD
+    ev = {"probe": "block_skip", "child": label, "starts": []}
+    try:
+        blocks = _packed_block_bytes(label)
+        first = FIRST_SENDS.get(label)
+        ev["packed_block_bytes"] = blocks
+        ev["first_send"] = first
+        off, on = [], []
+        for _ in range(BLOCK_SKIP_ROUNDS):
+            off.append(_timed_start(label, False))
+            on.append(_timed_start(label, True))
+        ev["starts"] = off + on
+        sent_on, sent_off = _median([s["request_bytes"] for s in on]), _median([s["request_bytes"] for s in off])
+        i_on, i_off = _median([s["seconds_to_instance"] for s in on]), _median([s["seconds_to_instance"] for s in off])
+        first_carried = bool(first and blocks and first.get("request_bytes", 0) >= blocks / 2)
+        ev.update({
+            "request_bytes_with_skip": sent_on,
+            "request_bytes_without_skip": sent_off,
+            "seconds_to_instance_with_skip": i_on,
+            "seconds_to_instance_without_skip": i_off,
+            "first_send_carried_the_blocks": first_carried,
+            "bytes_saved_against_first_send": (round(1 - sent_on / first["request_bytes"], 4)
+                                               if first_carried else None),
+        })
+        if not blocks:
+            ev["verdict"] = VERDICT_INCONCLUSIVE
+            ev["reason"] = "the blocks of the packed child could not be sized"
+        elif sent_on > blocks * BLOCK_SKIP_MAX_SHARE:
+            ev["verdict"] = VERDICT_INCONCLUSIVE
+            ev["reason"] = (f"a start of a child the node holds sent {sent_on} bytes of {blocks} "
+                            "bytes of blocks: the node did not stop the sender. It costs "
+                            "bandwidth, not money; no claim is made")
+        else:
+            compare = (f"; the first send of this child carried {first['request_bytes']} bytes "
+                       f"in {first['seconds']}s" if first_carried else
+                       "; the node already held the child at this instance's first send, so "
+                       "there is no full send to compare with")
+            ev["verdict"] = VERDICT_PASS
+            ev["reason"] = (f"a StartService for a child whose blocks the node holds sent "
+                            f"{sent_on} bytes of {blocks} bytes of blocks with the skip "
+                            f"({sent_off} without), and got its instance in {i_on}s "
+                            f"({i_off}s without){compare}")
+        return ev
+    except Exception as e:
+        return _infra(ev, "the block skip", e)
+
+
+# ----------------------------------------------------------------------------
+# Probe — environment variables (nodo #574, #582)
+# ----------------------------------------------------------------------------
+# A service declares the names of its environment variables (`envs` in service.json).
+# Since #582 the packer embeds them in Service.Container.environment_variables, so the
+# spec says what the service asks for; since #574 the node asks the caller for every
+# one and marks none required. At launch the values come from
+# Configuration.environment_variables, and the node gives them to the service on two
+# paths: always in /__config__ (config.environment_variables, the exact bytes), and
+# also as Linux env vars of the entrypoint when the name and value pass
+# src/utils/guest_env.py. The node gives no value of its own: a declared variable the
+# caller leaves out is absent, and the service uses its own default.
+#
+# `tiny` declares three: one the probe gives a random value, one it gives an empty
+# value, one it leaves out. tiny's /env reports both paths, with the values in hex.
+ENV_CHILD = "tiny"
+TINY_DECLARED_ENVS = ("DEMO_ENV_GIVEN", "DEMO_ENV_EMPTY", "DEMO_ENV_UNSET")
+
+
+def _packed_env_names(label):
+    """The env names the packer embedded in a child's spec (#582)."""
+    return [kv.key for kv in packed(label).spec().container.environment_variables]
+
+
+def _judge_env_report(report, sent, unset):
+    """(violations, gaps) between what was sent and what the child received."""
+    violations, gaps = [], []
+    process = report.get("process_env") or {}
+    config = report.get("config_env") or {}
+    if not report.get("config_readable"):
+        gaps.append("the child could not read its /__config__")
+    for name, value in sent.items():
+        want = value.hex()
+        got = config.get(name)
+        if report.get("config_readable"):
+            if got is None:
+                violations.append(f"{name} is not in /__config__, but the caller gave it")
+            elif got != want:
+                violations.append(f"{name} in /__config__ is {got}, the caller gave {want}")
+        env = process.get(name)
+        if env is None:
+            gaps.append(f"{name} is not in the process environment (the second path is "
+                        "additive and a guest may lack it)")
+        elif env != want:
+            violations.append(f"{name} in the process environment is {env}, the caller gave {want}")
+    for name in unset:
+        if process.get(name) is not None or config.get(name) is not None:
+            violations.append(f"{name} has a value ({process.get(name) or config.get(name)}) "
+                              "that nobody gave")
+    return violations, gaps
+
+
+def probe_env_vars():
+    label = ENV_CHILD
+    ev = {"probe": "env_vars", "child": label, "declared": list(TINY_DECLARED_ENVS)}
+    token = None
+    try:
+        try:
+            ev["packed_names"] = _packed_env_names(label)
+        except Exception as e:
+            ev["packed_names"] = None
+            ev["packed_error"] = clip(e)
+        given = "v-" + secrets.token_hex(8)
+        sent = {"DEMO_ENV_GIVEN": given.encode(), "DEMO_ENV_EMPTY": b""}
+        unset = ("DEMO_ENV_UNSET",)
+        ev["sent"] = {k: v.decode() for k, v in sent.items()}
+        ev["left_out"] = list(unset)
+        r = _gw_start(label, envs=sent)
+        token = r.instance.token
+        report = requests.get(f"http://{r.uri}/env", timeout=30).json()
+        ev["child_report"] = report
+        violations, gaps = _judge_env_report(report, sent, unset)
+        if ev["packed_names"] is None:
+            gaps.append(f"the packed spec of the child could not be read: {ev.get('packed_error')}")
+        elif sorted(ev["packed_names"]) != sorted(TINY_DECLARED_ENVS):
+            # The packer keeps the names as a sorted key-value list, so only the set counts.
+            gaps.append(f"the packed spec names {ev['packed_names']}, the manifest declares "
+                        f"{list(TINY_DECLARED_ENVS)}: the packer that packed this service drops "
+                        "envs (before nodo #582)")
+        if violations:
+            ev["verdict"] = VERDICT_DISHONEST
+            ev["reason"] = "the child did not get the configuration it was started with: " + \
+                           "; ".join(violations)
+        elif gaps:
+            ev["verdict"] = VERDICT_INCONCLUSIVE
+            ev["reason"] = "the values that arrived are right, but: " + "; ".join(gaps)
+        else:
+            ev["verdict"] = VERDICT_PASS
+            ev["reason"] = ("the packed spec names the three declared variables; the given and "
+                            "the empty value arrived exactly in /__config__ and in the process "
+                            "environment, and the variable left out has no value (the service's "
+                            "own default applies)")
+        return ev
+    except ValueError as e:
+        ev["verdict"] = VERDICT_INCONCLUSIVE
+        ev["reason"] = f"the child's /env answer was not JSON: {clip(e)}"
+        return ev
+    except (ChildNotReadyError, requests.RequestException) as e:
+        return _infra(ev, "the env vars", e)
+    except Exception as e:
+        return _infra(ev, "the env vars", e)
+    finally:
+        _gw_stop(token, label)
+
+
+# ----------------------------------------------------------------------------
+# Probe — network share (nodo #268)
+# ----------------------------------------------------------------------------
+# A network share is a directory that instances with no common parent share because they
+# declare the same network and the same share (docs/SHARED_FILESYSTEMS.md, "Network
+# shares"). netshare declares the network `celaut-demo-netshare` with the selection key
+# group=${DEMO_NETSHARE_GROUP}, and /netshare as a share of it. The share id includes the
+# formal after substitution, so each group is its own share.
+#
+# The probe starts three netshare instances as siblings: two of one group, one of
+# another. This service is the parent of each, but it does not export /netshare and is
+# not a member: it only declares the network, because a child gets only the networks
+# every ancestor declares. Member A writes, member B (same group) must read it, B writes
+# back and A must read that, and member C (other group) must not see A's file.
+NETSHARE_CHILD = "netshare"
+NETSHARE_MOUNT = "/netshare"
+NETSHARE_TIMEOUT_S = 30
+NETSHARE_MEMBERS = 3  # held at once: they share the runtime budget of one child
+
+
+def _netshare_member_mu():
+    """The initial_mu of one member: the build (if still owed) and a third of the runtime.
+
+    Three members run at once, for seconds. One child's runtime split between them keeps
+    what the suite holds at once at the largest single deposit, which is what the
+    funding gate counts on.
+    """
+    rate = FUNDING["self_rate_mu_per_s"]
+    if rate is None:
+        return None
+    runtime = child_runtime_mu(NETSHARE_CHILD, rate) // NETSHARE_MEMBERS
+    return child_build_mu(NETSHARE_CHILD) + max(CHILD_MIN_INITIAL_MU, runtime)
+
+
+def _netshare(uri, action, **params):
+    return requests.get(f"http://{uri}/{action}", params=params, timeout=NETSHARE_TIMEOUT_S).json()
+
+
+def _netshare_wait(uri, name, expected):
+    """Read ``name`` on a member until it holds ``expected``; the last answer."""
+    deadline = time.monotonic() + SHARE_PROPAGATION_TIMEOUT_S
+    while True:
+        answer = _netshare(uri, "read", name=name)
+        if answer.get("content") == expected or time.monotonic() >= deadline:
+            return answer
+        time.sleep(SHARE_PROPAGATION_POLL_S)
+
+
+def _plan_has_share(answer):
+    plan = (answer or {}).get("mount_plan") or {}
+    return bool(plan.get("present")) and NETSHARE_MOUNT in (plan.get("raw") or "")
+
+
+def probe_network_share():
+    label = NETSHARE_CHILD
+    ev = {"probe": "network_share", "child": label}
+    tokens = []
+    try:
+        groups = {"same": "g" + secrets.token_hex(4), "other": "g" + secrets.token_hex(4)}
+        uris = {}
+        for member, group in (("a", groups["same"]), ("b", groups["same"]), ("c", groups["other"])):
+            r = _gw_start(label, initial_mu=_netshare_member_mu(),
+                          envs={NETSHARE_GROUP_ENV: group.encode()})
+            tokens.append(r.instance.token)
+            uris[member] = r.uri
+        ev["groups"] = {"a": groups["same"], "b": groups["same"], "c": groups["other"]}
+        n1, n2 = secrets.token_hex(8), secrets.token_hex(8)
+        answers = {
+            "a_write": _netshare(uris["a"], "write", name="from_a", nonce=n1),
+        }
+        answers["b_read"] = _netshare_wait(uris["b"], "from_a", n1)
+        answers["b_write"] = _netshare(uris["b"], "write", name="from_b", nonce=n2)
+        answers["a_read"] = _netshare_wait(uris["a"], "from_b", n2)
+        answers["c_read"] = _netshare(uris["c"], "read", name="from_a")
+        ev["answers"] = answers
+        plans = {m: _plan_has_share(answers[k]) for m, k in
+                 (("a", "a_write"), ("b", "b_write"), ("c", "c_read"))}
+        ev["mount_plans"] = plans
+
+        if answers["c_read"].get("content") == n1:
+            ev["verdict"] = VERDICT_DISHONEST
+            ev["reason"] = ("a member of another group read what a member of the first group "
+                            "wrote: the node put two shares with different ids in one directory")
+        elif not all(plans.values()):
+            ev["verdict"] = VERDICT_INCONCLUSIVE
+            ev["reason"] = (f"a member launched with no mount plan for {NETSHARE_MOUNT} "
+                            f"({plans}): it was not asked to mount the share. {_PACKAGING_HINT}")
+        elif not (answers["a_write"].get("ok") and answers["b_write"].get("ok")):
+            ev["verdict"] = VERDICT_INCONCLUSIVE
+            ev["reason"] = (f"a member could not write to the share it mounts read-write: "
+                            f"{answers['a_write']}, {answers['b_write']}")
+        elif answers["b_read"].get("content") != n1 or answers["a_read"].get("content") != n2:
+            ev["verdict"] = VERDICT_DISHONEST
+            ev["reason"] = ("two members of one group did not see each other's files: the node "
+                            "gave one network share two directories (B saw "
+                            f"{answers['b_read'].get('content')!r} for {n1!r}, A saw "
+                            f"{answers['a_read'].get('content')!r} for {n2!r})")
+        else:
+            ev["verdict"] = VERDICT_PASS
+            ev["reason"] = ("two members of one group with no common exporter shared /netshare "
+                            "both ways, and a member of another group did not see it")
+        return ev
+    except ValueError as e:
+        ev["verdict"] = VERDICT_INCONCLUSIVE
+        ev["reason"] = f"a member's answer was not JSON: {clip(e)}"
+        return ev
+    except Exception as e:
+        return _infra(ev, "the network share", e)
+    finally:
+        for token in tokens:
+            _gw_stop(token, label)
+
+
+# ----------------------------------------------------------------------------
+# Probe — service tunnel: throughput and price
+# ----------------------------------------------------------------------------
+# Gateway.ServiceTunnel opens a byte stream to a declared slot of a local instance. The
+# node charges the instance tunnel_open_mu to open it, then net_mu_per_gib for the bytes
+# it relays in either direction, billed per costs.TUNNEL_CHARGE_INTERVAL_KB and the rest
+# when the tunnel closes (src/tunneling/rpc_tunnel.py). The charge is per volume, with no
+# scarcity surcharge: amount = net_mu_per_gib * bytes // GiB. Each charge is a "tunnel"
+# movement of the instance, with the bytes it billed in its detail.
+#
+# The probe reads TUNNEL_TEST_BYTES from tiny's /bytes/<n>, once directly (the control)
+# and once over a ServiceTunnel, and then reads tiny's statement: the bytes billed must
+# be the bytes relayed, and each charge at most the advertised rate (from /__config__).
+TUNNEL_CHILD = "tiny"
+TUNNEL_TEST_BYTES = int(os.environ.get("TUNNEL_TEST_BYTES", str(64 * 1024 * 1024)))
+TUNNEL_SETTLE_S = float(os.environ.get("TUNNEL_SETTLE_S", "15"))
+# Bytes billed beyond what was relayed that can still be framing, not an overcharge.
+TUNNEL_BILL_SLACK = 4096
+
+
+def _direct_download(uri, n):
+    t0 = time.monotonic()
+    with requests.get(f"http://{uri}/bytes/{n}", stream=True, timeout=300) as r:
+        got = sum(len(chunk) for chunk in r.iter_content(64 * 1024))
+    return got, time.monotonic() - t0
+
+
+def _tunnel_rows(token, relayed):
+    """The tunnel movements of the child, once the bill of the closed tunnel is in."""
+    deadline = time.monotonic() + TUNNEL_SETTLE_S
+    while True:
+        rows = [mv for mv in _child_rows(token) if mv.kind == "tunnel"]
+        billed = sum(int(gw.detail_of(mv).get("bytes", 0)) for mv in rows)
+        # The last part of a megabyte may cost 0 MU, and a charge of 0 writes no row.
+        if billed >= relayed - TUNNEL_BILL_SLACK or time.monotonic() >= deadline:
+            return rows
+        time.sleep(1)
+
+
+def _judge_tunnel_bill(rows, relayed, rates):
+    """(evidence, violations, notes) for the tunnel movements of the child."""
+    net_rate, open_rate = rates.get("net_mu_per_gib"), rates.get("tunnel_open_mu")
+    opens, traffic, violations, notes = [], [], [], []
+    for mv in rows:
+        detail = gw.detail_of(mv)
+        charged = -int(mv.amount.n)
+        if detail.get("open"):
+            opens.append(charged)
+            if open_rate is not None and charged > open_rate:
+                violations.append(f"the opening cost {charged} MU, the node advertises "
+                                  f"{open_rate} MU")
+            continue
+        n = int(detail.get("bytes", 0))
+        expected = net_rate * n // GIB if net_rate is not None else None
+        traffic.append({"bytes": n, "charged_mu": charged, "advertised_mu": expected})
+        if expected is not None and charged > expected:
+            violations.append(f"{n} bytes cost {charged} MU, the advertised rate gives {expected} MU")
+    billed = sum(t["bytes"] for t in traffic)
+    charged = sum(t["charged_mu"] for t in traffic)
+    if billed > relayed + TUNNEL_BILL_SLACK:
+        violations.append(f"{billed} bytes billed for {relayed} bytes relayed")
+    elif billed < relayed - TUNNEL_BILL_SLACK and net_rate:
+        notes.append(f"{billed} bytes billed for {relayed} relayed: the node charged less")
+    if net_rate is None or open_rate is None:
+        notes.append("the node's rates are not in /__config__: the prices were not compared")
+    evidence = {"open_charges_mu": opens, "traffic_rows": traffic, "billed_bytes": billed,
+                "relayed_bytes": relayed, "traffic_charged_mu": charged,
+                "advertised_net_mu_per_gib": net_rate, "advertised_tunnel_open_mu": open_rate,
+                "effective_mu_per_gib": round(charged * GIB / billed, 1) if billed else None}
+    return evidence, violations, notes
+
+
+def probe_tunnel():
+    label = TUNNEL_CHILD
+    n = TUNNEL_TEST_BYTES
+    ev = {"probe": "tunnel", "child": label, "bytes_asked": n}
+    token = None
+    try:
+        r = _gw_start(label)
+        token = r.instance.token
+        got, direct_s = _direct_download(r.uri, n)
+        ev["direct"] = {"bytes": got, "seconds": round(direct_s, 3),
+                        "mib_per_s": round(got / direct_s / 2 ** 20, 1) if direct_s else None}
+        t = gw.tunnel_http_get(node_url, token, CHILD_PORT, f"/bytes/{n}")
+        relayed = t.sent_bytes + t.received_bytes
+        ev["tunnel"] = {"status": t.status, "body_bytes": t.body_bytes, "sent_bytes": t.sent_bytes,
+                        "received_bytes": t.received_bytes, "seconds": round(t.seconds, 3),
+                        "mib_per_s": round(t.body_bytes / t.seconds / 2 ** 20, 1) if t.seconds else None}
+        if t.status != 200 or t.body_bytes != n:
+            ev["verdict"] = VERDICT_INFRA_ERROR
+            ev["reason"] = (f"the tunnel answered {t.status} with {t.body_bytes} of {n} bytes: the "
+                            "transfer did not complete, so there is no bill to check")
+            return ev
+        evidence, violations, notes = _judge_tunnel_bill(_tunnel_rows(token, relayed), relayed,
+                                                          NODE_RATES)
+        ev["bill"] = evidence
+        ev["notes"] = notes
+        if violations:
+            ev["verdict"] = VERDICT_DISHONEST
+            ev["reason"] = "the node charged the tunnel above what it advertises: " + "; ".join(violations)
+        elif not evidence["traffic_rows"] and NODE_RATES.get("net_mu_per_gib"):
+            ev["verdict"] = VERDICT_INCONCLUSIVE
+            ev["reason"] = (f"the node relayed {relayed} bytes and the statement of the child shows "
+                            f"no traffic charge after {TUNNEL_SETTLE_S}s")
+        elif NODE_RATES.get("net_mu_per_gib") is None:
+            ev["verdict"] = VERDICT_INCONCLUSIVE
+            ev["reason"] = "the tunnel worked, but the node's rates are not in /__config__ to compare"
+        else:
+            ev["verdict"] = VERDICT_PASS
+            ev["reason"] = (f"{n} bytes over the tunnel at {ev['tunnel']['mib_per_s']} MiB/s "
+                            f"(direct {ev['direct']['mib_per_s']} MiB/s); {evidence['billed_bytes']} "
+                            f"bytes billed for {relayed} relayed, at "
+                            f"{evidence['effective_mu_per_gib']} MU/GiB against the advertised "
+                            f"{evidence['advertised_net_mu_per_gib']}")
+        return ev
+    except Exception as e:
+        return _infra(ev, "the tunnel", e)
+    finally:
+        _gw_stop(token, label)
+
+
+# ----------------------------------------------------------------------------
+# Probe — balance statement (nodo #570, #571)
+# ----------------------------------------------------------------------------
+# Every write of a balance goes with a row in balance_movements, and GetBalanceStatement
+# returns the rows of the caller's account, signed by the node: a local instance reads
+# its own account by its address. The rows are a hash chain: each one carries the hash
+# of the row before it, the first one hangs from a genesis hash tied to the account,
+# and the head commits to all of them. The node signs the digest of every field and the
+# hash of every row with the key of its Peer (Ed25519).
+#
+# This probe runs after the others, so the statement holds the whole run: the starts of
+# the children, their refunds, the maintenance ticks, the statement queries. It checks
+# it by the rules of nodo's own reader (statement_check.verify_chain, in nodo_gateway):
+# signature, chain, the rows add up to the balance, the head is the last row. It checks
+# that each statement_query charge is the advertised price, and it ties the statement to
+# the balance that ModifyServiceSystemResources reports.
+def _statement_query_overcharges(rows, rates):
+    """statement_query charges above statement_query_mu + statement_row_mu x rows.
+
+    The node prices a read by the rows it returns, plus the charge row itself when the
+    payer reads its own account (src/database/sql_connection.py, balance_statement).
+    A read of a child's account names the child in instance_ref.
+    """
+    q, r = rates.get("statement_query_mu"), rates.get("statement_row_mu")
+    if q is None or r is None:
+        return None
+    out = []
+    for mv in rows:
+        if mv.kind != "statement_query":
+            continue
+        n = int(gw.detail_of(mv).get("rows", 0))
+        expected = q + r * (n + (0 if mv.instance_ref else 1))
+        if -int(mv.amount.n) > expected:
+            out.append(f"movement {mv.seq}: {-int(mv.amount.n)} MU for {n} rows, the advertised "
+                       f"price is {expected} MU")
+    return out
+
+
+def _peer_rates(peer):
+    """The rates in a Peer (mu_per_call), by name."""
+    out = {}
+    for kv in getattr(peer, "mu_per_call", []):
+        try:
+            out[kv.key] = int(kv.value.n)
+        except (TypeError, ValueError, AttributeError):
+            pass
+    return out
+
+
+def probe_balance_statement():
+    ev = {"probe": "balance_statement"}
+    try:
+        peer = gw.peer_info(node_url)
+        ev["node_public_key"] = peer.public_key
+        pages = gw.full_statement(node_url, from_seq=1)
+        checked = gw.verify_statement(pages, peer.public_key)
+        rows = checked.pop("rows")
+        ev.update(checked)
+        kinds = {}
+        for mv in rows:
+            kinds[mv.kind] = kinds.get(mv.kind, 0) + 1
+        ev["kinds"] = kinds
+        # The rates of the Peer the node signs, and those it wrote in /__config__: the
+        # two should agree, and either one may lack a rate that the node does not charge.
+        rates = dict(_peer_rates(peer), **NODE_RATES)
+        ev["statement_rates"] = {k: rates.get(k) for k in ("statement_query_mu", "statement_row_mu")}
+        overcharges = _statement_query_overcharges(rows, rates)
+        ev["statement_query_overcharges"] = overcharges
+
+        # The balance the gateway reports elsewhere must be a balance of this chain: the
+        # settle charges a resource_change, and its row carries the balance returned.
+        _, reported = controller.modify_resources(
+            {"min": mem_limit or MU_HIGH_CEILING, "max": MU_HIGH_CEILING})
+        after = _own_rows_after(checked.get("last_seq", 0)) if rows else []
+        ev["balance_reported_by_modify_resources"] = reported
+        ev["rows_after_the_settle"] = [_movement_view(mv) for mv in after[:5]]
+        tied = any(int(mv.balance_after.n) == int(reported) for mv in after)
+        ev["balance_tied_to_chain"] = tied
+
+        if checked["signatures_ok"] is None:
+            ev["verdict"] = VERDICT_INCONCLUSIVE
+            ev["reason"] = "no Ed25519 implementation in this image: the signature was not checked"
+        elif not checked["signatures_ok"]:
+            ev["verdict"] = VERDICT_INCONCLUSIVE
+            ev["reason"] = ("a page of the statement does not verify with the node's key, so it "
+                            "cannot be attributed to the node: no claim is made from it")
+        elif checked["problems"] or overcharges or (rows and not tied):
+            reasons = [f"{p['problem']}" for p in checked["problems"]] + list(overcharges or [])
+            if rows and not tied:
+                reasons.append(f"ModifyServiceSystemResources reported a balance of {reported} MU "
+                               "that no movement after the settle carries")
+            ev["verdict"] = VERDICT_DISHONEST
+            ev["reason"] = "the node signed a statement that is false: " + "; ".join(reasons[:6])
+        elif not checked.get("adds_up"):
+            ev["verdict"] = VERDICT_INCONCLUSIVE
+            ev["reason"] = (f"the statement starts at movement {checked.get('first_seq')}: the "
+                            "node deleted the movements before it (its retention), so the sum "
+                            "cannot be checked from the start")
+        else:
+            ev["verdict"] = VERDICT_PASS
+            ev["reason"] = (f"{checked['movements']} movements in {checked['pages']} signed "
+                            f"page(s): the signature, the chain and the head verify, the rows "
+                            f"add up to the balance of {checked['balance_mu']} MU, each statement "
+                            "query was charged at most its price, and the balance that "
+                            "ModifyServiceSystemResources reports is a balance of the chain")
+        return ev
+    except Exception as e:
+        return _infra(ev, "the balance statement", e)
+
+
+# ----------------------------------------------------------------------------
+# Probe — delegation pricing (nodo #577/#586; #567 seen from the client)
+# ----------------------------------------------------------------------------
+# A node that delegates a child to a peer charges it like a local one: its own cost
+# functions, its rates, its scarcity at the launch. The father pays initial_mu, the node
+# keeps its own build and sends the peer the rest; what the peer charges this node is
+# only the cost of the delegation, and the margin is the node's (#577). A peer that
+# charges more maintenance than it signed in its quote is scored MAINTENANCE_OVERCHARGED
+# by the node, and the client's charge does not change: the node absorbs the excess
+# (#567). From inside a service, the client side is what can be seen: the child's
+# balance, as the delegating node keeps it (GetMetrics), must fall at that node's own
+# price: its advertised base rates for the child, times a scarcity multiplier between 1
+# and its scarcity_max_multiplier (fixed at the launch). A peer cheaper than the node
+# (as in tools/two-node/, a third of its rates) shows below that range if the node
+# passed the peer's price on. The quote (GetServiceEstimatedCost, always the node's own
+# price) is priced at the scarcity of the moment it was asked, so it is evidence only.
+#
+# Whether a child was delegated shows in one place a service can read: the node gives
+# no statement of an instance that it delegated (GetBalanceStatement answers
+# UNIMPLEMENTED). A node with no peer, or one that runs the child itself, delegates
+# nothing, and the probe is NOT_APPLICABLE. The scoring of an overcharging peer is
+# visible only to the operator of the delegating node: tools/two-node/ checks it.
+DELEGATION_CHILD = "tiny"
+DELEGATION_WINDOW_S = float(os.environ.get("DELEGATION_WINDOW_S", "120"))
+DELEGATION_SAMPLE_S = float(os.environ.get("DELEGATION_SAMPLE_S", "10"))
+# Room around the bounds before the reading says anything: the ticks are discrete (one
+# tick either way is allowed on top of this).
+DELEGATION_TOLERANCE = float(os.environ.get("DELEGATION_TOLERANCE", "0.15"))
+# The memory the upper bound prices the child at: a node raises a small guest to its own
+# floor (MIN_MEM_MIB), which the child's declaration does not say.
+DELEGATION_MEM_CEILING_BYTES = 512 * 1024 * 1024
+
+
+def _is_delegated(token):
+    """True if the node delegated the instance, False if it runs it, None if unknown."""
+    try:
+        gw.balance_statement(node_url, token=token, from_seq=0)
+        return False
+    except gw.GatewayError as e:
+        if e.code == "UNIMPLEMENTED":
+            return True
+        return None
+
+
+def _burn(token, window, every):
+    """Samples of the child's balance over ``window`` seconds: [(t, balance), ...]."""
+    samples = []
+    t0 = time.monotonic()
+    while True:
+        samples.append((round(time.monotonic() - t0, 2), gw.metrics_balance(node_url, token)))
+        if time.monotonic() - t0 >= window:
+            return samples
+        time.sleep(every)
+
+
+def _price_bounds(label, rates):
+    """(low, high) MU per second that the node's own price for the child can be.
+
+    The node advertises its base rates (cpu_mu_per_vcpu_second, ram_mu_per_gib_second,
+    disk_mu_per_gib_second) and the most its scarcity can multiply them by
+    (scarcity_max_multiplier). A delegated child is charged those rates for the
+    resources it holds, at the multipliers of its launch (#577), so its price per second
+    is at least the base for its declared resources and at most that multiplier times
+    the base with the memory at a node's floor. None when a rate is not advertised.
+    """
+    cpu, ram, disk_rate = (rates.get(k) for k in ("cpu_mu_per_vcpu_second", "ram_mu_per_gib_second",
+                                                   "disk_mu_per_gib_second"))
+    if None in (cpu, ram, disk_rate):
+        return None
+    mem, disk = CHILD_DECLARED_RESOURCES[label]
+    low = cpu + ram * mem / GIB + disk_rate * disk / GIB
+    high = (cpu + ram * max(mem, DELEGATION_MEM_CEILING_BYTES) / GIB + disk_rate * disk / GIB) \
+        * (rates.get("scarcity_max_multiplier") or 10)
+    return low, high
+
+
+def _judge_burn(samples, bounds, loop_s):
+    """(evidence, verdict, reason) of a delegated child's burn against the node's own price."""
+    (t0, b0), (t1, b1) = samples[0], samples[-1]
+    elapsed = t1 - t0
+    spent = b0 - b1
+    evidence = {"window_s": elapsed, "spent_mu": spent, "samples": samples,
+                "mu_per_s": round(spent / elapsed, 1) if elapsed else None}
+    if not bounds or not elapsed:
+        return evidence, VERDICT_INCONCLUSIVE, "the node's base rates are not in /__config__"
+    low, high = bounds
+    tick_low, tick_high = low * (loop_s or 10), high * (loop_s or 10)
+    evidence.update(base_mu_per_s=round(low, 1), ceiling_mu_per_s=round(high, 1),
+                    ratio_to_base=round(spent / (low * elapsed), 3))
+    if spent > high * elapsed * (1 + DELEGATION_TOLERANCE) + tick_high:
+        return evidence, VERDICT_DISHONEST, (
+            f"the delegated child was charged {spent} MU in {elapsed}s ({evidence['mu_per_s']} "
+            f"MU/s), above the node's own base rates times its largest scarcity multiplier "
+            f"({round(high, 1)} MU/s)")
+    if spent < low * elapsed * (1 - DELEGATION_TOLERANCE) - tick_low:
+        return evidence, VERDICT_INCONCLUSIVE, (
+            f"the delegated child was charged {spent} MU in {elapsed}s ({evidence['mu_per_s']} "
+            f"MU/s), below the node's own base rates ({round(low, 1)} MU/s): the client was not "
+            "overcharged, but this is not the node's own price either (the peer's price passed "
+            "on, or time not charged)")
+    return evidence, VERDICT_PASS, (
+        f"the delegated child was charged {evidence['mu_per_s']} MU/s: the node's own price, "
+        f"between its base rates for the child ({round(low, 1)} MU/s) and those rates at its "
+        f"largest scarcity multiplier ({round(high, 1)} MU/s)")
+
+
+def probe_delegation_pricing():
+    label = DELEGATION_CHILD
+    ev = {"probe": "delegation_pricing", "child": label}
+    token = None
+    try:
+        budget = _child_budget(label)
+        config = gw.configuration(initial_mu=budget) if budget is not None else None
+        quote = gw.estimated_cost(node_url, packed(label), config=config)
+        period, loop_s = gw.mu(quote.init_maintenance_cost), int(quote.maintenance_seconds_loop)
+        ev["quote"] = {"cost_mu": gw.mu(quote.cost), "init_maintenance_cost_mu": period,
+                       "max_maintenance_cost_mu": gw.mu(quote.max_maintenance_cost),
+                       "maintenance_seconds_loop": loop_s}
+        head = _own_head()
+        ref = secrets.token_bytes(16)
+        r = _gw_start(label, start_ref=ref, wait_ready=False)
+        token = r.instance.token
+        delegated = _is_delegated(token)
+        ev["delegated"] = delegated
+        if delegated is False:
+            ev["verdict"] = VERDICT_NOT_APPLICABLE
+            ev["reason"] = ("the node ran the child itself (it gives its statement): no peer took "
+                            "it, so there is no delegated price to check. A node delegates only "
+                            "with network.DELEGATE_EXECUTION on, a peer with a common payment "
+                            "system and a deposit there, and no room of its own")
+            return ev
+        if delegated is None:
+            ev["verdict"] = VERDICT_INCONCLUSIVE
+            ev["reason"] = "it could not be told whether the node delegated the child"
+            return ev
+        ev["balance_after_start_mu"] = gw.metrics_balance(node_url, token)
+        evidence, verdict, reason = _judge_burn(_burn(token, DELEGATION_WINDOW_S,
+                                                      DELEGATION_SAMPLE_S),
+                                                _price_bounds(label, NODE_RATES), loop_s)
+        if loop_s and period:
+            # The quote is priced at the scarcity of the moment it was asked, the charge at
+            # that of the launch: evidence only.
+            evidence["ratio_to_quote"] = round(evidence["spent_mu"] / (period * evidence["window_s"]
+                                                                       / loop_s), 3)
+        ev["burn"] = evidence
+        starts = _rows_for_ref(_own_rows_after(head), ref)
+        ev["child_start_rows"] = [_movement_view(mv) for mv in starts]
+        paid = [-int(mv.amount.n) for mv in starts]
+        if budget is not None and paid and paid != [budget]:
+            verdict = VERDICT_DISHONEST
+            reason = (f"the father paid {paid} for a delegated start of initial_mu {budget} MU; "
+                      "#577: the father pays initial_mu and nothing else. " + reason)
+        ev["verdict"], ev["reason"] = verdict, reason
+        return ev
+    except Exception as e:
+        return _infra(ev, "the delegated price", e)
+    finally:
+        if token:
+            ev["refund_mu"] = _gw_stop(token, label)
+
+
+# ----------------------------------------------------------------------------
 # Probe — dependency connectivity is not fraudulent (node Observe cross-check)
 # ----------------------------------------------------------------------------
 # A dishonest node could fabricate a dependency's network behaviour (claim it
@@ -1869,13 +3153,15 @@ def exclusive(name, wait=False):
         _suite_lock.release()
 
 
-def ensure_funded(pending_builds=0, timeout=None, on_wait=None):
+def ensure_funded(timeout=None, on_wait=None, requote=False):
     """Wait until the balance covers one suite. Returns (funded, funding snapshot).
 
-    The first call measures what the node charges this instance and sizes every
-    child from it. When the rate cannot be measured -- the gateway is down, or
-    the node charges nothing -- there is nothing to wait for: the suite runs and
-    its preflight reports the gateway, or the node is free.
+    The first call measures what the node charges this instance, asks the node what
+    the build of each child costs, and sizes every child from both. ``requote`` asks
+    again (after the node refused a start for funds). When the rate cannot be
+    measured -- the gateway is down, or the node charges nothing -- there is nothing
+    to wait for: the suite runs and its preflight reports the gateway, or the node is
+    free.
     Call with the suite lock held: sampling settles this instance's resources.
     """
     timeout = FUNDING_WAIT_TIMEOUT_SECONDS if timeout is None else timeout
@@ -1887,10 +3173,11 @@ def ensure_funded(pending_builds=0, timeout=None, on_wait=None):
         if rate is None:
             return True, dict(funding_status(), note="rate unknown (no charge, or a top-up "
                                                      "during sampling); not gating on funds")
-        if not FUNDING["child_initial_mu"]:
+        if not FUNDING["child_initial_mu"] or requote:
+            quote_child_builds()
             configure_child_budgets(rate)
         while True:
-            required = funding_requirement(rate, pending_builds)
+            required = funding_requirement(rate)
             sample_balance()
             snap = funding_status(required)
             if snap["funded"] or time.monotonic() >= deadline:
@@ -2027,13 +3314,23 @@ def probe_gateway_reachability():
 PROBES = [
     ("gateway_reachability", probe_gateway_reachability),
     ("resource_provisioning", probe_resource_provisioning),
+    # First of the probes that start children: on a node that has not built `tiny`
+    # yet, this is the start that pays its build, so both #563 rules are exercised.
+    ("build_funding", probe_build_funding),
     ("dependency_identity", probe_dependency_identity),
     ("network_isolation", probe_network_isolation),
     ("dependency_observe", probe_dependency_observe),
     ("memory_ceiling", probe_memory_ceiling),
     ("node_benchmark", probe_node_benchmark),
     ("shared_filesystem", probe_shared_filesystem),
+    ("idempotent_start", probe_idempotent_start),
+    ("block_skip", probe_block_skip),
+    ("env_vars", probe_env_vars),
+    ("network_share", probe_network_share),
+    ("tunnel", probe_tunnel),
+    ("delegation_pricing", probe_delegation_pricing),
     ("mu_accounting", probe_mu_accounting),
+    ("balance_statement", probe_balance_statement),
 ]
 
 # Probes that cannot produce any observation without the gateway. When the
@@ -2041,9 +3338,16 @@ PROBES = [
 # report says "could not verify" once rather than six times in six dialects.
 # resource_provisioning is deliberately NOT here: it only reads /proc and
 # /__config__, so it stays valid (and can legitimately PASS) with the gateway down.
-GATEWAY_DEPENDENT = ("dependency_identity", "network_isolation",
+GATEWAY_DEPENDENT = ("build_funding", "dependency_identity", "network_isolation",
                      "dependency_observe", "memory_ceiling", "node_benchmark",
-                     "shared_filesystem", "mu_accounting")
+                     "shared_filesystem", "mu_accounting",
+                     "idempotent_start",
+                     "block_skip",
+                     "env_vars",
+                     "network_share",
+                     "tunnel",
+                     "balance_statement",
+                     "delegation_pricing")
 
 
 def _safe_probe(name, fn):
@@ -2103,12 +3407,17 @@ def _run_probe_suite():
 
 
 def summarize_suite(results):
-    unobserved = [p for p in results.values() if p.get("verdict") not in CONCLUSIVE_VERDICTS]
+    unobserved = [p for p in results.values()
+                  if p.get("verdict") not in CONCLUSIVE_VERDICTS + NEUTRAL_VERDICTS]
+    not_applicable = [p.get("probe") for p in results.values()
+                      if p.get("verdict") in NEUTRAL_VERDICTS]
     summary = {
         "pass": sum(1 for p in results.values() if p.get("verdict") == VERDICT_PASS),
         "dishonest": sum(1 for p in results.values() if p.get("verdict") in ACCUSING_VERDICTS),
         "unobserved": len(unobserved),
         "unobserved_probes": [p.get("probe") for p in unobserved],
+        "not_applicable": len(not_applicable),
+        "not_applicable_probes": not_applicable,
         "total": len(results),
     }
     summary["observation_complete"] = not unobserved
@@ -2123,10 +3432,10 @@ def run_startup_tests():
     try:
         # Waits for an attestation or probe already running instead of colliding.
         with exclusive("startup_tests", wait=True):
-            pending_builds = 0
+            starved = []
             for attempt in range(1, STARTUP_MAX_ATTEMPTS + 1):
                 STARTUP_TESTS["attempt"] = attempt
-                funded, snap = ensure_funded(pending_builds, on_wait=waiting)
+                funded, snap = ensure_funded(on_wait=waiting, requote=bool(starved))
                 STARTUP_TESTS["funding"] = snap
                 if not funded:
                     STARTUP_TESTS["status"] = "unfunded"
@@ -2145,12 +3454,12 @@ def run_startup_tests():
                 STARTUP_TESTS["status"] = "done"
                 if not starved:
                     break
-                # The node refused a launch for want of balance: children that have
-                # never launched here still owe their first build. Wait for that too.
-                pending_builds = max(1, sum(1 for c in CHILD_DECLARED_RESOURCES
-                                            if c not in FUNDING["built_children"]))
-                logging.info("Startup suite starved of funds (%s); waiting for %d build(s)",
-                             starved, pending_builds)
+                # The node refused a launch for want of balance, or because a child's
+                # initial_mu did not cover its build. Ask for the builds again (a
+                # refusal that named its build already raised that child's) and wait
+                # until the balance covers them.
+                logging.info("Startup suite starved of funds (%s); quoting the builds again",
+                             starved)
     except Exception as e:
         STARTUP_TESTS["status"] = "error"
         STARTUP_TESTS["error"] = f"{type(e).__name__}: {clip(e)}"
@@ -2181,7 +3490,9 @@ def build_attestation():
     probes = list(_run_probe_suite().values())
     passes = [p for p in probes if p.get("verdict") == VERDICT_PASS]
     dishonest = [p for p in probes if p.get("verdict") in ACCUSING_VERDICTS]
-    unobserved = [p for p in probes if p.get("verdict") not in CONCLUSIVE_VERDICTS]
+    unobserved = [p for p in probes
+                  if p.get("verdict") not in CONCLUSIVE_VERDICTS + NEUTRAL_VERDICTS]
+    not_applicable = [p.get("probe") for p in probes if p.get("verdict") in NEUTRAL_VERDICTS]
 
     # An attestation is only mintable when EVERY probe reached a conclusive
     # verdict. Otherwise we did not measure the node — we measured our own
@@ -2198,6 +3509,8 @@ def build_attestation():
         "dishonest": len(dishonest),
         "unobserved": len(unobserved),
         "unobserved_probes": [p.get("probe") for p in unobserved],
+        "not_applicable": len(not_applicable),
+        "not_applicable_probes": not_applicable,
         "total": len(probes),
     }
 
@@ -2264,13 +3577,21 @@ def attestation_json_run():
 PROBE_ENDPOINTS = [
     ("probe_gateway_reachability", "/probe/gateway", probe_gateway_reachability),
     ("probe_resource_provisioning", "/probe/resources", probe_resource_provisioning),
+    ("probe_build_funding", "/probe/build_funding", probe_build_funding),
     ("probe_dependency_identity", "/probe/dependency_identity", probe_dependency_identity),
     ("probe_network_isolation", "/probe/network", probe_network_isolation),
     ("probe_dependency_observe", "/probe/dependency_observe", probe_dependency_observe),
     ("probe_memory_ceiling", "/probe/memory", probe_memory_ceiling),
     ("probe_node_benchmark", "/probe/benchmark", probe_node_benchmark),
     ("probe_shared_filesystem", "/probe/shared_filesystem", probe_shared_filesystem),
+    ("probe_idempotent_start", "/probe/idempotent_start", probe_idempotent_start),
+    ("probe_block_skip", "/probe/block_skip", probe_block_skip),
+    ("probe_env_vars", "/probe/env_vars", probe_env_vars),
+    ("probe_network_share", "/probe/network_share", probe_network_share),
+    ("probe_tunnel", "/probe/tunnel", probe_tunnel),
+    ("probe_delegation_pricing", "/probe/delegation_pricing", probe_delegation_pricing),
     ("probe_mu_accounting", "/probe/mu_accounting", probe_mu_accounting),
+    ("probe_balance_statement", "/probe/balance_statement", probe_balance_statement),
 ]
 # Reads /proc and /__config__ only: it spins nothing and moves nothing, so it
 # may run beside a suite.
@@ -2331,6 +3652,7 @@ def service_status(refresh=False):
         "version": VERIFIER_VERSION,
         "node_url": node_url,
         "mem_limit_bytes": mem_limit,
+        "node_rates": dict(NODE_RATES),
         "funding": funding_status(required),
         "balance_note": note,
         "running": dict(CURRENT_WORK),
@@ -2392,6 +3714,11 @@ MCP_TOOLS = [
           True, {"type": "object", "properties": {"refresh": {
               "type": "boolean",
               "description": "settle the account for a live balance (one MODIFY_RESOURCES charge)"}}}),
+    _tool("probe_build_funding",
+          "Check the start-funding rules of nodo #563: a child funded below its build, or below "
+          "one maintenance period after it, must be refused with the node's message and charge "
+          "nothing; a child funded with enough must start, charge this account exactly its "
+          "initial_mu, and pay the build from its own account." + _SPENDS, False),
     _tool("probe_dependency_identity",
           "Execute each dependency and assert the requested dependency is the one that actually ran."
           + _SPENDS, False),
@@ -2408,6 +3735,12 @@ MCP_TOOLS = [
           "Verify the node spends the service's MUs in line with the resources it provisions "
           "(charges, scales with usage beyond the run's own noise, does not drain). Takes three "
           "MU windows (~3 min)." + _SPENDS, False),
+    _tool("probe_balance_statement",
+          "Read this instance's own account with GetBalanceStatement (nodo #570/#571) after the "
+          "other probes, and check it by the rules of nodo's reader: the Ed25519 signature, the "
+          "hash chain, the rows adding up to the balance, the head, the price of each statement "
+          "query, and the balance that ModifyServiceSystemResources reports."
+          + _SPENDS, False),
     _tool("probe_dependency_observe",
           "Use the node Observe RPC to independently watch a dependency's real packets and confirm "
           "its connectivity is genuine, not fabricated by the node." + _SPENDS, False),
@@ -2420,6 +3753,39 @@ MCP_TOOLS = [
           "read-only mount must refuse a write, and sharefs-denied (which asks for a share this "
           "service does not export) must be refused at launch. A package that does not carry the "
           "share declarations reports INCONCLUSIVE, never DISHONEST." + _SPENDS, False),
+    _tool("probe_idempotent_start",
+          "Check that StartService with a StartReference is idempotent (nodo #578): the same "
+          "reference twice gives one instance and one charge, and the second request gets the "
+          "same instance back without sending the service."
+          + _SPENDS, False),
+    _tool("probe_block_skip",
+          "Measure the block skip of nodo #371: start the tiny child with the skip off and on, "
+          "after the node holds its block, and report the request bytes, the time to the instance"
+          " and the time until the request was sent. PASS when the skip saves at least half of "
+          "the bytes; a node that does not skip is never accused."
+          + _SPENDS, False),
+    _tool("probe_env_vars",
+          "Check the env vars of nodo #574/#582: the packed spec of the tiny child names its "
+          "declared variables, and a child started with one value given, one empty and one left "
+          "out gets exactly those, in /__config__ and in its process environment, with no value "
+          "for the one left out."
+          + _SPENDS, False),
+    _tool("probe_network_share",
+          "Check the network shares of nodo #268: two netshare children of one group (no common "
+          "exporter) must share /netshare both ways, and a member of another group must not see "
+          "it."
+          + _SPENDS, False),
+    _tool("probe_tunnel",
+          "Measure a ServiceTunnel to the tiny child: its throughput (against a direct download),"
+          " and the bill on the child's statement: the bytes billed must be the bytes relayed, "
+          "and each charge at most the advertised net_mu_per_gib and tunnel_open_mu."
+          + _SPENDS, False),
+    _tool("probe_delegation_pricing",
+          "Check the delegated price of nodo #577/#586 (and, from the client side, #567): a child"
+          " that the node delegates to a peer must be charged at the delegating node's own "
+          "advertised price, and the father pays initial_mu and nothing else. NOT_APPLICABLE when"
+          " the node runs the child itself."
+          + _SPENDS, False),
 ]
 
 # Every HTTP route an operator can use, and the MCP tool(s) that give a model the

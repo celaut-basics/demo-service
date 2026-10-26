@@ -493,7 +493,7 @@ class WiringTests(unittest.TestCase):
         self.assertEqual(app.child_iface("sharefs_denied").service_hash, "sharefsdeniedhash")
 
     def test_the_verifier_version_moved(self):
-        self.assertEqual(app.VERIFIER_VERSION, "1.4.0")
+        self.assertEqual(app.VERIFIER_VERSION, "1.5.0")
 
 
 class ManifestAgreementTests(unittest.TestCase):
@@ -571,6 +571,7 @@ class ManifestAgreementTests(unittest.TestCase):
                     self.assertIn(share["path"], mkdirs, f"{arch}/{service}: {share['path']}")
 
     def test_no_directory_is_declared_both_ways_or_twice(self):
+        # netshare's share has role "network": its test is in test_new_benchmarks.py.
         for arch in ARCHES:
             for service in ("demo", "sharefs", "sharefs-denied"):
                 shares = self.shares(arch, service)

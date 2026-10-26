@@ -41,6 +41,12 @@
                 "www.amazon.com"
             ],
             "prose": "Connection to Amazon."
+        },
+        {
+            "tags": [
+                "celaut-demo-netshare"
+            ],
+            "prose": "The demo network share of the netshare children. A child gets only the networks that this service declares too."
         }
     ],
     "shared_filesystems": [

@@ -2,7 +2,7 @@
 
 This turns the passive `demo-service` into an **active verifier** that checks
 whether the nodo node it is running on is *honest*. It reuses the existing
-`tiny` / `heavy` / `ping` / `benchmark` / `sharefs` child scaffolding and the `node_controller` library —
+`tiny` / `heavy` / `ping` / `benchmark` / `sharefs` / `netshare` child scaffolding and the `node_controller` library —
 nothing was rewritten from scratch.
 
 An honest node must:
@@ -38,7 +38,7 @@ blind; it must never accuse.
 | `PASS` | behaviour observed and correct | no | yes |
 | `DISHONEST` | behaviour observed and incorrect | **yes** | yes |
 | `INFRA_ERROR` | could not observe (node/network fault) | no | **no** |
-| `NOT_APPLICABLE` | probe does not apply to this environment | no | no |
+| `NOT_APPLICABLE` | probe does not apply to this environment | no | does not block it |
 | `INCONCLUSIVE` | ran, but the result is not decidable | no | **no** |
 
 `FAIL` no longer exists as a verdict: it was ambiguous at exactly the point where
@@ -53,6 +53,11 @@ Two consequences follow:
   verdict** (`summary.attestable`). Otherwise `content_hash.value` is `null` with
   a note explaining which probes were blind. There is no path from an incomplete
   observation to an on-chain opinion.
+- `NOT_APPLICABLE` is not a blind spot: the probe has nothing to observe on this
+  node (a node that runs for free has no build to fund, a node with no peer
+  delegates nothing). It is listed in `summary.not_applicable_probes`, it is in
+  the hashed payload with its verdict, and it does not block the hash. It is
+  never counted as a pass.
 
 ## The probes
 
@@ -67,6 +72,14 @@ Two consequences follow:
 | 6 | `node_benchmark` | `benchmark` | the node's per-core benchmark runs under its declared architecture and measures every primitive; the scores travel as evidence |
 | 7 | `shared_filesystem` | `sharefs`, `sharefs-denied` | the directory this service exports is shared with its child in both directions, a read-only mount refuses a write, and a child asking for a share its parent does not export is refused at launch |
 | 8 | `mu_accounting` | orchestrator (self) | the node spends MUs in line with the resources it provisions |
+| 10 | `build_funding` | `tiny` | nodo #563: a child funded below its build, or below one maintenance period after it, is refused with the node's message and charged nothing; a funded child starts, this account pays exactly its `initial_mu`, and the build is paid from the child's account |
+| 11 | `idempotent_start` | `tiny` | nodo #578: three StartService requests with one `StartReference` give one instance and one `child_start` charge; the requests after the first send no service and get the same instance |
+| 12 | `block_skip` | `tiny` | nodo #371: a StartService that carries blocks the node holds sends a small part of them (≤ 5%); the bytes and the time to the instance are reported, against this instance's first send of the child |
+| 13 | `env_vars` | `tiny` | nodo #574/#582: the packed spec names the declared env vars; a child started with one value given, one empty and one left out gets exactly those, in `/__config__` and in its process environment |
+| 14 | `network_share` | `netshare` ×3 | nodo #268: two members of one network share, with no common exporter, see each other's files; a member of another group does not |
+| 15 | `tunnel` | `tiny` | a `ServiceTunnel` to a child: its throughput against a direct download, and the bill: the bytes billed are the bytes relayed, each charge at most the advertised `net_mu_per_gib` and `tunnel_open_mu` |
+| 16 | `balance_statement` | orchestrator (self) | nodo #570/#571: after the run, this instance's own `GetBalanceStatement` verifies by nodo's `verify_chain` rules (Ed25519 signature, hash chain, rows add up to the balance, head), each statement query costs its advertised price, and the balance that `ModifyServiceSystemResources` reports is in the chain |
+| 17 | `delegation_pricing` | `tiny`, on a peer | nodo #577/#586 (and #567 from the client side): a child the node delegates is charged at the delegating node's own advertised price, and the father pays `initial_mu` only. `NOT_APPLICABLE` when no peer takes it |
 | 9 | `attestation` | orchestrator | per-probe verdict + `sha3_256` content hash, as JSON and HTML |
 
 ### Child readiness — the node's "ready" is not the service's "ready"
@@ -430,6 +443,344 @@ new, empty one, which is why every run writes its own end first.
 Exposed as `GET/POST /probe/shared_filesystem` and as the MCP tool
 `probe_shared_filesystem`.
 
+### The newer benchmarks (nodo dev after v3)
+
+The probes below test what nodo `dev` added after v3. node_controller carries an
+older `celaut.proto`, so these probes start their children and read the node with
+`nodo_gateway.py`, which loads nodo's own descriptor set (`nodo_protos/`, from nodo
+`97906c7c`) into a private descriptor pool. They follow the same rules as the
+other probes: each child is stopped in a `finally`, a start the node refuses for
+funds is recorded as a shortage, and only an observed violation accuses.
+
+#### Build funding (`tiny`, nodo #563)
+
+Since #563 the caller pays `Configuration.initial_mu` and nothing else. The node
+takes the build from it, and refuses a start when the build does not fit, or when
+what is left does not pay one maintenance period. A refused start charges nothing.
+
+The probe asks the node for its quote (`GetServiceEstimatedCost` asking for a
+balance of 1 MU answers the build plus 1 MU; the build is 0 for a built image) and
+starts `tiny` three times, each with its own `StartReference`:
+
+| start | `initial_mu` | an honest node |
+|---|---|---|
+| `below_build` (only when a build is owed) | build − 1 | refuses: `does not cover the build of the service, <build> MU` |
+| `below_one_period` | build + half a period | refuses: `leaves <x> MU after the build of <build> MU. One maintenance period costs <p> MU` |
+| `funded` | build + the child's usual runtime budget (at least 60 periods) | starts it |
+
+Then it reads this instance's statement and the funded child's statement, and
+finds each start by its reference (`detail.start_ref`).
+
+| observation | verdict |
+|---|---|
+| the refusals carry the #563 messages, no refused start left a charge, the funded start charged exactly its `initial_mu`, and the build is on the child's account | `PASS` |
+| a start charged more than its `initial_mu`, a refused start kept MU, or a build was charged to this account | `DISHONEST` |
+| an under-funded start was started, or refused with another message (nothing was charged beyond `initial_mu`) | `INCONCLUSIVE` |
+| the node quotes no build and no maintenance (it runs for free) | `NOT_APPLICABLE` |
+| the quote, the funded start or a statement failed | `INFRA_ERROR` |
+
+It runs first of the probes that start children: on a node that has not built
+`tiny` yet, the funded start is the one that pays the build, so both rules are
+exercised. On later runs the image is built and only the period rule applies.
+
+#### Idempotent StartService (`tiny`, nodo #578, PR #585)
+
+A `StartService` with a `StartReference` chosen by the caller is idempotent. The
+node keys the reference by the caller (here, this local instance). A second
+request with the same reference starts nothing and charges nothing: the node
+answers the same `ServiceInstance`, and the reference alone is enough, with no
+service. The `child_start` that paid the start carries the reference in
+`detail.start_ref`.
+
+The probe starts `tiny` with a new reference, then sends two more requests with
+it and the hashes only: one with no `Configuration`, one with another
+`initial_mu`. An `ABORTED` answer (the first start still running) is asked again.
+Then it counts the instances it got and the `child_start` movements of the
+reference in this instance's statement.
+
+| observation | verdict |
+|---|---|
+| one instance, every request got it back, one `child_start` | `PASS` |
+| more than one instance or charge, and the node's signed `Peer` announces `StartReference` in its gateway layer | `DISHONEST` |
+| the same, from a node that does not announce `StartReference` (it made no promise) | `INCONCLUSIVE` |
+| a request with the reference got an error, or the charge cannot be found | `INCONCLUSIVE` |
+| the first start or a statement failed | `INFRA_ERROR` |
+
+Every instance the probe got is stopped.
+
+#### Block skip on StartService (`tiny`, nodo #371, commit `7375f37`)
+
+A `StartService` carries the `Service`, and the `Service` carries its blocks:
+`tiny`'s image is one block of tens of MB. A node that already holds what arrives
+stops the sender. For a service it holds, it does so at the first hash (bee-rpc's
+signal). Since #371 it also does so for each block it holds of a service it does
+not hold yet: it sends a skip request in the response direction, and a sender
+with bee-rpc `block_skip` stops that block. Before #371 the node read every block
+of such a service and dropped the ones it held.
+
+What a client sees is the first request that carries a service, and the requests
+after it. The first one is this instance's first send of `tiny`:
+`quote_child_builds` asks for a quote with the service before any start, and
+records its bytes and seconds (`first_send`). It carries the blocks that the node
+does not hold. The probe then starts `tiny` twice with the skip off and twice with
+it on, and counts the bytes of each request (the Buffers handed to gRPC, the
+measure of nodo's own test) and the time to the instance.
+
+It reports `first_send` (bytes, seconds), `request_bytes_with_skip`,
+`request_bytes_without_skip`, `seconds_to_instance_with_skip`,
+`seconds_to_instance_without_skip` and `bytes_saved_against_first_send`.
+
+| observation | verdict |
+|---|---|
+| a start of the child the node holds sends at most 5% of the bytes of its blocks | `PASS` |
+| it sends more: the node did not stop the sender. It costs bandwidth, not money | `INCONCLUSIVE` |
+| the blocks of the packed child cannot be sized | `INCONCLUSIVE` |
+| a start failed | `INFRA_ERROR` |
+
+The first send carries the blocks only on the first suite after a pack on a node
+(after that, the node holds the child). On later suites `first_send` is small and
+the reason says so. The skip of the blocks of a service that the node does not
+hold (#371 proper) shows in `first_send` when the node already holds some of its
+blocks from another service.
+
+#### Environment variables (`tiny`, nodo #574, #582)
+
+A service declares the names of its env vars (`envs` in `service.json`). Since
+#582 the packer embeds them in `Service.Container.environment_variables`; since
+#574 the node asks the caller for every one and marks none required. The node
+gives the values on two paths: always in `/__config__`
+(`config.environment_variables`, the exact bytes), and also as Linux env vars of
+the entrypoint when the name and value pass `src/utils/guest_env.py`. The node
+gives no value of its own: a declared variable that the caller leaves out is
+absent, and the service uses its own default.
+
+`tiny` declares `DEMO_ENV_GIVEN`, `DEMO_ENV_EMPTY` and `DEMO_ENV_UNSET`. The probe
+reads the names in the packed spec of `tiny` (from this service's
+`__services__`), starts it with a random value for the first, an empty value for
+the second and nothing for the third, and reads `GET /env`, which reports both
+paths with the values in hex.
+
+| observation | verdict |
+|---|---|
+| the spec names the three, both given values arrived exactly on both paths, the third has no value | `PASS` |
+| a given value is missing from `/__config__` or changed on either path, or the variable left out has a value | `DISHONEST` |
+| a value is missing from the process environment only (that path is additive), the spec does not name the variables (a packer before #582), or `/__config__` cannot be read | `INCONCLUSIVE` |
+| the child did not start or answer | `INFRA_ERROR` |
+
+#### Network share (`netshare`, nodo #268)
+
+A network share is a directory that instances with **no common parent** share
+because they declare the same network and the same share
+(`docs/SHARED_FILESYSTEMS.md` in nodo, "Network shares"). `netshare` declares the
+network `celaut-demo-netshare` with the selection key
+`group=${DEMO_NETSHARE_GROUP}`, and `/netshare` as a share of it (`role:
+"network"`). The share id includes the formal after substitution, so each group
+is its own share.
+
+The probe starts three `netshare` instances as siblings: `a` and `b` in one new
+group, `c` in another. This service is the parent of each, but it exports
+nothing to them and is not a member. It declares the network only because a child
+gets only the networks that every ancestor declares. Then `a` writes a nonce,
+`b` must read it (polled for `SHARE_PROPAGATION_TIMEOUT_S`), `b` writes back and
+`a` must read that, and `c` must not see `a`'s file. The three members split the
+runtime budget of one child, so the funding gate still counts one deposit.
+
+| observation | verdict |
+|---|---|
+| `a` and `b` see each other's files, `c` does not | `PASS` |
+| `c` sees `a`'s file (two share ids in one directory), or `a` and `b` do not see each other's files while both have a mount plan for the share | `DISHONEST` |
+| a member has no mount plan for `/netshare` (a packer before #268), or cannot write to it | `INCONCLUSIVE` |
+| a member did not start or answer | `INFRA_ERROR` |
+
+`dependency_identity` checks `netshare` too, in a group of its own (`identity`).
+
+#### Service tunnel (`tiny`)
+
+`Gateway.ServiceTunnel` opens a byte stream to a declared slot of a local
+instance. The node charges the instance `tunnel_open_mu` to open it, then
+`net_mu_per_gib` for the bytes it relays in either direction, per
+`costs.TUNNEL_CHARGE_INTERVAL_KB` and the rest when the tunnel closes. The charge
+is per volume, with no scarcity surcharge: `amount = net_mu_per_gib × bytes //
+GiB`. Each charge is a `tunnel` movement of the instance, with its bytes in the
+detail.
+
+The probe reads `TUNNEL_TEST_BYTES` (64 MiB) from `tiny`'s `GET /bytes/<n>` once
+directly (the control) and once over a `ServiceTunnel` from this service, then
+reads `tiny`'s statement. It reports both throughputs (`direct.mib_per_s`,
+`tunnel.mib_per_s`) and the bill (`bill.billed_bytes`, `bill.relayed_bytes`,
+`bill.effective_mu_per_gib` against `bill.advertised_net_mu_per_gib`). The rates
+are the node's own, from `/__config__`.
+
+| observation | verdict |
+|---|---|
+| the bytes billed are the bytes relayed (within 4 KiB), each charge at most the advertised rate, the opening at most `tunnel_open_mu` | `PASS` |
+| more bytes billed than relayed, a charge above the advertised rate, or a dearer opening | `DISHONEST` |
+| no traffic charge after `TUNNEL_SETTLE_S`, or no rates in `/__config__` to compare | `INCONCLUSIVE` |
+| the child, the download or the tunnel failed | `INFRA_ERROR` |
+
+#### Balance statement (orchestrator, nodo #570, #571)
+
+Every write of a balance goes with a row in the node's `balance_movements`, and
+`GetBalanceStatement` returns the rows of the caller's account, signed by the
+node. A local instance reads its own account by its address. The rows are a hash
+chain: each carries the hash of the row before it, the first hangs from a genesis
+hash tied to the account (`account_ref`), and the head commits to all of them. The
+node signs the digest of the statement with the Ed25519 key of its `Peer`.
+
+The probe runs **last**, after `mu_accounting`, so the statement holds the whole
+run. It reads the node's public key (`GetPeerInfo`) and the statement page by page
+from movement 1, and checks it by the rules of nodo's own reader
+(`src/manager/statement_check.py::verify_chain`, ported to `nodo_gateway.py`):
+
+- each page is signed by the node: `celaut-balance-statement:<key>|<digest>`;
+- the statement is dated within 120 s of this clock, the amounts are canonical
+  integers, the seqs follow with no gap, each row hangs from the hash of the one
+  before (across pages too) and adds up, no row is dated after the statement;
+- the first row hangs from the genesis of the account and starts from 0;
+- the last row is the head: its hash and its balance;
+- the rows add up to the balance;
+- each `statement_query` charge is at most `statement_query_mu +
+  statement_row_mu × rows` (plus the charge row itself for a read of the own
+  account), with the rates from `/__config__`;
+- the balance that `ModifyServiceSystemResources` returns right after is the
+  balance of a row after it (the settle is a `resource_change` row).
+
+| observation | verdict |
+|---|---|
+| all of the above hold | `PASS` |
+| a signed page breaks a chain rule, a query costs more than its price, or the reported balance is in no row | `DISHONEST` |
+| a page does not verify with the node's key (it cannot be attributed to the node), or the node deleted the first rows (its retention) | `INCONCLUSIVE` |
+| a read failed | `INFRA_ERROR` |
+
+The other probes use statements too: `build_funding` and `idempotent_start` find
+their starts by `detail.start_ref`, and `tunnel` reads the bill of its child.
+
+#### Delegation pricing (`tiny` on a peer, nodo #577/#586; #567 from the client side)
+
+A node that delegates a child to a peer charges it like a local one: its own
+cost functions, its rates, its scarcity at the launch. The father pays
+`initial_mu`; the node keeps its own build and sends the peer the rest. What the
+peer charges the node is only the cost of the delegation (#577). A peer that
+charges more maintenance than it signed in its quote is scored
+`MAINTENANCE_OVERCHARGED` by the node, and the client's charge does not change:
+the node absorbs the excess (#567).
+
+From inside a service the client side is what can be seen. The probe asks the
+node for its quote (`GetServiceEstimatedCost`, always the node's own price),
+starts `tiny` with a `StartReference`, and tells whether the node delegated it:
+the node gives no statement of an instance it delegated (`GetBalanceStatement`
+answers `UNIMPLEMENTED`). Then it samples the child's balance as the delegating
+node keeps it (`GetMetrics`) every `DELEGATION_SAMPLE_S` (10 s) for
+`DELEGATION_WINDOW_S` (120 s).
+
+The node's own price for the child is its advertised base rates
+(`cpu_mu_per_vcpu_second`, `ram_mu_per_gib_second`, `disk_mu_per_gib_second`, from
+`/__config__`) for the child's resources, times a scarcity multiplier between 1
+and `scarcity_max_multiplier`, fixed at the launch. So the spend per second must
+be at least the base for the declared resources, and at most the base (memory at
+512 MiB, for the node's floor) times `scarcity_max_multiplier`. The quote is
+priced at the scarcity of the moment it was asked, so the ratio to it is evidence
+only (`burn.ratio_to_quote`).
+
+| observation | verdict |
+|---|---|
+| the spend is in that range (within one tick and `DELEGATION_TOLERANCE`, 15%), and the father paid exactly `initial_mu` | `PASS` |
+| it is above the range, or the father paid more than `initial_mu` | `DISHONEST` |
+| it is below the node's own base rates (the peer's price passed on, or time not charged), or it cannot be told whether the child was delegated | `INCONCLUSIVE` |
+| the node ran the child itself: no peer, `network.DELEGATE_EXECUTION` off, no common payment system or deposit, or room of its own | `NOT_APPLICABLE` |
+| the quote, the start or a reading failed | `INFRA_ERROR` |
+
+The score of an overcharging peer is visible only to the operator of the
+delegating node. `tools/two-node/` runs this probe on a node that delegates to a
+second node, once with an honest peer and once with one that overcharges, and
+checks the score from the operator's side.
+
+#### Results on nodo dev `97906c7c` (2026-10-24)
+
+Packed from commit `f07f032` with `nodo pack amd64 --local` on the test node
+(Alienware, WSL2 Ubuntu 22.04, `ch`, amd64). Service ids:
+
+| service | id |
+|---|---|
+| verifier (`celaut-node-honesty-verifier`) | `0c8de510b37b822118811e433395a07e16bfb478f062cf1ce9db922e70298162` |
+| tiny | `8c60438af63475d71a8efe94d7532930944a0f83bceb8748078ffd641c325ce1` |
+| heavy | `361d1afc25e621d36331c65dd9c9cc325baeba268ef7e315ca00d9998b0284d6` |
+| ping | `71e78ad6fd060bb3faeaaac516047ce8ef1e9673706d05a1b24e4c7c2e0a8d28` |
+| benchmark | `ce3925f31524c506c1a07c8350ad862d908ce699fe0b2ef1de7adc63258d9bab` |
+| sharefs | `73e30da6554bf33e497ecf59ddaae74b9fa4f3425d983271032ad72d331b5bc6` |
+| sharefs-denied | `a914815d9a8394a73fcde609f4e22d5cc5ca632fadb7e7b14414e00e7ffca1cb` |
+| netshare | `452dfa49fa5a2b31a905576391ac2d5d01c887c4d51e8ae098211d8d93fdda30` |
+
+Three runs of the startup suite, with no env override. Each first suite after a
+pack owes the 6 builds (6e7 MU). The gate waited for them and showed the exact
+shortfall, and one local top-up (`nodo increase_deposit`) let it run.
+
+- **packing node**: the node that packed it (it holds every child already);
+- **clean node**: a new node (node B of `tools/two-node/`) that imported only the
+  exported `0c8de5.celaut.bee`, so each child reached it only through the
+  verifier's own requests (the release rule's clean-registry import test);
+- **two-node**: `delegation_pricing` on node A, which delegates its child to node B.
+
+| probe | packing node | clean node | two-node |
+|---|---|---|---|
+| gateway_reachability | PASS | PASS | |
+| resource_provisioning | PASS | PASS | |
+| build_funding | PASS | PASS | |
+| dependency_identity | PASS | PASS | |
+| network_isolation | PASS | PASS | |
+| dependency_observe | PASS (58 packets) | PASS (53 packets) | |
+| memory_ceiling | PASS (240 MiB ok, 300 MiB killed) | PASS (same) | |
+| node_benchmark | PASS | PASS | |
+| shared_filesystem | PASS | PASS | |
+| idempotent_start | PASS | PASS | |
+| block_skip | PASS | PASS | |
+| env_vars | PASS | PASS | |
+| network_share | PASS | PASS | |
+| tunnel | PASS | PASS | |
+| delegation_pricing | NOT_APPLICABLE (no peer) | NOT_APPLICABLE (room of its own) | PASS, honest peer; PASS, overcharging peer |
+| mu_accounting | PASS | PASS | |
+| balance_statement | PASS | PASS | |
+| **summary** | 16 PASS, 1 N/A, `all_passed` | 16 PASS, 1 N/A, `all_passed` | |
+| suite time | 11.9 min | 12.2 min | |
+
+The numbers:
+
+- **build_funding**: quote build 10 000 000 MU. `initial_mu` 9 999 999 was refused:
+  `does not cover the build of the service, 10000000 MU`. 10 020 764 was refused:
+  `leaves 20764 MU after the build of 10000000 MU. One maintenance period costs 62685
+  MU`. 12 693 742 started; this account paid exactly that, and the child's account
+  shows the build of 10 000 000.
+- **idempotent_start**: the first start took 3.9 s; the two requests with the
+  reference only took 0.49 s and 0.46 s and got the same instance; one
+  `child_start` (2 693 742 MU).
+- **block_skip**: a start of `tiny` that the node holds sent 586 bytes (skip on and
+  off) and got its instance in 3.6 s / 4.0 s. On the clean node the first send of
+  `tiny` (the quote of the funding gate) carried 27 076 270 bytes in 1.6 s; the
+  later starts sent 585 bytes (skip on) and 572 bytes (off), and got the instance in
+  4.4 s / 3.8 s. The node answers at the first hash of a service it holds, so the
+  time to the instance is the boot of the child either way.
+- **tunnel**: 64 MiB over a `ServiceTunnel` at 3.7 MiB/s (17.5 s); directly, 1284
+  MiB/s. The bill: 10 000 MU to open, then 64 rows of 1 953 MU per MiB (124 992 MU):
+  67 108 864 bytes billed for 67 109 051 relayed (the last 187 bytes cost 0 MU and
+  write no row), 1 999 872 MU/GiB against the advertised 2 000 000.
+- **balance_statement**: 167 movements in one signed page, Ed25519 signature valid,
+  the chain verifies, the rows add up to the balance (22 907 555 MU), and the balance
+  that `ModifyServiceSystemResources` returned is the balance of the next row. The
+  packing node has no statement price (see below), so no `statement_query` row; on
+  the clean node 9 queries cost 100 + 1 per row each, as advertised.
+- **network_share**: two members of group `gf15cd18d` saw each other's files; the
+  member of group `g177ca48c` did not.
+- **delegation_pricing** (two nodes; B at a third of A's rates): A delegated `tiny`
+  to B, kept its own build (10 000 000 MU) from `initial_mu` and sent B the rest.
+  With an honest B, the client paid 2 119.9 MU/s (A's base for `tiny` is 1 128.9
+  MU/s, its ceiling 12 545.3 MU/s; 1.02× A's quote), while B charged A 55 155 MU over
+  the child's two minutes. With B patched to charge 5× on its tick, the client paid
+  1 500.0 MU/s, B charged A 340 760 MU (about 3.5× the maximum B signed), and A scored
+  B `maintenance_overcharged` −1000, once (`reputation_events`, `statement_faults`).
+
+What a node owes for these runs was local only: free credit and local top-ups.
+Nothing was paid on a ledger.
+
 ### 4. Attestation report card
 
 A full run drives every probe — including the memory-ceiling ladder and the
@@ -477,10 +828,13 @@ or an MCP call gets `busy` and the name of what is running.
 ## Funding the instance
 
 Every child is paid for out of **this** instance's balance: the node charges the
-parent `BUILD_MU` (10 000 000 on a default node) the first time a child is built,
-plus the child's `initial_mu`, and refunds whatever the child did not spend when
-it is stopped. The node itself funds this instance for
-`deposits.INITIAL_RUNTIME_HOURS` of its own resources — about 14e6 MU on a
+parent the child's `initial_mu`, and refunds whatever the child did not spend when
+it is stopped. Since nodo #563 the node takes the **build** of a child (`BUILD_MU`,
+10 000 000 on a default node, the first time it builds that image) out of the
+child's own `initial_mu`. A start whose `initial_mu` does not cover the build, or
+leaves less than one maintenance period after it, is refused and charges nothing
+(`src/utils/cost_functions/start_funding.py`). The node itself funds this instance
+for `deposits.INITIAL_RUNTIME_HOURS` of its own resources — about 14e6 MU on a
 default node.
 
 The children used to ask for a flat 2e8-5e8 MU each (`HEAVY_INITIAL_MU` etc.):
@@ -488,14 +842,22 @@ The children used to ask for a flat 2e8-5e8 MU each (`HEAVY_INITIAL_MU` etc.):
 executed verifier was refused (`Insufficient balance … needed 0.51 ERG`), its
 startup suite reported five `INFRA_ERROR`s, and it never tried again. Now:
 
-1. **Children are funded for minutes, not days.** On the first suite the
-   verifier measures the rate the node really charges it (two settled balances,
-   `FUNDING_RATE_SAMPLE_SECONDS` apart) and funds each child for
+1. **Children are funded for minutes, not days, plus their build.** On the first
+   suite the verifier measures the rate the node really charges it (two settled
+   balances, `FUNDING_RATE_SAMPLE_SECONDS` apart) and funds each child for
    `CHILD_FUNDED_SECONDS` (600) × `CHILD_BUDGET_MARGIN` (2) of the child's own
    resources, priced from that rate with the node's shipped RAM/vCPU/disk price
-   ratios. The largest (`benchmark`, 2 GiB) comes to ~4e6 MU on a default node.
+   ratios. The largest (`benchmark`, 2 GiB) comes to ~4e6 MU on a default node. To
+   that it adds the **build** of the child: the node's own quote
+   (`GetServiceEstimatedCost` asking for a balance of 1 MU answers the build plus 1
+   MU, and the build is 0 for an image the node has built; with no `initial_mu` the
+   node would fill in its default balance). Without a quote, the build is the node's `build_mu`
+   rate from `/__config__` (else `BUILD_MU_ESTIMATE`) until this instance has seen
+   the child launch. After a child launches, its next starts are funded without the
+   build.
 2. **The suite only starts once the balance covers it**: the largest child
-   deposit (children run one at a time and are refunded), the suite's own upkeep
+   deposit (children run one at a time and are refunded), the builds of the other
+   children that the node has not built yet, the suite's own upkeep
    (`SUITE_EXPECTED_SECONDS`), and `MIN_RESERVE_SECONDS` (900) of runtime left
    afterwards. On a node that has built the children before, the default funding
    of a new instance covers that, so the startup suite runs straight away.
@@ -503,14 +865,14 @@ startup suite reported five `INFRA_ERROR`s, and it never tried again. Now:
    showing the balance, what is required and the shortfall with the exact
    command; an attestation is refused as `insufficient_funds` instead of running
    into `INFRA_ERROR`s. `GET /status` (MCP `get_service_status`) shows the same.
-4. **A refused launch is named.** When the node refuses to charge for a child,
-   the probe's `INFRA_ERROR` says `INSUFFICIENT FUNDS` and quotes the node
-   (`Launch service error charging …`) instead of a reason cut off at
-   `Unable to l`. The rest of that run is skipped (`fault:
-   "insufficient_funds"`) rather than launching children the node will refuse
-   or spending three MU windows on a run that will be repeated. The startup
-   suite then waits for the first builds
-   (`BUILD_MU_ESTIMATE` per child not yet launched here) and runs again, up to
+4. **A refused launch is named.** When the node refuses to charge for a child, or
+   refuses its `initial_mu` because it does not cover the build (`does not cover the
+   build`, `after the build of`), the probe's `INFRA_ERROR` says `INSUFFICIENT FUNDS`
+   and quotes the node instead of a reason cut off at `Unable to l`. A refusal that
+   names the build makes that figure the build of the child. The rest of that run is
+   skipped (`fault: "insufficient_funds"`) rather than launching children the node
+   will refuse or spending three MU windows on a run that will be repeated. The
+   startup suite then asks the node for the builds again and runs again, up to
    `STARTUP_MAX_ATTEMPTS` (3).
 
 Validated on a real node (`ch`, amd64): a fresh instance with no deposit
@@ -588,6 +950,13 @@ things.
   MCP tool, `DEP_IDENTITY` for `sharefs`), `shared_filesystems` and the
   `/shared`, `/shared-ro` directories in both parents' `.service/`, the two new
   `pack_config.json` dependencies, and `tests/test_shared_filesystem.py`.
+- **1.5.0 — the nodo features after v3.** The funding fix of #563 (each child is
+  funded with its build, from the node's quote), and the probes `build_funding`,
+  `idempotent_start`, `block_skip`, `env_vars`, `network_share`, `tunnel`,
+  `balance_statement` and `delegation_pricing`. `nodo_gateway.py` and
+  `nodo_protos/` (the client for the current gateway protocol), the `netshare` child,
+  `tiny`'s `GET /env` and `GET /bytes/<n>`, `tests/test_new_benchmarks.py`, and
+  `tools/two-node/` (the two-node harness).
 
 ## Live validation against a real node
 
