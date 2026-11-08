@@ -1059,6 +1059,21 @@ Packing an architecture other than the host's needs a binfmt_misc handler for
 it on the machine that builds (nodo checks this in `ensure_native_arch`) and
 the packer enabled for it (`packer.ARM_PACKER_SUPPORT` / `X86_PACKER_SUPPORT`).
 
+### Declared workload of the children
+
+`<arch>/.service/service.json` declares the worst case of its descendants in
+`possible_environment_workload` (the same way personal-nutrition declares its PostgreSQL):
+four independent scenarios of resources only, one for each shape of child that a run starts
+at the same time: `benchmark` (2 GiB), `heavy` (256 MiB), `ping` (50 MB, 500 MB of disk) and
+the three small children of `network_share` (50 MB, 200 MB of disk, ×3). The children are not
+named by hash: their hashes change with every pack.
+
+At launch the node checks that each group has a place where one instance could run now,
+locally or on a peer, and it refuses the service if one has not
+(`workload_admission.ON_UNSATISFIABLE`, `reject` by default). **This is an admission check.**
+It reserves no capacity and it funds nothing: `initial_mu` is still the build plus the hours
+of this instance, so the funding of the children is the one of "Funding the instance" above.
+
 ## Reproducibility
 
 `<arch>/.service/Dockerfile` pins every input: the base image by digest, `requests`,
