@@ -699,6 +699,34 @@ delegating node. `tools/two-node/` runs this probe on a node that delegates to a
 second node, once with an honest peer and once with one that overcharges, and
 checks the score from the operator's side.
 
+#### Results on nodo dev `a97148dd` (2026-11-08)
+
+Release `v5` (pre-release). Packed from `main` after #17 (the `celaut` children of 11/08,
+the descriptor of dev a97148dd and bee-rpc v0.0.3) with `nodo pack amd64 --local` on a
+fresh nspawn test node at dev a97148dd.
+
+| service | id |
+|---|---|
+| verifier (`celaut-node-honesty-verifier`) | `7e89f0fd550dbe0fefe95f699a0c90b8c7b9d5ed2101b5d62748b2edf023a058` |
+| tiny | `f46bdda9b3eec6ffa633ba4f0e49638aaa200eba5b194daaede951c754fc4dbc` |
+| heavy | `ef5af32d7744dbdf0e1e05964407428b9fbe7b2d7e08bc6245276480acd70222` |
+| ping | `4a4d4fc6a9ba420571e2a6faa187afe385ae12037da62975edb6e575b2617aa1` |
+| benchmark | `6515b528f5de589313225a15e6487333ff24cad9e5c0042ce2d01b45dd259407` |
+| sharefs | `3bdbf0b7d8774e4525622f027772c9e21b168c6f8939039ad897c4d6bc6aac8f` |
+| sharefs-denied | `bf09b3763094bf596740c33763c4f962b8061917b22ec72c6dcb32d211cf88f6` |
+| netshare | `b2c69af742fbc30bb16a8dad880fdbe50759a3ec3f36d0c08c8c689811a989d1` |
+
+- **Clean node** (a node with no demo-service id in its registry, which imported only
+  `7e89f0.celaut.bee`), two runs: 15 PASS, `delegation_pricing` NOT_APPLICABLE, and
+  `network_share` INFRA_ERROR both times. The cause is a `ConnectTimeout` to member A at
+  `:3030/write`, after the member booted, mounted `/netshare` and exec'd
+  `/netshare-service`. `block_skip`: 557 B of 12,849,329 B.
+- The same sync on the tree before the `celaut` children (pack `1361dc`, not released) gave
+  16 PASS and `all_passed` on the same kind of clean node, with `network_share` PASS.
+- **Release v4 (`e236c5`) on the same dev**: 15 PASS, `delegation_pricing`
+  NOT_APPLICABLE, and `block_skip` INCONCLUSIVE: 4,552,549 B of 12,848,276 B sent, because
+  the node did not stop the sender. v4 pins bee-rpc v0.0.1, and the node runs v0.0.3.
+
 #### Results on nodo dev `97906c7c` (2026-10-24)
 
 Packed from commit `f07f032` with `nodo pack amd64 --local` on the test node
