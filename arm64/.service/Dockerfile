@@ -11,7 +11,7 @@
 # silently breaks reproducibility, and makes any bug observed in a running
 # instance impossible to trace back to a specific library revision.
 #
-# bee-rpc is pinned by commit. It is the one of its v0.0.1 tag, which is what nodo itself
+# bee-rpc is pinned by commit. It is the one of its v0.0.3 tag, which is what nodo itself
 # installs (bash/requirements.txt), so both ends speak the same bee-rpc. nodo_gateway.py
 # uses it for the calls that the `celaut` command does not make. grpcio and protobuf are
 # pinned so they cannot float; nodo's bash/requirements.txt pins bee-rpc only. The second
@@ -33,7 +33,7 @@ RUN pip3 install --no-cache-dir \
         click==8.5.0 blinker==1.9.0 urllib3==2.8.0 idna==3.20 \
         charset-normalizer==3.5.2 certifi==2026.7.22 \
         cryptography==50.0.2 cffi==2.1.1 pycparser==3.12 \
-        "bee-rpc @ git+https://github.com/bee-rpc-protocol/bee-rpc-over-grpc-py@8049fd86261c0d85445e6c27d363e0c82d5b2958"
+        "bee-rpc @ git+https://github.com/bee-rpc-protocol/bee-rpc-over-grpc-py@b250bcaca191209560be7b41b872d996e8c010d2"
 ADD --checksum=sha256:0173e4b9f33ee785176f68011995f29ceb4ea8d267ddbf7f8f1e24bcd08dd7e9 --chmod=755 \
     https://github.com/celaut-project/service-library/releases/download/v0.4.1/celaut-linux-arm64 \
     /usr/local/bin/celaut

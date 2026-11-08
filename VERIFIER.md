@@ -452,7 +452,7 @@ The probes below test what nodo `dev` added after v3. `celaut acquire` sends no
 `StartReference` and does not read quotes, statements or tunnels, and these probes keep
 the token of each child to do it, so they start their children and read the node with
 `nodo_gateway.py`, which loads nodo's own descriptor set (`nodo_protos/`, from nodo
-`97906c7c`) into a private descriptor pool. They follow the same rules as the
+`a97148dd`) into a private descriptor pool. They follow the same rules as the
 other probes: each child is stopped in a `finally`, a start the node refuses for
 funds is recorded as a shortage, and only an observed violation accuses.
 
@@ -1094,7 +1094,7 @@ content-addressed, so an unpinned `git+…` install (which resolves to whatever
 different images — and any bug observed in a running instance cannot be traced
 back to a specific library revision.
 
-The `bee-rpc` commit is the one of its `v0.0.1` tag, which nodo installs too
+The `bee-rpc` commit is the one of its `v0.0.3` tag, which nodo installs too
 (`bash/requirements.txt`), so both ends speak the same bee-rpc. `nodo_gateway.py` uses it.
 
 ## The pool: the `celaut` command
