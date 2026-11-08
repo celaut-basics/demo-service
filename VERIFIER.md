@@ -2,7 +2,7 @@
 
 This turns the passive `demo-service` into an **active verifier** that checks
 whether the nodo node it is running on is *honest*. It reuses the existing
-`tiny` / `heavy` / `ping` / `benchmark` / `sharefs` / `netshare` child scaffolding and the `celaut` command of
+`tiny` / `heavy` / `ping` / `benchmark` / `sharefs` / `netshare` / `family` child scaffolding and the `celaut` command of
 [service-library](https://github.com/celaut-project/service-library) (`celaut_pool.py`) —
 nothing was rewritten from scratch.
 
@@ -74,6 +74,7 @@ Two consequences follow:
 | 7 | `shared_filesystem` | `sharefs`, `sharefs-denied` | the directory this service exports is shared with its child in both directions, a read-only mount refuses a write, and a child asking for a share its parent does not export is refused at launch |
 | 8 | `mu_accounting` | orchestrator (self) | the node spends MUs in line with the resources it provisions |
 | 10 | `build_funding` | `tiny` | nodo #563: a child funded below its build, or below one maintenance period after it, is refused with the node's message and charged nothing; a funded child starts, this account pays exactly its `initial_mu`, and the build is paid from the child's account |
+| 18 | `children_initial_cost` | `family` (→ `tiny`) | nodo #538: the quote gives the start of a parent's initial children apart from `cost` (`children_initial_cost`); a parent funded below build + `children_initial_cost` + one period is refused with the node's message and charged nothing; a parent funded by the client formula starts its initial child at its one attempt, with one `child_start` of about the quoted figure |
 | 11 | `idempotent_start` | `tiny` | nodo #578: three StartService requests with one `StartReference` give one instance and one `child_start` charge; the requests after the first send no service and get the same instance |
 | 12 | `block_skip` | `tiny` | nodo #371: a StartService that carries blocks the node holds sends a small part of them (≤ 5%); the bytes and the time to the instance are reported, against this instance's first send of the child |
 | 13 | `env_vars` | `tiny` | nodo #574/#582: the packed spec names the declared env vars; a child started with one value given, one empty and one left out gets exactly those, in `/__config__` and in its process environment |
@@ -452,7 +453,7 @@ The probes below test what nodo `dev` added after v3. `celaut acquire` sends no
 `StartReference` and does not read quotes, statements or tunnels, and these probes keep
 the token of each child to do it, so they start their children and read the node with
 `nodo_gateway.py`, which loads nodo's own descriptor set (`nodo_protos/`, from nodo
-`a97148dd`) into a private descriptor pool. They follow the same rules as the
+`eda0a9b3`, PR #635) into a private descriptor pool. They follow the same rules as the
 other probes: each child is stopped in a `finally`, a start the node refuses for
 funds is recorded as a shortage, and only an observed violation accuses.
 
@@ -486,6 +487,45 @@ finds each start by its reference (`detail.start_ref`).
 It runs first of the probes that start children: on a node that has not built
 `tiny` yet, the funded start is the one that pays the build, so both rules are
 exercised. On later runs the image is built and only the period rule applies.
+
+#### Children initial cost (`family`, nodo #538, PR #635)
+
+Since #538 a service declares its descendants in conjunctive normal form, in two fields:
+`initial_environment_workload` (the children that it needs to start: admission and cost)
+and `possible_environment_workload` (what it can ask for later: admission only). The quote
+gives `EstimatedCost.children_initial_cost`: for each initial workload, `count` times the
+build of the child plus the node's default balance for it. `cost` leaves it out, and a
+client funds a parent with `cost + maintenance × (periods + 1) + children_initial_cost`. A
+start whose `initial_mu` is below build + `children_initial_cost` + one period is refused
+(`workload_admission.ON_UNDERFUNDED`, `reject` by default) and charges nothing: before
+#538 such a parent started and then could not pay for its children (#628).
+
+The `family` child is such a parent. Its `service.json` declares one `tiny` in
+`initial_environment_workload`, and `family/service/run.sh` starts it once at boot with
+`celaut acquire --new --attempts 1` and no `initial_mu` (the node's default start, which
+is what the quote priced). It serves the result at `/status.txt` and stops its child
+through `/cgi-bin/stop`. The probe:
+
+1. quotes `family` and a default start of `tiny`, both with no `initial_mu`;
+2. starts `family` with build + `children_initial_cost` + half a period (refused by an
+   honest node);
+3. starts `family` by the client formula (6 periods), waits for `/status.txt`, waits
+   `FAMILY_SETTLE_S` (20 s) more, and reads `family`'s statement;
+4. stops `tiny` through `family`, then `family`.
+
+| observation | verdict |
+|---|---|
+| `children_initial_cost` is the cost of a default start of `tiny` (±25 %, `CHILDREN_COST_TOLERANCE`), the under-funded start is refused with the #538 message (`children_initial_cost`) and leaves no charge, and the funded `family` starts `tiny` at its one attempt: one `child_start` of about the quote, and a `child_bound` that names `tiny` | `PASS` |
+| the node refused the under-funded start and kept MU of it | `DISHONEST` |
+| the under-funded `family` was started (the operator may run `ON_UNDERFUNDED=warn`), it was refused with another message, `tiny` could not start, there was more than one `child_start`, or a figure is off the quote | `INCONCLUSIVE` |
+| the quote has no `children_initial_cost` (a node before #538), or the node is free | `NOT_APPLICABLE` |
+| a quote, the funded start or a statement failed | `INFRA_ERROR` |
+
+The quote and the start price the default balance at the load of two moments, so the
+figures are compared with a tolerance, and a figure that is off is never an accusation.
+The evidence also has `own_initial_mu`: what the node funded this verifier with
+(`/__config__`), to compare with `nodo estimate` of the verifier (`cost` plus
+`children_initial_cost`).
 
 #### Idempotent StartService (`tiny`, nodo #578, PR #585)
 
@@ -873,6 +913,17 @@ leaves less than one maintenance period after it, is refused and charges nothing
 for `deposits.INITIAL_RUNTIME_HOURS` of its own resources — about 14e6 MU on a
 default node.
 
+**On a node with #538** (PR #635) the node funds this instance with its own default
+balance plus `children_initial_cost`: for each child of `initial_environment_workload`, its
+build and the node's default balance for it (`deposits.INITIAL_RUNTIME_HOURS` of the
+child's `at_init`). So the verifier funds each of those children with the node's own
+figures instead of its estimate: it asks for a default start of each child
+(`GetServiceEstimatedCost` with no `initial_mu`; its cost is the build plus that balance),
+takes the balance as the runtime of the child, and adds the build as before (the #563 build
+quote, 0 once the node has built the image). The suite then needs no top-up, on a node that
+has never built the children too: the builds were in the quote. On an older node (its
+quote has no `children_initial_cost`) the rules below still apply.
+
 The children used to ask for a flat 2e8-5e8 MU each (`HEAVY_INITIAL_MU` etc.):
 35× what funds this whole instance for an hour. Every launch of a freshly
 executed verifier was refused (`Insufficient balance … needed 0.51 ERG`), its
@@ -1029,8 +1080,9 @@ passes to BuildKit as `--opt platform=`), so every service here is maintained
 twice, by hand, and packed from the tree of the architecture wanted:
 
 ```sh
-nodo pack arm64          # demo + tiny/heavy/ping/benchmark/sharefs/sharefs-denied, all linux/arm64
-nodo pack amd64          # the same, all linux/amd64
+tools/pack/pack.sh amd64    # the children, family and the verifier, named by hash (see below)
+nodo pack arm64             # demo + every child, all linux/arm64, workloads without hashes
+nodo pack amd64             # the same, all linux/amd64
 nodo pack benchmark/amd64   # one service on its own
 ```
 
@@ -1038,8 +1090,8 @@ nodo pack benchmark/amd64   # one service on its own
 arm64/  amd64/                  the demo's pack roots
 ├── .service/                   Dockerfile, service.json, pack_config.json — per arch
 ├── app.py      -> ../app.py
-└── tiny heavy ping benchmark sharefs sharefs-denied   -> ../<svc>/<arch>
-<svc>/                          tiny, heavy, ping, benchmark, sharefs, sharefs-denied
+└── tiny heavy ping benchmark sharefs sharefs-denied netshare family   -> ../<svc>/<arch>
+<svc>/                          tiny, heavy, ping, benchmark, sharefs, sharefs-denied, netshare, family
 ├── src/ Cargo.* | bench.sh serve www/     shared source
 └── arm64/  amd64/              the service's pack roots
     ├── .service/               per arch
@@ -1093,26 +1145,48 @@ the packer enabled for it (`packer.ARM_PACKER_SUPPORT` / `X86_PACKER_SUPPORT`).
 
 ### Declared workload of the children
 
-`<arch>/.service/service.json` declares the descendants of this service in
-`possible_environment_workload`, the way personal-nutrition declares its PostgreSQL. It is
-**one scenario** with six groups, one for each kind of child that a run starts: `tiny`,
-`heavy`, `ping`, `benchmark` (2 GiB), `sharefs` and `netshare` (×3, the members of
-`network_share`), each with the memory and the disk of its own `service.json`. Inside a
-scenario the groups are an AND: the service may need all of them. Between scenarios it would
-be an OR (the dearest counts), so a service that starts its children one after another, and
-builds each one, puts them all in the same scenario. The children are not named by hash:
-their hashes change with every pack.
+`<arch>/.service/service.json` declares the descendants of this service in the
+conjunctive normal form of nodo [#538](https://github.com/celaut-project/nodo/issues/538)
+(PR [#635](https://github.com/celaut-project/nodo/pull/635)): each field is an AND of
+clauses, a clause (`{"any_of": [...]}`) an OR of groups, and a group (`{"workloads": [...]}`)
+an AND of workloads that run at the same time. A workload is `{"count", "dependency"}`, and
+its resources are the ones of `dependency.service.container` (architecture and
+`resources.at_init` / `at_most`): the shape of a partial service. A workload has no
+`resources` field any more; the packer of #635 refuses the old shape.
+
+- **`initial_environment_workload`**: the children that the startup suite starts at boot,
+  which the verifier needs to produce its first result. One clause for each: `tiny`,
+  `heavy` (256 MiB), `ping`, `benchmark` (2 GiB), `sharefs`, and `netshare` ×3 (the three
+  members of `network_share` run at the same time, so they are one workload of count 3).
+  They are separate clauses because the suite starts them one after another: each must
+  fit somewhere, not all of them at once. No clause has an alternative group: each child
+  is the one that its probe tests.
+- **`possible_environment_workload`**: what the verifier may start, but does not need to
+  start: `family` and the `tiny` that it starts (one group: they run at the same time),
+  and `sharefs-denied` (an honest node refuses it at launch, but a node that starts it
+  runs it).
 
 What the node does with it:
 
-- **Admission** (every nodo): at launch it checks that each group has a place where one
-  instance could run now, locally or on a peer, and it refuses the service if one has not
+- **Admission** (both fields): at launch it checks that each clause has a group that fits
+  now, locally or on a peer, and it refuses the service if one has not
   (`workload_admission.ON_UNSATISFIABLE`, `reject` by default). It reserves no capacity.
-- **Funding** (nodo with [#634](https://github.com/celaut-project/nodo/pull/634)): the
-  default balance of the service covers the runtime of every group for the same hours as the
-  service, plus one build for each group, and the quote (`EstimatedCost.cost`) says so. An
-  older node does not do this: `initial_mu` is the build plus the hours of this instance, and
-  the missing MU come from "Funding the instance" above.
+- **Cost** (`initial_environment_workload` only): `EstimatedCost.children_initial_cost`
+  is the sum, over the clauses, of `count` × (the build of the child + the node's default
+  balance for it). `cost` leaves it out. A default start (`nodo execute`, no `initial_mu`)
+  funds both. A start with an `initial_mu` below build + `children_initial_cost` + one
+  period is refused (`workload_admission.ON_UNDERFUNDED`). The verifier funds each of
+  these children with what the node set aside for it (see "Funding the instance").
+
+**Hashes.** A workload counts the build of its child only when `dependency.hash` names it:
+a workload with no hash names no service, and the node quotes no build for it. The ids of
+the children change with every pack (a pack is not reproducible), so the `service.json`
+files of this repository carry no hash, and a plain `nodo pack amd64` gives a verifier
+whose `children_initial_cost` holds the balances of its children but not their builds.
+`tools/pack/pack.sh <arch>` packs the children first, then `family` and the verifier from
+copies that `tools/pack/stamp.py` names by those ids (and whose `pack_config.json` takes
+each child from the registry by its id, so it is not packed twice). The released packs are
+packed this way.
 
 ## Reproducibility
 
