@@ -1,0 +1,10 @@
+{
+  "_comment": "The dependency (pack_config.json key) of each workload of each pack root, clause by clause, group by group, workload by workload. stamp.py names each workload by the service id of that dependency.",
+  "verifier": {
+    "initial_environment_workload": [[["TINY"]], [["HEAVY"]], [["PING"]], [["BENCHMARK"]], [["SHAREFS"]], [["NETSHARE"]]],
+    "possible_environment_workload": [[["FAMILY", "TINY"]], [["SHAREFS_DENIED"]]]
+  },
+  "family": {
+    "initial_environment_workload": [[["TINY"]]]
+  }
+}
