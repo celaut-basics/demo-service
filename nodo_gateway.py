@@ -493,11 +493,24 @@ def movement_hash(mv):
 
 
 def statement_digest(st):
+    """The digest that the node signs.
+
+    Since nodo #631 the text has three optional parts after the movements: the
+    service_id (field 13) and the instance_ref (field 14) when they are not empty, and
+    ``|relayed`` (field 12) when it is true. A statement without them has the digest of
+    before.
+    """
     text = "|".join((
         st.account_ref, str(st.from_seq), str(st.to_seq), str(st.ts), str(st.retention_days),
         str(st.oldest_seq), str(st.head_seq), st.head_hash, _hex(st.balance.n),
         "/".join(movement_hash(mv) for mv in st.movements),
     ))
+    if getattr(st, "service_id", ""):
+        text += "|service_id:" + _hex(st.service_id)
+    if getattr(st, "instance_ref", ""):
+        text += "|instance_ref:" + _hex(st.instance_ref)
+    if getattr(st, "relayed", False):
+        text += "|relayed"
     return _digest(text)
 
 

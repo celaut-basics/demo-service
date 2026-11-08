@@ -9,6 +9,7 @@ accused.
 
 Run with:  python3 tests/test_new_benchmarks.py
 """
+import hashlib
 import json
 import os
 import sys
@@ -604,6 +605,38 @@ class StatementReaderTests(unittest.TestCase):
         other = ed25519.Ed25519PrivateKey.generate()
         out = gw.verify_statement(signed_chain(RUN, key=other), public_hex(self.key))
         self.assertFalse(out["signatures_ok"])
+
+    def test_the_digest_covers_the_fields_of_a_descendant_read(self):
+        # nodo #631: service_id, instance_ref and relayed are in the signed text only
+        # when they are set, so a statement without them keeps its digest.
+        st = signed_chain(RUN)[0]
+        plain = gw.statement_digest(st)
+        st.service_id, st.instance_ref, st.relayed = "", "", False
+        self.assertEqual(gw.statement_digest(st), plain)
+        digests = {plain}
+        for name, value in (("service_id", "ab12"), ("instance_ref", "cd34"), ("relayed", True)):
+            setattr(st, name, value)
+            digests.add(gw.statement_digest(st))
+        self.assertEqual(len(digests), 4)
+        st.signature = self.key.sign(gw.statement_payload(
+            public_hex(self.key), gw.statement_digest(st)).encode()).hex()
+        self.assertTrue(gw.verify_signature(st, public_hex(self.key)))
+        st.instance_ref = "ef56"
+        self.assertFalse(gw.verify_signature(st, public_hex(self.key)))
+
+    def test_the_digest_is_the_one_of_nodo(self):
+        # The text of src/manager/balance_statement.py::statement_digest (nodo a97148dd),
+        # written out here for one statement with the three fields of #631.
+        st = signed_chain(RUN)[0]
+        st.service_id, st.instance_ref, st.relayed = "ab12", "cd34", True
+        text = "|".join((st.account_ref, str(st.from_seq), str(st.to_seq), str(st.ts),
+                         str(st.retention_days), str(st.oldest_seq), str(st.head_seq),
+                         st.head_hash, st.balance.n.encode().hex(),
+                         "/".join(gw.movement_hash(mv) for mv in st.movements)))
+        text += "|service_id:" + "ab12".encode().hex() + "|instance_ref:" \
+            + "cd34".encode().hex() + "|relayed"
+        self.assertEqual(gw.statement_digest(st),
+                         hashlib.blake2b(text.encode(), digest_size=32).hexdigest())
 
 
 @unittest.skipUnless(HAVE_ED25519, "cryptography is not installed")

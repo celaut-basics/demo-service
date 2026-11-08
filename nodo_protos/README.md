@@ -2,7 +2,7 @@
 
 `celaut.binpb` is a copy of `protos/celaut_doc.binpb` from
 [celaut-project/nodo](https://github.com/celaut-project/nodo) at commit
-`97906c7c` (dev, 2026-10-24). It is a `FileDescriptorSet` of `celaut.proto`.
+`a97148dd` (dev, 2026-11-08). It is a `FileDescriptorSet` of `celaut.proto`.
 
 `nodo_gateway.py` loads it into a private descriptor pool, apart from the default pool of
 protobuf. The `celaut` command does not read quotes, statements or tunnels, and the newer
