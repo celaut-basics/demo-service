@@ -4,9 +4,9 @@
 [celaut-project/nodo](https://github.com/celaut-project/nodo) at commit
 `97906c7c` (dev, 2026-10-24). It is a `FileDescriptorSet` of `celaut.proto`.
 
-`nodo_gateway.py` loads it into a private descriptor pool. The pinned
-`node_controller` keeps its own, older `celaut.proto` in the default pool, and
-the newer benchmarks need messages it does not have: `StartReference` (#578),
+`nodo_gateway.py` loads it into a private descriptor pool, apart from the default pool of
+protobuf. The `celaut` command does not read quotes, statements or tunnels, and the newer
+benchmarks need messages for them: `StartReference` (#578),
 `BalanceStatementRequest` and `BalanceStatement` (#570), and the current
 `EstimatedCost` and `Peer`.
 

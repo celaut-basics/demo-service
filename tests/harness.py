@@ -1,6 +1,6 @@
-"""Shared test harness: stubs node_controller/bee_rpc and imports app.py.
+"""Shared test harness: stubs celaut_pool/bee_rpc and imports app.py.
 
-No node, no network and no node_controller install required: the client
+No node, no network and no `celaut` binary required: the client
 library, the gateway and the child services are all stubbed at import time.
 Importing this module once per process gives every test file the same app.
 """
@@ -59,18 +59,18 @@ CLOSED_URI = "127.0.0.1:%d" % _CLOSED_PORT
 # Stub out everything app.py touches at import time.
 # ---------------------------------------------------------------------------
 def _install_stubs(tmpdir):
-    """Fake node_controller + bee_rpc so app.py imports with no node present."""
+    """Fake celaut_pool + bee_rpc so app.py imports with no node present."""
 
     class _Instance:
-        def __init__(self, uri=None, token="inst-token"):
+        def __init__(self, uri=None, lease=1):
             self.uri = uri or LISTENING_URI
-            self.token = token
+            self.lease = lease
 
         def stop(self, gateway_stub):
             FakeServiceInterface.stopped.append(self.uri)
 
     class FakeServiceInterface:
-        """Mimics node_controller's ServiceInterface.
+        """Mimics celaut_pool.ServiceInterface.
 
         launch_mode:
           "unbound_local" -> reproduce the observed library bug verbatim
@@ -85,17 +85,17 @@ def _install_stubs(tmpdir):
 
         def __init__(self, service_hash=None, config=None):
             self.service_hash = service_hash
-            # Real ServiceInterfaces carry the stub _release_child stops through.
-            self.gateway_stub = object()
+            # The real ServiceInterface has no gateway stub: `celaut` holds the connection.
+            self.gateway_stub = None
 
         def get_instance(self, max_attempts=1):
             if FakeServiceInterface.launch_mode == "ok":
                 return _Instance()
             if FakeServiceInterface.launch_mode == "never_ready":
                 return _Instance(uri=CLOSED_URI)
-            # Verbatim shape of the real failure: node_controller's
-            # launch_instance() swallows every grpc.RpcError into debug() and
-            # then executes `return instance` with the name never assigned.
+            # Verbatim shape of a failure that the old node_controller library gave:
+            # launch_instance() swallowed every grpc.RpcError and then executed
+            # `return instance` with the name never assigned. app.py still translates it.
             raise UnboundLocalError(
                 "cannot access local variable 'instance' where it is not "
                 "associated with a value")
@@ -131,26 +131,9 @@ def _install_stubs(tmpdir):
                 "StatusCode.UNAVAILABLE failed to connect to all addresses; "
                 "last error: UNKNOWN: ipv4:192.168.200.1:58443: Failed to connect")
 
-    nc = types.ModuleType("node_controller")
-    nc_controller = types.ModuleType("node_controller.controller")
-    nc_controller_controller = types.ModuleType("node_controller.controller.controller")
-    nc_controller_controller.Controller = FakeController
-
-    nc_gateway = types.ModuleType("node_controller.gateway")
-    nc_protos = types.ModuleType("node_controller.gateway.protos")
-    celaut_pb2 = types.ModuleType("node_controller.gateway.protos.celaut_pb2")
-    celaut_pb2.Configuration = lambda **kw: {"config": kw}
-    celaut_pb2.BytesKeyValue = lambda **kw: dict(kw)
-    celaut_pb2.ObserveRequest = lambda **kw: {"observe": kw}
-    celaut_pb2.ObserveEvent = object
-    nc_protos.celaut_pb2 = celaut_pb2
-
-    nc_utils = types.ModuleType("node_controller.gateway.utils")
-    nc_utils.to_amount = lambda v: v
-    nc_utils.from_amount = lambda v: v
-
-    nc_comm = types.ModuleType("node_controller.gateway.communication")
-    nc_comm.generate_gateway_stub = lambda url: object()
+    # app.py gets its pool from celaut_pool, which runs the `celaut` command.
+    pool = types.ModuleType("celaut_pool")
+    pool.Controller = FakeController
 
     bee = types.ModuleType("bee_rpc")
     bee_client = types.ModuleType("bee_rpc.client")
@@ -162,14 +145,7 @@ def _install_stubs(tmpdir):
     bee.utils = bee_utils
 
     for name, mod in [
-        ("node_controller", nc),
-        ("node_controller.controller", nc_controller),
-        ("node_controller.controller.controller", nc_controller_controller),
-        ("node_controller.gateway", nc_gateway),
-        ("node_controller.gateway.protos", nc_protos),
-        ("node_controller.gateway.protos.celaut_pb2", celaut_pb2),
-        ("node_controller.gateway.utils", nc_utils),
-        ("node_controller.gateway.communication", nc_comm),
+        ("celaut_pool", pool),
         ("bee_rpc", bee),
         ("bee_rpc.client", bee_client),
         ("bee_rpc.utils", bee_utils),

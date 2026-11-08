@@ -36,11 +36,9 @@ from flask import Flask, jsonify, render_template_string, request
 from google.protobuf.json_format import MessageToDict
 
 from bee_rpc.utils import modify_env
-from node_controller.controller.controller import Controller
-from node_controller.gateway.protos import celaut_pb2
-from node_controller.gateway.utils import to_amount, from_amount
 
 import nodo_gateway as gw
+from celaut_pool import Controller
 
 
 DIR = "service"
@@ -108,7 +106,7 @@ def classify_rpc_failure(exc):
     """Attribute a failed gateway RPC to the transport or to the node.
 
     Handles both shapes this service actually sees: a real ``grpc.RpcError``
-    (which carries ``.code()``) and the exceptions node_controller re-raises,
+    (which carries ``.code()``) and the exceptions that celaut_pool raises,
     where the status survives only in the text -- so the classification never
     depends on grpc being importable here.
 
@@ -240,10 +238,11 @@ app = Flask(__name__)
 # Under nodo the cwd of this process is /, but the packer puts the blocks in
 # service/__block__/ beside __services__. Without this line, a launch that must
 # send a child service to the node fails with "gRPCbb: Error reading block".
-# node_controller does not set it.
+# The `celaut` command (celaut_pool) reads its own blocks; this is for nodo_gateway.
 modify_env(block_dir=os.path.join(os.path.abspath(DIR), "__block__") + "/")
 
-controller = Controller(debug=lambda s: logging.info('Node Controller: %s', s),
+# The children go through the `celaut` command (celaut-project/service-library): see celaut_pool.
+controller = Controller(debug=lambda s: logging.info('celaut: %s', s),
                         app_dir=DIR, config_file=CONFIG_FILE)
 node_url: str = controller.get_node_url()
 mem_limit: int = controller.get_mem_limit_at_start()
@@ -307,7 +306,7 @@ METADATA_DIR = os.path.join(DIR, "__metadata__")
 
 
 def packed(label):
-    """A child as this service holds it, for the calls node_controller cannot make."""
+    """A child as this service holds it, for the calls that celaut_pool does not make."""
     return gw.PackedService(_CHILD_HASHES[label], SERVICES_DIR, METADATA_DIR)
 
 
@@ -490,7 +489,7 @@ def granted_addresses(resolutions, tags):
 def _read_own_resolutions():
     """This instance's own NetworkResolution entries, from its __config__."""
     try:
-        cfg = celaut_pb2.ConfigurationFile()
+        cfg = gw.messages().ConfigurationFile()
         with open(CONFIG_FILE, "rb") as fh:
             cfg.ParseFromString(fh.read())
         return list(cfg.network_resolution)
@@ -535,21 +534,26 @@ def control_reach(addresses, port=TARGET_PORT, timeout=CONTROL_TIMEOUT_S):
 
 
 def _child_config(label, initial_mu=None):
-    """The Configuration a child is launched with, or None for the node default."""
-    kwargs = {}
+    """How a child is launched, or None for the node default.
+
+    ``initial_mu`` is the MU that the child is funded with, and ``environment_variables`` the
+    ``{"key", "value"}`` of the variables that it is given. ``celaut_pool`` turns them into the
+    flags of ``celaut acquire``.
+    """
+    config = {}
     if initial_mu is not None:
-        kwargs["initial_mu"] = to_amount(initial_mu)
+        config["initial_mu"] = int(initial_mu)
     undeclared = TARGET_ADDRESSES[UNDECLARED_TARGET[0]]
     if label == "ping" and undeclared:
-        kwargs["environment_variables"] = [celaut_pb2.BytesKeyValue(
-            key=UNDECLARED_ADDRS_ENV, value=",".join(undeclared).encode())]
+        config["environment_variables"] = [{
+            "key": UNDECLARED_ADDRS_ENV, "value": ",".join(undeclared).encode()}]
     if label == "netshare":
         # The group fills ${DEMO_NETSHARE_GROUP} in netshare's network: without it the
         # node refuses the launch. A group of its own, so dependency_identity never joins
         # the share of network_share.
-        kwargs["environment_variables"] = [celaut_pb2.BytesKeyValue(
-            key=NETSHARE_GROUP_ENV, value=b"identity")]
-    return celaut_pb2.Configuration(**kwargs) if kwargs else None
+        config["environment_variables"] = [{
+            "key": NETSHARE_GROUP_ENV, "value": b"identity"}]
+    return config or None
 
 
 def _add_child(label, initial_mu=None):
@@ -571,7 +575,7 @@ sharefs_denied_service = _add_child("sharefs_denied", CHILD_MIN_INITIAL_MU)
 
 
 def _register_child_budget(label, initial_mu):
-    """Re-register one child funded with initial_mu (node_controller keeps the config)."""
+    """Re-register one child funded with initial_mu (celaut_pool keeps the config)."""
     global tiny_service, heavy_service, ping_service, benchmark_service, sharefs_service
     global netshare_service
     iface = _add_child(label, initial_mu)
@@ -825,10 +829,10 @@ def _full_error_text(exc):
 def _describe_launch_failure(exc):
     """Recover a usable message even when the client library loses the real error.
 
-    node_controller's launch_instance() swallows every grpc.RpcError into debug()
-    and then trips over `return instance` with the name unbound, so an
-    UnboundLocalError is all that reaches us. Translate that into what it
-    actually means instead of propagating a meaningless Python detail.
+    The node_controller library that this service used before swallowed every
+    grpc.RpcError and tripped over `return instance` with the name unbound, so an
+    UnboundLocalError was all that reached us. That case is still translated into
+    what it meant. A `celaut` command gives a CelautError that keeps the node's own text.
 
     A gRPC failure is reduced to the node's own `details = "..."` text: the
     rendezvous wrapper around it used up the whole length budget, so reports
@@ -887,8 +891,8 @@ def _spin_child(service_iface, label, wait_ready=True):
     misbehaved". Only the last of those can support a verdict about the node.
 
     The caller owns the returned instance and must hand it to _release_child;
-    node_controller's own contract is that a taken instance is either returned
-    to its queue or stopped, and a verifier that leaks one bills its parent for
+    the contract of a pool of instances is that a taken instance is either returned
+    or stopped, and a verifier that leaks one bills its parent for
     a child it has finished measuring.
     """
     try:
@@ -1844,10 +1848,11 @@ def probe_shared_filesystem():
 # ----------------------------------------------------------------------------
 # The newer benchmarks: children started over nodo_gateway
 # ----------------------------------------------------------------------------
-# node_controller starts a child with its own copy of an older celaut.proto. The
-# benchmarks below need what it cannot send -- an initial_mu per start, a
-# StartReference, env vars per instance, the block skip -- or read what it cannot
-# read (quotes, statements, tunnels), so they start their children with nodo_gateway.
+# celaut_pool starts a child with `celaut acquire`, which sends no StartReference and no
+# block skip request. The benchmarks below need what it cannot send -- a StartReference,
+# the blocks that the node holds -- or read what it does not read (quotes, statements,
+# tunnels), and they keep the token of each child to do it, so they start their
+# children with nodo_gateway.
 # They keep the rules of the other probes: every child is stopped in a `finally`, a
 # start the node refuses for want of funds is recorded in FUNDING_FAILURES, and only an
 # observed violation accuses.
@@ -2947,21 +2952,18 @@ OBSERVE_ARM_SECONDS = float(os.environ.get("OBSERVE_ARM_SECONDS", "5"))
 OBSERVE_MAX_EVENTS = 60
 
 
-def _collect_observe_events(instance_id, out, stop_flag):
+def _collect_observe_events(lease, out, stop_flag):
+    """Read the ``Observe`` stream of the child ``lease`` (``celaut observe``) into ``out``.
+
+    The events are the dicts that ``celaut`` prints: ``{"time", "kind", "data"}``. An error is
+    one ``("__error__", text)`` in ``out``.
+    """
     try:
-        from node_controller.gateway.communication import generate_gateway_stub
-        from bee_rpc.client import client_grpc
-        stub = generate_gateway_stub(node_url)
-        for evt in client_grpc(
-            method=stub.Observe,
-            input=celaut_pb2.ObserveRequest(instance_id=instance_id, include_packets=True),
-            indices_parser=celaut_pb2.ObserveEvent,
-            partitions_message_mode_parser=True,
-            indices_serializer=celaut_pb2.ObserveRequest,
-        ):
-            out.append(evt)
-            if len(out) >= OBSERVE_MAX_EVENTS or stop_flag[0]:
-                break
+        with controller.observe(lease, packets=True) as events:
+            for evt in events:
+                out.append(evt)
+                if len(out) >= OBSERVE_MAX_EVENTS or stop_flag[0]:
+                    break
     except Exception as e:
         out.append(("__error__", clip(e)))
 
@@ -2975,9 +2977,11 @@ def probe_dependency_observe():
         # the others: Observe can only corroborate a connectivity claim the
         # dependency actually got far enough to make.
         inst = _spin_child(ping_service, "ping")
-        instance_id = getattr(inst, "token", None)
+        # The child is named by its lease: the token never reaches this process, and it is
+        # a credential, so no report holds it.
+        lease = getattr(inst, "lease", None)
         ev["dependency"] = "ping"
-        ev["instance_id_used"] = instance_id
+        ev["lease_used"] = lease
 
         # 1) Open the Observe stream FIRST. ping only makes traffic while it is
         #    serving GET /, so a stream opened after that request has returned
@@ -2987,7 +2991,7 @@ def probe_dependency_observe():
         #    fabricated connectivity on an honest node.
         events, stop_flag = [], [False]
         t = threading.Thread(target=_collect_observe_events,
-                             args=(instance_id, events, stop_flag), daemon=True)
+                             args=(lease, events, stop_flag), daemon=True)
         t.start()
         armed_deadline = time.monotonic() + OBSERVE_ARM_SECONDS
         while not events and t.is_alive() and time.monotonic() < armed_deadline:
@@ -3017,22 +3021,27 @@ def probe_dependency_observe():
                 obs_err = e[1]
                 continue
             try:
-                if e.HasField("packet"):
-                    p = e.packet
-                    packets.append({"direction": p.direction, "protocol": p.protocol,
-                                    "src": p.src, "dst": p.dst, "peer_kind": p.peer_kind,
-                                    "peer_tag": p.peer_tag,
-                                    "peer_relationship": p.peer_relationship,
-                                    "peer_host": p.peer_host, "source": p.source})
-                elif e.HasField("session"):
-                    sessions.append({"instance_id": e.session.instance_id, "tag": e.session.tag,
-                                     "capture_mode": e.session.capture_mode,
-                                     "degraded_reason": e.session.degraded_reason})
-                    if e.session.degraded_reason:
-                        degraded.append(e.session.degraded_reason)
-                elif e.HasField("notice"):
-                    if e.notice.degraded:
-                        degraded.append(e.notice.message)
+                kind, d = e.get("kind"), e.get("data") or {}
+                if kind == "packet":
+                    packets.append({"direction": d.get("direction"), "protocol": d.get("protocol"),
+                                    "src": d.get("src"), "dst": d.get("dst"),
+                                    "peer_kind": d.get("peer_kind"),
+                                    "peer_tag": d.get("peer_tag"),
+                                    "peer_relationship": d.get("peer_relationship"),
+                                    "peer_host": d.get("peer_host"), "source": d.get("source")})
+                elif kind == "session":
+                    # The node names the instance by its token here; the report keeps its
+                    # instance_ref (a hash), which names it without handing out the credential.
+                    token = d.get("instance_id")
+                    sessions.append({"instance_ref": gw.instance_ref(token) if token else None,
+                                     "tag": d.get("tag"),
+                                     "capture_mode": d.get("capture_mode"),
+                                     "degraded_reason": d.get("degraded_reason")})
+                    if d.get("degraded_reason"):
+                        degraded.append(d["degraded_reason"])
+                elif kind == "notice":
+                    if d.get("degraded"):
+                        degraded.append(d.get("message"))
             except Exception:
                 pass
 

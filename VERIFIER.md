@@ -2,7 +2,8 @@
 
 This turns the passive `demo-service` into an **active verifier** that checks
 whether the nodo node it is running on is *honest*. It reuses the existing
-`tiny` / `heavy` / `ping` / `benchmark` / `sharefs` / `netshare` child scaffolding and the `node_controller` library —
+`tiny` / `heavy` / `ping` / `benchmark` / `sharefs` / `netshare` child scaffolding and the `celaut` command of
+[service-library](https://github.com/celaut-project/service-library) (`celaut_pool.py`) —
 nothing was rewritten from scratch.
 
 An honest node must:
@@ -112,9 +113,9 @@ wait.
 
 Each probe hands every child it spins to `_release_child` in a `finally`.
 
-node_controller's contract is that a taken instance is either returned to its
-queue or stopped — its own source says a leaked one "remain[s] as zombies on the
-network until the service is removed". Beyond the leak, an abandoned child keeps
+The contract of a pool of instances is that a taken instance is either returned or
+stopped (`celaut release` or `celaut stop`): a leaked one stays on the node, and
+bills, until the service is removed. Beyond the leak, an abandoned child keeps
 drawing MU from *this* service's balance, and that balance is what
 `mu_accounting` measures: enough abandoned children swamp the difference its two
 windows exist to compare. A verifier that leaks children measures its own litter.
@@ -142,7 +143,9 @@ So a `node_rpc` fault is never reported as an unreachable gateway, and the node'
 own `details = "..."` text is surfaced verbatim as `node_detail` — that string
 names the RPC path that broke. `classify_rpc_failure` reads the status from a real
 `grpc.RpcError` (`.code()`) or from the exception text, so it works with whatever
-node_controller re-raises.
+`celaut_pool` raises: a `CelautError` carries `StatusCode.UNAVAILABLE` when `celaut`
+says that the node did not answer (exit code 3) and the node's own words as
+`details = "..."` when it answered with an error.
 
 `resource_provisioning` is deliberately **not** gateway-dependent: it only reads
 `/proc` and `/__config__`, so it stays valid — and can legitimately `PASS` — even
@@ -445,8 +448,9 @@ Exposed as `GET/POST /probe/shared_filesystem` and as the MCP tool
 
 ### The newer benchmarks (nodo dev after v3)
 
-The probes below test what nodo `dev` added after v3. node_controller carries an
-older `celaut.proto`, so these probes start their children and read the node with
+The probes below test what nodo `dev` added after v3. `celaut acquire` sends no
+`StartReference` and does not read quotes, statements or tunnels, and these probes keep
+the token of each child to do it, so they start their children and read the node with
 `nodo_gateway.py`, which loads nodo's own descriptor set (`nodo_protos/`, from nodo
 `97906c7c`) into a private descriptor pool. They follow the same rules as the
 other probes: each child is stopped in a `finally`, a start the node refuses for
@@ -1059,18 +1063,36 @@ the packer enabled for it (`packer.ARM_PACKER_SUPPORT` / `X86_PACKER_SUPPORT`).
 
 `<arch>/.service/Dockerfile` pins every input: the base image by digest, `requests`,
 `Flask`, `grpcio`, `protobuf` and each package that Flask and requests pull in by
-version, and `bee-rpc` and `celaut-service-libraries` (`node_controller`) by
-commit SHA. The Rust children pin their builder and runtime images by digest,
+version, `bee-rpc` by commit SHA, and the `celaut` binary by the sha256 of its release
+asset (`ADD --checksum`). The Rust children pin their builder and runtime images by digest,
 and their crates through `Cargo.lock` (`cargo build --locked`). This service is
 content-addressed, so an unpinned `git+…` install (which resolves to whatever
 `master` happened to be that day) means two packs of the same source tree produce
 different images — and any bug observed in a running instance cannot be traced
 back to a specific library revision.
 
-`celaut-service-libraries` requires `bee-rpc` without a pin, so it is installed
-with `--no-deps` after the pinned `bee-rpc`. Otherwise pip fetches `bee-rpc`
-master again. The `bee-rpc` commit is the one of its `v0.0.1` tag, which nodo
-installs too (`bash/requirements.txt`), so both ends speak the same bee-rpc.
+The `bee-rpc` commit is the one of its `v0.0.1` tag, which nodo installs too
+(`bash/requirements.txt`), so both ends speak the same bee-rpc. `nodo_gateway.py` uses it.
+
+## The pool: the `celaut` command
+
+The children of the older probes are started, stopped and observed with `celaut`
+([service-library](https://github.com/celaut-project/service-library), v0.4.1), which
+`celaut_pool.py` runs. It replaces the Python `node_controller` library:
+
+| What | Command |
+|---|---|
+| the gateway and the memory limit | `celaut config` |
+| a child, funded and with its variables | `celaut acquire --new --service HEX --root … --env K=V --initial-mu N` |
+| stop a child | `celaut stop <lease>` |
+| settle the account at a ceiling | `celaut resize --mem BYTES` |
+| the node's `Observe` of a child | `celaut observe <lease> --packets` (JSON lines; `data` has the fields) |
+
+`celaut` keeps the tokens of the children in its own pool file, so this service only sees
+lease numbers. The consequence for the reports: the child of `dependency_observe` is named
+by its `lease_used`, and the session events carry the `instance_ref` of the child (a hash),
+never its token, which is a credential. The children that the newer benchmarks start with
+`nodo_gateway.py` do keep their token, in memory, for the calls that need it.
 
 ## Live validation
 

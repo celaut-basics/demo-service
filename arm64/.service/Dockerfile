@@ -11,16 +11,18 @@
 # silently breaks reproducibility, and makes any bug observed in a running
 # instance impossible to trace back to a specific library revision.
 #
-# bee-rpc and celaut-service-libraries (node_controller) are pinned by commit.
-# The bee-rpc commit is the one of its v0.0.1 tag, which is what nodo itself
-# installs (bash/requirements.txt), so both ends speak the same bee-rpc.
-# celaut-service-libraries declares bee-rpc as an unpinned `git+` requirement,
-# so it is installed with --no-deps after the pinned bee-rpc: otherwise pip
-# would fetch bee-rpc master again. grpcio and protobuf are pinned so they
-# cannot float; nodo's bash/requirements.txt pins bee-rpc only. The second
+# bee-rpc is pinned by commit. It is the one of its v0.0.1 tag, which is what nodo itself
+# installs (bash/requirements.txt), so both ends speak the same bee-rpc. nodo_gateway.py
+# uses it for the calls that the `celaut` command does not make. grpcio and protobuf are
+# pinned so they cannot float; nodo's bash/requirements.txt pins bee-rpc only. The second
 # group pins what Flask and requests pull in. cryptography (and what it pulls in)
 # checks the Ed25519 signature of the node's balance statements; it ships abi3
 # manylinux wheels for x86_64 and aarch64.
+#
+# The children are started, stopped and observed with `celaut` (celaut-project/service-library,
+# v0.4.1): one static binary per architecture, fetched from the release by its sha256, so the
+# build stays reproducible and a changed asset fails the build. The Python library of Celaut
+# services (celaut-service-libraries, node_controller) is no longer installed.
 FROM python:3.11@sha256:7bd2bbe2112147be4dbe68802d60eee6c5e46042f621ffdf2102264aeeba8716
 RUN pip3 install --no-cache-dir \
         requests==2.32.3 \
@@ -31,9 +33,10 @@ RUN pip3 install --no-cache-dir \
         click==8.5.0 blinker==1.9.0 urllib3==2.8.0 idna==3.20 \
         charset-normalizer==3.5.2 certifi==2026.7.22 \
         cryptography==50.0.2 cffi==2.1.1 pycparser==3.12 \
-        "bee-rpc @ git+https://github.com/bee-rpc-protocol/bee-rpc-over-grpc-py@8049fd86261c0d85445e6c27d363e0c82d5b2958" && \
-    pip3 install --no-cache-dir --no-deps \
-        "celaut_libs @ git+https://github.com/bee-rpc-protocol/celaut-service-libraries@23459eea47351c75cffffa9318049aad8810ea75"
+        "bee-rpc @ git+https://github.com/bee-rpc-protocol/bee-rpc-over-grpc-py@8049fd86261c0d85445e6c27d363e0c82d5b2958"
+ADD --checksum=sha256:0173e4b9f33ee785176f68011995f29ceb4ea8d267ddbf7f8f1e24bcd08dd7e9 --chmod=755 \
+    https://github.com/celaut-project/service-library/releases/download/v0.4.1/celaut-linux-arm64 \
+    /usr/local/bin/celaut
 COPY service /service
 RUN chmod +x /service/app.py
 # Directories this service exports to its children. The packer marks them as

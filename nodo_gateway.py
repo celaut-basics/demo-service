@@ -1,17 +1,16 @@
-"""The parts of nodo's gateway protocol that node_controller does not speak.
+"""The parts of nodo's gateway protocol that the ``celaut`` command does not speak.
 
-node_controller (celaut-service-libraries) carries a copy of celaut.proto from an
-older nodo. It has no StartReference (#578), no GetBalanceStatement (#570) and no
-block skip on the request side (#371), and the newer benchmarks need all three. This
-module talks to the same gateway with the messages of the nodo that the benchmarks
-test.
+``celaut`` (celaut_pool.py) starts, stops and observes the children of the older probes. It
+sends no StartReference (#578) and no block skip request (#371), and it does not read
+quotes, balance statements (#570) or tunnels, and the newer benchmarks need all of that, with
+the token of each child. This module talks to the same gateway with the messages of the nodo
+that the benchmarks test.
 
 The messages come from ``nodo_protos/celaut.binpb``, a copy of nodo's own
 ``protos/celaut_doc.binpb`` (a FileDescriptorSet). It is loaded into a private
-descriptor pool, never into the default one: node_controller's ``celaut_pb2`` already
-registered a ``celaut.proto`` there, and a second file with that name and other
-content cannot be added. Two pools give two sets of classes with the same wire
-format, and a call uses the classes of one pool from end to end.
+descriptor pool, never into the default one: another library of the process may have
+registered a ``celaut.proto`` there, and a second file with that name and other content
+cannot be added. A private pool keeps the classes of one nodo from end to end.
 
 Every gateway RPC has the same gRPC signature (a stream of bee-rpc Buffers each way),
 so the calls here use a generic stream-stream method and the index tables of nodo's

@@ -12,7 +12,7 @@ suite now degrades to INFRA_ERROR with no attestation hash, instead of emitting
 two DISHONEST verdicts and minting an EGO-opinion-ready digest over them.
 
 Run with:  python3 tests/test_verdicts.py
-No node, no network and no node_controller install required: the client library,
+No node, no network and no `celaut` binary required: the pool library,
 the gateway and the child services are all stubbed at import time.
 """
 import json
@@ -447,7 +447,7 @@ class ChildReadinessTests(unittest.TestCase):
 
     def test_probes_stop_the_children_they_spin(self):
         # A child left running keeps billing this service's balance -- which is
-        # what mu_accounting measures -- and node_controller's own contract is
+        # what mu_accounting measures -- and the contract of a pool of instances is
         # that a taken instance is returned to its queue or stopped.
         FakeServiceInterface.launch_mode = "ok"
 
@@ -558,11 +558,11 @@ class NetworkIsolationTests(unittest.TestCase):
         self.assertEqual(ev["verdict"], app.VERDICT_INCONCLUSIVE)
 
     def test_the_child_is_handed_the_undeclared_addresses(self):
-        config = app._child_config("ping", 1000)["config"]
+        config = app._child_config("ping", 1000)
         self.assertEqual(config["initial_mu"], 1000)
         self.assertEqual(config["environment_variables"],
                          [{"key": "UNDECLARED_ADDRS", "value": b"54.239.28.85,52.94.236.248"}])
-        self.assertNotIn("environment_variables", app._child_config("heavy", 1000)["config"])
+        self.assertNotIn("environment_variables", app._child_config("heavy", 1000))
         self.assertIsNone(app._child_config("tiny"))
 
 
@@ -635,10 +635,8 @@ class ObserveCorroborationTests(unittest.TestCase):
     def test_no_packets_from_a_degraded_observation_is_not_an_accusation(self):
         # The node said it cannot capture this instance (no AF_PACKET, no
         # conntrack): an empty packet feed is then what it promised.
-        notice = mock.Mock()
-        notice.HasField.side_effect = lambda f: f == "notice"
-        notice.notice.degraded = True
-        notice.notice.message = "no CAP_NET_RAW; conntrack unavailable"
+        notice = {"kind": "notice", "data": {
+            "degraded": True, "message": "no CAP_NET_RAW; conntrack unavailable"}}
         ev = self._run([self._session_evt(), notice])
         self.assertEqual(ev["verdict"], app.VERDICT_INCONCLUSIVE)
         self.assertIn("degraded", ev["reason"])
@@ -664,15 +662,11 @@ class ObserveCorroborationTests(unittest.TestCase):
 
     @staticmethod
     def _packet_evt(direction, host):
-        evt = mock.Mock()
-        evt.HasField.side_effect = lambda f: f == "packet"
-        p = evt.packet
-        p.direction, p.protocol, p.peer_kind, p.peer_host = direction, "TCP", "external", host
-        p.src = p.dst = f"{host}:443"
-        p.peer_tag = p.peer_relationship = ""
-        p.source = "pcap"
-        return evt
-
+        # An event as `celaut observe` prints it: {"time", "kind", "data"}.
+        return {"time": "10:00:01", "kind": "packet", "data": {
+            "direction": direction, "protocol": "TCP", "peer_kind": "external",
+            "peer_host": host, "src": f"{host}:443", "dst": f"{host}:443",
+            "peer_tag": "", "peer_relationship": "", "source": "pcap"}}
 
     def test_the_stream_is_opened_before_the_dependency_is_driven(self):
         # ping only makes traffic while serving GET /; a stream opened after that
@@ -722,13 +716,10 @@ class ObserveCorroborationTests(unittest.TestCase):
 
     @staticmethod
     def _session_evt(degraded_reason=""):
-        evt = mock.Mock()
-        evt.HasField.side_effect = lambda f: f == "session"
-        evt.session.instance_id = "abc"
-        evt.session.tag = "ping"
-        evt.session.capture_mode = "conntrack" if degraded_reason else "pcap"
-        evt.session.degraded_reason = degraded_reason
-        return evt
+        return {"time": "10:00:00", "kind": "session", "data": {
+            "instance_id": "abc", "tag": "ping",
+            "capture_mode": "conntrack" if degraded_reason else "pcap",
+            "degraded_reason": degraded_reason}}
 
 
 class FundingTests(unittest.TestCase):

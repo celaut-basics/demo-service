@@ -16,6 +16,7 @@
   "include": [
     "app.py",
     "nodo_gateway.py",
+    "celaut_pool.py",
     "nodo_protos"
   ]
 }
