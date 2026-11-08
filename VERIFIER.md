@@ -1061,18 +1061,26 @@ the packer enabled for it (`packer.ARM_PACKER_SUPPORT` / `X86_PACKER_SUPPORT`).
 
 ### Declared workload of the children
 
-`<arch>/.service/service.json` declares the worst case of its descendants in
-`possible_environment_workload` (the same way personal-nutrition declares its PostgreSQL):
-four independent scenarios of resources only, one for each shape of child that a run starts
-at the same time: `benchmark` (2 GiB), `heavy` (256 MiB), `ping` (50 MB, 500 MB of disk) and
-the three small children of `network_share` (50 MB, 200 MB of disk, ×3). The children are not
-named by hash: their hashes change with every pack.
+`<arch>/.service/service.json` declares the descendants of this service in
+`possible_environment_workload`, the way personal-nutrition declares its PostgreSQL. It is
+**one scenario** with six groups, one for each kind of child that a run starts: `tiny`,
+`heavy`, `ping`, `benchmark` (2 GiB), `sharefs` and `netshare` (×3, the members of
+`network_share`), each with the memory and the disk of its own `service.json`. Inside a
+scenario the groups are an AND: the service may need all of them. Between scenarios it would
+be an OR (the dearest counts), so a service that starts its children one after another, and
+builds each one, puts them all in the same scenario. The children are not named by hash:
+their hashes change with every pack.
 
-At launch the node checks that each group has a place where one instance could run now,
-locally or on a peer, and it refuses the service if one has not
-(`workload_admission.ON_UNSATISFIABLE`, `reject` by default). **This is an admission check.**
-It reserves no capacity and it funds nothing: `initial_mu` is still the build plus the hours
-of this instance, so the funding of the children is the one of "Funding the instance" above.
+What the node does with it:
+
+- **Admission** (every nodo): at launch it checks that each group has a place where one
+  instance could run now, locally or on a peer, and it refuses the service if one has not
+  (`workload_admission.ON_UNSATISFIABLE`, `reject` by default). It reserves no capacity.
+- **Funding** (nodo with [#634](https://github.com/celaut-project/nodo/pull/634)): the
+  default balance of the service covers the runtime of every group for the same hours as the
+  service, plus one build for each group, and the quote (`EstimatedCost.cost`) says so. An
+  older node does not do this: `initial_mu` is the build plus the hours of this instance, and
+  the missing MU come from "Funding the instance" above.
 
 ## Reproducibility
 
