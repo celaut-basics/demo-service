@@ -701,7 +701,7 @@ checks the score from the operator's side.
 
 #### Results on nodo dev `a97148dd` (2026-11-08)
 
-Release `v5` (pre-release). Packed from `main` after #17 (the `celaut` children of 11/08,
+Release `v6` (linux/amd64). Packed from `main` after #17 (the `celaut` children of 11/08,
 the descriptor of dev a97148dd and bee-rpc v0.0.3) with `nodo pack amd64 --local` on a
 fresh nspawn test node at dev a97148dd.
 
@@ -721,6 +721,10 @@ fresh nspawn test node at dev a97148dd.
   `network_share` INFRA_ERROR both times. The cause is a `ConnectTimeout` to member A at
   `:3030/write`, after the member booted, mounted `/netshare` and exec'd
   `/netshare-service`. `block_skip`: 557 B of 12,849,329 B.
+- **nodo dev `b7d5f40e`** (a97148dd + #634, which funds a service for the descendants that
+  it declares in `possible_environment_workload`), on the same node after a fast-forward:
+  16 PASS, `delegation_pricing` NOT_APPLICABLE, `all_passed`, and no top-up was needed.
+  `network_share` PASS, `block_skip` 572 B. So `network_share` needs a nodo with #634.
 - The same sync on the tree before the `celaut` children (pack `1361dc`, not released) gave
   16 PASS and `all_passed` on the same kind of clean node, with `network_share` PASS.
 - **Release v4 (`e236c5`) on the same dev**: 15 PASS, `delegation_pricing`
