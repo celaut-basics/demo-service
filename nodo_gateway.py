@@ -669,3 +669,18 @@ def rates_from_config(config_file):
             except (TypeError, ValueError):
                 pass
     return rates
+
+
+def config_initial_mu(config_file):
+    """The initial_mu of this instance's own start, from ``/__config__``, or None.
+
+    ``ConfigurationFile.config`` is the Configuration of the start. The node fills in
+    ``initial_mu`` when the caller left it to the default.
+    """
+    m = messages()
+    cfg = m.ConfigurationFile()
+    with open(config_file, "rb") as fh:
+        cfg.ParseFromString(fh.read())
+    if cfg.config.HasField("initial_mu") and cfg.config.initial_mu.n:
+        return int(cfg.config.initial_mu.n)
+    return None

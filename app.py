@@ -225,6 +225,9 @@ BENCHMARK_SERVICE = env_vars.get("BENCHMARK", None)
 SHAREFS_SERVICE = env_vars.get("SHAREFS", None)
 SHAREFS_DENIED_SERVICE = env_vars.get("SHAREFS_DENIED", None)
 NETSHARE_SERVICE = env_vars.get("NETSHARE", None)
+# A parent that declares tiny in its initial_environment_workload and starts it at boot
+# (family/). Only children_initial_cost starts it.
+FAMILY_SERVICE = env_vars.get("FAMILY", None)
 # The variable that selects the network share of a netshare child: it fills
 # ${DEMO_NETSHARE_GROUP} in the formal of its network (netshare/<arch>/.service/service.json).
 NETSHARE_GROUP_ENV = "DEMO_NETSHARE_GROUP"
@@ -297,7 +300,7 @@ MU_PER_ERG = int(os.environ.get("MU_PER_ERG", str(10 ** 9)))
 _CHILD_HASHES = {"tiny": TINY_SERVICE, "heavy": HEAVY_SERVICE,
                  "ping": PING_SERVICE, "benchmark": BENCHMARK_SERVICE,
                  "sharefs": SHAREFS_SERVICE, "sharefs_denied": SHAREFS_DENIED_SERVICE,
-                 "netshare": NETSHARE_SERVICE}
+                 "netshare": NETSHARE_SERVICE, "family": FAMILY_SERVICE}
 
 # Where the packer put the children (pack_config.json): the Service of each one, and
 # its Metadata, by service id.
@@ -338,6 +341,14 @@ FUNDING = {
     "build_quote_mu": {},
     # The build that the node named in a refusal, when it is above the estimate.
     "build_learned_mu": None,
+    # label -> the balance that the node gives the child at a default start (nodo #538):
+    # the cost of a quote with no initial_mu, less the build. This is what
+    # EstimatedCost.children_initial_cost funds this instance with for each initial
+    # child, so it is what the child is started with. Absent: no such quote yet, or a node
+    # that predates #538, and the child is funded from the measured rate.
+    "default_balance_mu": {},
+    # True when the node quotes children_initial_cost (nodo #538), None until a quote.
+    "node_quotes_children": None,
 }
 _funding_lock = threading.Lock()
 
@@ -373,7 +384,18 @@ def child_build_mu(label):
 
 
 def child_runtime_mu(label, self_rate):
-    """MU of runtime to fund one child with: CHILD_FUNDED_SECONDS of its own resources."""
+    """MU of runtime to fund one child with.
+
+    On a node with #538 it is the node's own default balance for the child: the node
+    funded this instance with exactly that for each child of its
+    initial_environment_workload (EstimatedCost.children_initial_cost), so the start
+    spends what the node set aside for it. Without that quote, CHILD_FUNDED_SECONDS of
+    the child's own resources at the measured rate.
+    """
+    with _funding_lock:
+        default = FUNDING["default_balance_mu"].get(label)
+    if default:
+        return default
     mem, disk = CHILD_DECLARED_RESOURCES[label]
     self_weight = price_weight(mem_limit or SELF_DECLARED_MEM_BYTES, SELF_DECLARED_DISK_BYTES)
     child_rate = self_rate * price_weight(mem, disk) / self_weight
@@ -408,21 +430,53 @@ def quote_build(label):
     return max(0, gw.mu(quote.cost) - BUILD_QUOTE_BALANCE_MU), quote
 
 
+def quote_default(label):
+    """The EstimatedCost of a default start of one child: no initial_mu (nodo #538).
+
+    Its cost is the build plus the default balance of the node for the child. It is the
+    figure that EstimatedCost.children_initial_cost adds up for a parent.
+    """
+    return gw.estimated_cost(node_url, packed(label), config=None)
+
+
+def node_quotes_children(quote):
+    """Whether an EstimatedCost comes from a node that quotes children_initial_cost."""
+    try:
+        return quote.HasField("children_initial_cost")
+    except (AttributeError, ValueError):
+        return getattr(quote, "children_initial_cost", None) is not None
+
+
 def quote_child_builds():
     """Ask the node what the build of each child costs (GetServiceEstimatedCost).
 
     0 for an image the node has built. A child the node does not hold yet goes with
     the request, with the block skip on, and the node keeps it, so the start that
     follows does not send it again. A failed quote leaves that child on the estimate.
+    A node with #538 is asked for a default start too: what it gives the child as
+    balance becomes the runtime of the child (child_runtime_mu).
     """
-    quotes = {}
+    quotes, balances, children = {}, {}, None
     for label in CHILD_DECLARED_RESOURCES:
         try:
-            quotes[label] = quote_build(label)[0]
+            quotes[label], build_quote = quote_build(label)
         except Exception as e:
             logging.warning("No build quote for %s: %s", label, e)
+            continue
+        if not node_quotes_children(build_quote):
+            children = False
+            continue
+        children = True
+        try:
+            default = gw.mu(quote_default(label).cost)
+            balances[label] = max(0, default - quotes[label])
+        except Exception as e:
+            logging.warning("No default-start quote for %s: %s", label, e)
     with _funding_lock:
         FUNDING["build_quote_mu"].update(quotes)
+        FUNDING["default_balance_mu"].update(balances)
+        if children is not None:
+            FUNDING["node_quotes_children"] = children
     return quotes
 
 
@@ -2104,6 +2158,222 @@ def probe_build_funding():
             _gw_stop(token, label)
 
 
+# ----------------------------------------------------------------------------
+# Probe — children_initial_cost (nodo #538, #628)
+# ----------------------------------------------------------------------------
+# A service declares the children that it needs to start in
+# initial_environment_workload. The node quotes what their starts cost apart from the
+# start of the service, as EstimatedCost.children_initial_cost: for each workload, count
+# times the build of the child plus the node's default balance for it. `cost` leaves it
+# out. A caller that sets initial_mu below build + children_initial_cost + one period is
+# refused at once (workload_admission.ON_UNDERFUNDED=reject) and charged nothing,
+# instead of a parent that tries to start its children in a loop that cannot be paid
+# (#628). The family child declares one tiny, and starts it once at boot, with one
+# attempt (family/service/run.sh). So:
+#
+#   quote of family        -> children_initial_cost > 0, and the same figure as the
+#                             cost of a default start of tiny (its build and balance)
+#   initial_mu below that  -> refused, "... (children_initial_cost) ...", nothing kept
+#   initial_mu = cost + periods + children_initial_cost
+#                          -> family starts, and starts tiny at its first and only
+#                             attempt: one child_start on family's account, of about
+#                             the quoted figure, and a child_bound that names tiny
+CHILDREN_COST_CHILD = "family"
+# Periods of family's own upkeep in the funded start, on top of the 1 h of default
+# balance that `cost` already holds.
+CHILDREN_COST_PERIODS = 6
+# The quote and the start sample the load of the node at two moments, and the default
+# balance is priced at that load, so they can differ a little.
+CHILDREN_COST_TOLERANCE = float(os.environ.get("CHILDREN_COST_TOLERANCE", "0.25"))
+FAMILY_PORT = 8080
+FAMILY_TIMEOUT_S = int(os.environ.get("FAMILY_TIMEOUT_S", "300"))
+# After family says that its start of tiny is done, how long to wait before its
+# statement is read: a retry would show as a second child_start.
+FAMILY_SETTLE_S = int(os.environ.get("FAMILY_SETTLE_S", "20"))
+_UNDERFUNDED_RE = re.compile(r"children_initial_cost")
+_LEAST_RE = re.compile(r"The least initial_mu is (\d+) MU")
+
+
+def _family_status(uri):
+    """family's /status.txt as a dict ({} while it cannot be read)."""
+    try:
+        text = requests.get(f"http://{uri}/status.txt", timeout=5).text
+    except requests.RequestException:
+        return {}
+    return dict(line.split("=", 1) for line in text.splitlines() if "=" in line)
+
+
+def _family_wait(uri):
+    deadline = time.monotonic() + FAMILY_TIMEOUT_S
+    while time.monotonic() < deadline:
+        status = _family_status(uri)
+        if status.get("state") == "done":
+            return status
+        time.sleep(2)
+    return _family_status(uri)
+
+
+def _family_stop_child(uri):
+    """Ask family to stop the tiny that it started; the answer of celaut, or the error."""
+    try:
+        return clip(requests.get(f"http://{uri}/cgi-bin/stop", timeout=120).text, 300)
+    except requests.RequestException as e:
+        return f"{type(e).__name__}: {clip(e)}"
+
+
+def _near(observed, quoted):
+    return quoted > 0 and abs(observed - quoted) <= CHILDREN_COST_TOLERANCE * quoted
+
+
+def _judge_children_cost(ev):
+    violations, unexpected = [], []
+    q = ev["quote"]
+    if not _near(q["children_initial_cost_mu"], ev["tiny_default_start_mu"]):
+        unexpected.append(f"children_initial_cost {q['children_initial_cost_mu']} MU is not the "
+                          f"cost of a default start of tiny ({ev['tiny_default_start_mu']} MU)")
+
+    under = ev["underfunded"]
+    if under.get("outcome") == "refused" and under.get("net_charge_mu"):
+        violations.append(f"the node refused the under-funded start and kept "
+                          f"{under['net_charge_mu']} MU of it")
+    if under.get("outcome") == "started":
+        unexpected.append(f"the node started family with an initial_mu of {under['initial_mu']} MU, "
+                          f"below build + children_initial_cost + one period "
+                          f"(workload_admission.ON_UNDERFUNDED may be 'warn')")
+    elif not _UNDERFUNDED_RE.search(under.get("node_detail") or ""):
+        unexpected.append(f"the under-funded start was refused, but not by the #538 rule: "
+                          f"{under.get('node_detail')}")
+
+    funded = ev["funded"]
+    status = funded.get("family_status") or {}
+    starts = funded.get("child_start_rows") or []
+    if status.get("rc") != "0":
+        unexpected.append(f"family could not start tiny at its one attempt (celaut rc "
+                          f"{status.get('rc')}: {funded.get('acquire_error')})")
+    if len(starts) > 1:
+        unexpected.append(f"family's account has {len(starts)} child_start rows for one "
+                          f"declared child: a retry")
+    elif len(starts) == 1:
+        charged = -starts[0]["amount"]
+        funded["child_start_mu"] = charged
+        if not _near(charged, q["children_initial_cost_mu"]):
+            unexpected.append(f"the child_start of tiny charged {charged} MU, quoted "
+                              f"{q['children_initial_cost_mu']} MU")
+    elif status.get("rc") == "0":
+        unexpected.append("family started tiny, but its statement has no child_start")
+    bound = [r for r in funded.get("child_bound_rows") or []
+             if r["detail"].get("service_id") == TINY_SERVICE]
+    if starts and not bound:
+        unexpected.append("no child_bound row of family's account names tiny")
+
+    if violations:
+        ev["verdict"] = VERDICT_DISHONEST
+        ev["reason"] = "the node broke the start-funding rule of #538: " + "; ".join(violations)
+    elif unexpected:
+        ev["verdict"] = VERDICT_INCONCLUSIVE
+        ev["reason"] = "; ".join(unexpected)
+    else:
+        ev["verdict"] = VERDICT_PASS
+        ev["reason"] = (f"quoted children_initial_cost {q['children_initial_cost_mu']} MU apart from "
+                        f"the cost; refused an initial_mu of {under['initial_mu']} MU with the #538 "
+                        f"message and kept nothing; the funded family started tiny at its one "
+                        f"attempt, and its child_start charged {funded['child_start_mu']} MU")
+    return ev
+
+
+def probe_children_initial_cost():
+    label = CHILDREN_COST_CHILD
+    ev = {"probe": "children_initial_cost", "child": label, "declared_child": "tiny"}
+    token, uri = None, None
+    try:
+        ev["own_initial_mu"] = gw.config_initial_mu(CONFIG_FILE)
+    except Exception as e:
+        ev["own_initial_mu_error"] = f"{type(e).__name__}: {clip(e)}"
+    try:
+        if not FAMILY_SERVICE:
+            ev["verdict"] = VERDICT_INFRA_ERROR
+            ev["reason"] = "this pack carries no family child (FAMILY in .dependencies)"
+            return ev
+        quote = quote_default(label)
+        if not node_quotes_children(quote):
+            ev["verdict"] = VERDICT_NOT_APPLICABLE
+            ev["reason"] = ("the node does not quote children_initial_cost: it predates nodo #538, "
+                            "so it has no initial_environment_workload to price or check")
+            return ev
+        build_f, _ = quote_build(label)
+        period = gw.mu(quote.max_maintenance_cost)
+        cic = gw.mu(quote.children_initial_cost)
+        ev["quote"] = {"cost_mu": gw.mu(quote.cost), "children_initial_cost_mu": cic,
+                       "build_mu": build_f, "max_maintenance_cost_mu": period,
+                       "maintenance_seconds_loop": int(quote.maintenance_seconds_loop)}
+        ev["tiny_default_start_mu"] = gw.mu(quote_default("tiny").cost)
+        if cic == 0 and period == 0:
+            ev["verdict"] = VERDICT_NOT_APPLICABLE
+            ev["reason"] = "the node runs for free (free tier): no start can be under-funded"
+            return ev
+        head = _own_head()
+
+        # Below build + children_initial_cost + one period, by half a period.
+        ref = secrets.token_bytes(16)
+        under = {"initial_mu": build_f + cic + period // 2, "start_ref": ref.hex()}
+        ev["underfunded"] = under
+        try:
+            r = _gw_start(label, initial_mu=under["initial_mu"], start_ref=ref,
+                          count_funding=False, wait_ready=False)
+            under["outcome"] = "started"
+            if r.uri:
+                try:
+                    _wait_until_ready(r.uri, label)
+                    under["family_status"] = _family_wait(r.uri)
+                except Exception as e:
+                    under["family_error"] = f"{type(e).__name__}: {clip(e)}"
+                under["stop_child"] = _family_stop_child(r.uri)
+            _gw_stop(r.instance.token, label)
+        except gw.GatewayError as e:
+            under["outcome"] = "refused"
+            under["grpc_code"] = e.code
+            under["node_detail"] = clip(e.details or str(e), 600)
+            m = _LEAST_RE.search(e.details or "")
+            under["named_least_mu"] = int(m.group(1)) if m else None
+
+        # The client formula of celaut.proto: cost + maintenance * (periods + 1) + children.
+        ref = secrets.token_bytes(16)
+        funded = {"initial_mu": gw.mu(quote.cost) + period * (CHILDREN_COST_PERIODS + 1) + cic,
+                  "start_ref": ref.hex()}
+        ev["funded"] = funded
+        r = _gw_start(label, initial_mu=funded["initial_mu"], start_ref=ref)
+        token, uri = r.instance.token, r.uri
+        status = _family_wait(uri)
+        funded["family_status"] = status
+        if status.get("rc") not in (None, "0"):
+            try:
+                funded["acquire_error"] = clip(
+                    requests.get(f"http://{uri}/acquire.err", timeout=5).text, 400)
+            except requests.RequestException:
+                pass
+        time.sleep(FAMILY_SETTLE_S)
+        rows = [_movement_view(mv) for mv in _child_rows(token)]
+        funded["child_start_rows"] = [r for r in rows if r["kind"] == "child_start"]
+        funded["child_bound_rows"] = [r for r in rows if r["kind"] == "child_bound"]
+        funded["family_opened_mu"] = next((r["amount"] for r in rows if r["kind"] == "start"), None)
+        funded["family_build_mu"] = -sum(r["amount"] for r in rows if r["kind"] == "build")
+
+        own = _own_rows_after(head)
+        starts = _rows_for_ref(own, bytes.fromhex(under["start_ref"]))
+        seqs = {str(int(mv.seq)) for mv in starts}
+        refunds = [mv for mv in own if mv.kind == "refund"
+                   and str(gw.detail_of(mv).get("refunds_seq")) in seqs]
+        under["net_charge_mu"] = -sum(int(mv.amount.n) for mv in starts + refunds)
+        return _judge_children_cost(ev)
+    except Exception as e:
+        return _infra(ev, "the funding of the initial children", e)
+    finally:
+        if uri:
+            ev.setdefault("funded", {})["stop_child"] = _family_stop_child(uri)
+        if token:
+            ev.setdefault("funded", {})["family_refund_mu"] = _gw_stop(token, label)
+
+
 def _node_claims(feature):
     """Whether the node's signed Peer names ``feature``, or None when it cannot be read.
 
@@ -3326,6 +3596,8 @@ PROBES = [
     # First of the probes that start children: on a node that has not built `tiny`
     # yet, this is the start that pays its build, so both #563 rules are exercised.
     ("build_funding", probe_build_funding),
+    # After build_funding: tiny is built by then, so its default start costs its balance.
+    ("children_initial_cost", probe_children_initial_cost),
     ("dependency_identity", probe_dependency_identity),
     ("network_isolation", probe_network_isolation),
     ("dependency_observe", probe_dependency_observe),
@@ -3347,7 +3619,7 @@ PROBES = [
 # report says "could not verify" once rather than six times in six dialects.
 # resource_provisioning is deliberately NOT here: it only reads /proc and
 # /__config__, so it stays valid (and can legitimately PASS) with the gateway down.
-GATEWAY_DEPENDENT = ("build_funding", "dependency_identity", "network_isolation",
+GATEWAY_DEPENDENT = ("build_funding", "children_initial_cost", "dependency_identity", "network_isolation",
                      "dependency_observe", "memory_ceiling", "node_benchmark",
                      "shared_filesystem", "mu_accounting",
                      "idempotent_start",
@@ -3587,6 +3859,7 @@ PROBE_ENDPOINTS = [
     ("probe_gateway_reachability", "/probe/gateway", probe_gateway_reachability),
     ("probe_resource_provisioning", "/probe/resources", probe_resource_provisioning),
     ("probe_build_funding", "/probe/build_funding", probe_build_funding),
+    ("probe_children_initial_cost", "/probe/children_initial_cost", probe_children_initial_cost),
     ("probe_dependency_identity", "/probe/dependency_identity", probe_dependency_identity),
     ("probe_network_isolation", "/probe/network", probe_network_isolation),
     ("probe_dependency_observe", "/probe/dependency_observe", probe_dependency_observe),
@@ -3728,6 +4001,12 @@ MCP_TOOLS = [
           "one maintenance period after it, must be refused with the node's message and charge "
           "nothing; a child funded with enough must start, charge this account exactly its "
           "initial_mu, and pay the build from its own account." + _SPENDS, False),
+    _tool("probe_children_initial_cost",
+          "Check children_initial_cost of nodo #538 with the family child, which declares one "
+          "tiny in initial_environment_workload: the quote must give the start of tiny apart "
+          "from the cost, a start funded below it must be refused with the node's message and "
+          "charge nothing, and a start funded by the client formula must start tiny at its one "
+          "attempt, with one child_start of about the quoted figure." + _SPENDS, False),
     _tool("probe_dependency_identity",
           "Execute each dependency and assert the requested dependency is the one that actually ran."
           + _SPENDS, False),
