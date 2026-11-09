@@ -515,14 +515,18 @@ through `/cgi-bin/stop`. The probe:
 
 | observation | verdict |
 |---|---|
-| `children_initial_cost` is the cost of a default start of `tiny` (±25 %, `CHILDREN_COST_TOLERANCE`), the under-funded start is refused with the #538 message (`children_initial_cost`) and leaves no charge, and the funded `family` starts `tiny` at its one attempt: one `child_start` of about the quote, and a `child_bound` that names `tiny` | `PASS` |
+| `children_initial_cost` is the cost of a default start of `tiny` (±25 %, `CHILDREN_COST_TOLERANCE`), the under-funded start is refused with the #538 message (`children_initial_cost`) and leaves no charge, and the funded `family` starts `tiny` at its one attempt: one `child_start` within ±100 % of the quote (`CHILDREN_CHARGE_TOLERANCE`), and a `child_bound` that names `tiny` | `PASS` |
 | the node refused the under-funded start and kept MU of it | `DISHONEST` |
 | the under-funded `family` was started (the operator may run `ON_UNDERFUNDED=warn`), it was refused with another message, `tiny` could not start, there was more than one `child_start`, or a figure is off the quote | `INCONCLUSIVE` |
 | the quote has no `children_initial_cost` (a node before #538), or the node is free | `NOT_APPLICABLE` |
 | a quote, the funded start or a statement failed | `INFRA_ERROR` |
 
-The quote and the start price the default balance at the load of two moments, so the
-figures are compared with a tolerance, and a figure that is off is never an accusation.
+The two quotes are asked one after the other, so they price tiny's default balance at
+almost the same load. The `child_start` does not: it is tiny's default balance priced at
+the load when `family` starts it, with `family` itself running by then. On n538a it was
+−8 % and +34 % of the quote in two runs (`child_start_vs_quote` in the evidence). It is the
+balance of the child, not a fee: the child gets it and the rest comes back. So only a
+figure far out of the quote is reported, and never as an accusation.
 The evidence also has `own_initial_mu`: what the node funded this verifier with
 (`/__config__`), to compare with `nodo estimate` of the verifier (`cost` plus
 `children_initial_cost`).

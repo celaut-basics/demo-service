@@ -154,6 +154,12 @@ class ChildrenInitialCostProbeTests(unittest.TestCase):
         ev = run_with(FakeNode538(charged=400_000), app.probe_children_initial_cost)
         self.assertEqual(ev["verdict"], app.VERDICT_INCONCLUSIVE, ev["reason"])
 
+    def test_a_charge_priced_at_a_later_load_passes(self):
+        # Seen on nodo #635: the start of the child cost 34 % more than the quote.
+        ev = run_with(FakeNode538(charged=241_200), app.probe_children_initial_cost)
+        self.assertEqual(ev["verdict"], app.VERDICT_PASS, ev["reason"])
+        self.assertEqual(ev["funded"]["child_start_vs_quote"], 0.34)
+
     def test_a_quote_that_is_not_the_start_of_the_child_is_reported(self):
         node = FakeNode538()
         real = node.quote

@@ -2182,9 +2182,15 @@ CHILDREN_COST_CHILD = "family"
 # Periods of family's own upkeep in the funded start, on top of the 1 h of default
 # balance that `cost` already holds.
 CHILDREN_COST_PERIODS = 6
-# The quote and the start sample the load of the node at two moments, and the default
-# balance is priced at that load, so they can differ a little.
+# The quote of family and the quote of a default start of tiny are asked one after the
+# other: they price tiny's default balance at almost the same load.
 CHILDREN_COST_TOLERANCE = float(os.environ.get("CHILDREN_COST_TOLERANCE", "0.25"))
+# The child_start of tiny is its default balance priced at the load when family starts it:
+# family itself runs by then, and other instances may have come or gone since the quote.
+# On n538a (nodo #635) it was -8 % and +34 % of the quote in two runs. It is the balance of
+# the child, not a fee (the child gets it, and what it does not spend comes back), so only a
+# figure out of this wide bound is reported.
+CHILDREN_CHARGE_TOLERANCE = float(os.environ.get("CHILDREN_CHARGE_TOLERANCE", "1.0"))
 FAMILY_PORT = 8080
 FAMILY_TIMEOUT_S = int(os.environ.get("FAMILY_TIMEOUT_S", "300"))
 # After family says that its start of tiny is done, how long to wait before its
@@ -2221,8 +2227,9 @@ def _family_stop_child(uri):
         return f"{type(e).__name__}: {clip(e)}"
 
 
-def _near(observed, quoted):
-    return quoted > 0 and abs(observed - quoted) <= CHILDREN_COST_TOLERANCE * quoted
+def _near(observed, quoted, tolerance=None):
+    tolerance = CHILDREN_COST_TOLERANCE if tolerance is None else tolerance
+    return quoted > 0 and abs(observed - quoted) <= tolerance * quoted
 
 
 def _judge_children_cost(ev):
@@ -2256,7 +2263,9 @@ def _judge_children_cost(ev):
     elif len(starts) == 1:
         charged = -starts[0]["amount"]
         funded["child_start_mu"] = charged
-        if not _near(charged, q["children_initial_cost_mu"]):
+        if q["children_initial_cost_mu"]:
+            funded["child_start_vs_quote"] = round(charged / q["children_initial_cost_mu"] - 1, 4)
+        if not _near(charged, q["children_initial_cost_mu"], CHILDREN_CHARGE_TOLERANCE):
             unexpected.append(f"the child_start of tiny charged {charged} MU, quoted "
                               f"{q['children_initial_cost_mu']} MU")
     elif status.get("rc") == "0":
