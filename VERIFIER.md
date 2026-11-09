@@ -752,6 +752,39 @@ delegating node. `tools/two-node/` runs this probe on a node that delegates to a
 second node, once with an honest peer and once with one that overcharges, and
 checks the score from the operator's side.
 
+#### Results on nodo PR #635 (`8fcaf618`, the children in `cost`, 2026-11-09)
+
+Only the verifier is repacked (`ba8c53b`): its `app.py` and `nodo_protos/celaut.binpb`
+changed, the children did not. The copies are stamped by `tools/pack/stamp.py` with the ids
+of the `v7` children (`ids-amd64`), and packed with `nodo pack --local` on the test node that
+holds them (n538a, nodo `8fcaf618`). On arm64 the node that packed `v7` was gone, so `family`
+and `sharefs-denied` are packed again (new ids; a pack is not reproducible) on n538c with
+`packer.ARM_PACKER_SUPPORT` on for the pack only.
+
+| arch | verifier | asset | children |
+|---|---|---|---|
+| amd64 | `bd864bf3598c8bca7e340eaab3ea372a3bfa62688b378d2f77dff2f8655b1c2f` | `bd864b.celaut.bee` (1,408,577,608 B) | the `v7` ids |
+| arm64 | `ab1b8d36d5c8cb2faae49ff0b72c05b9cc1a0e4941c9ddf4bf931ff89db28423` | `ab1b8d.celaut.bee` (2,141,048,034 B) | the `v7` ids, except family `e2cd47b732db…3e8c` and sharefs-denied `664111e6c7a5…c1d6` |
+
+- **amd64, clean node** (n538e at `8fcaf618`, `nodo import` of the asset only, no top-up):
+  15 PASS, 0 dishonest, `delegation_pricing` NOT_APPLICABLE; `block_skip` and
+  `mu_accounting` INCONCLUSIVE from load (an arm64 pack ran on the same host).
+  `initial_children_cost` PASS: the cost of family held 20,546,989 MU for its child, and a
+  default start of tiny cost 21,051,564 MU (−2.4 %); the build and one period without the
+  children (9,552,499 MU) was refused with the #538 message, the node named a least of
+  18,310,271 MU and kept nothing; family funded with `cost` + 7 periods (51,493,496 MU)
+  started tiny at its one attempt, one `child_start` of 17,852,639 MU (−13.1 % of what
+  the cost held), and its own build row of 10,000,000 MU.
+- The first pack of this change (`fd911d5a…`) used the quote for half a period of balance
+  as the under-funded amount. On the same clean node the node started it: the least prices
+  the children at the base load, and the quote at the load of the moment, so that amount
+  was above the least. That is the guarantee of nodo f572d0fd, not a fault; the probe now
+  leaves the children out of the under-funded amount.
+- **arm64, clean node under TCG** (n538c at `8fcaf618`, import of the asset only, 812 s;
+  suite 1593 s, no top-up): 16 PASS, 0 dishonest, `delegation_pricing` NOT_APPLICABLE.
+  `initial_children_cost` INFRA_ERROR: `GetServiceEstimatedCost` hit its deadline under
+  emulation, so no claim; it needs a native arm64 node.
+
 #### Results on nodo PR #635 (`eda0a9b3`, #538, 2026-11-08)
 
 (At this head the quote gave the children apart, in `children_initial_cost`, and the probe
