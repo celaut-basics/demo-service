@@ -527,7 +527,11 @@ The `family` child is such a parent. Its `service.json` declares one `tiny` in
    but without the build of `tiny` (refused by an honest node). A built `tiny` costs
    nothing, and then the rule has nothing to check: the start is not tried;
 3. starts `family` by the client formula (`cost` + the sum of 6 periods + a default start
-   of `tiny`, which `family` pays from its balance), waits for `/status.txt`, waits
+   of `tiny`, which `family` pays from its balance). The node prices that start at the
+   load of the moment `family` starts `tiny`, with `family` running by then, which no
+   quote knows (on n538e it came to more than the quote, and `family` was refused the
+   start), so `family` carries it with the headroom of `CHILDREN_CHARGE_TOLERANCE`
+   (+100 %); what `tiny` does not spend comes back. It waits for `/status.txt`, waits
    `FAMILY_SETTLE_S` (20 s) more, and reads `family`'s statement. What the cost holds for
    the children (`children_in_cost_mu`) is the cost less the `build` row of that statement;
 4. stops `tiny` through `family`, then `family`.

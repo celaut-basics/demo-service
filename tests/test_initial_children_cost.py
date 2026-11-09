@@ -170,8 +170,9 @@ class InitialChildrenCostProbeTests(unittest.TestCase):
         self.assertEqual(ev["underfunded"]["net_charge_mu"], 0)
         # The client formula: cost + the sum of N periods + a default start of tiny.
         self.assertEqual(ev["tiny_default_start_mu"], 10_000_000 + 360 * ONE)
+        # family carries the default start of tiny with the headroom of the judge.
         self.assertEqual(ev["funded"]["initial_mu"], 20_000_000 + app.CHILDREN_COST_PERIODS * ONE
-                         + 10_000_000 + 360 * ONE)
+                         + math.ceil((10_000_000 + 360 * ONE) * (1 + app.CHILDREN_CHARGE_TOLERANCE)))
         self.assertEqual(ev["funded"]["child_start_mu"], node.tiny_default)
         self.assertEqual(ev["own_initial_mu"], 123)
         self.assertEqual(sorted(node.stopped), ["family0"])

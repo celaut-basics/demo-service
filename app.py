@@ -2346,10 +2346,16 @@ def probe_initial_children_cost():
                 under["named_least_mu"] = int(m.group(1)) if m else None
 
         # The client formula of celaut.proto (#636): cost + the sum of N periods, and the
-        # default start of tiny that family pays from its balance.
+        # default start of tiny that family pays from its balance. The node prices that
+        # start at the load of the moment family starts tiny, with family running by then,
+        # which no quote knows: on n538e it came to more than the quote, and family was
+        # refused the start. So family carries the default start of tiny with the same
+        # headroom that the judge allows (CHILDREN_CHARGE_TOLERANCE); what tiny does not
+        # spend comes back.
         ref = secrets.token_bytes(16)
         funded = {"initial_mu": gw.mu(quote.cost) + gw.funding_sum_mu(quote, CHILDREN_COST_PERIODS)
-                  + ev["tiny_default_start_mu"], "start_ref": ref.hex()}
+                  + math.ceil(ev["tiny_default_start_mu"] * (1 + CHILDREN_CHARGE_TOLERANCE)),
+                  "start_ref": ref.hex()}
         ev["funded"] = funded
         try:
             r = _gw_start(label, initial_mu=funded["initial_mu"], start_ref=ref)
