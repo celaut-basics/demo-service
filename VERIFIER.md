@@ -743,6 +743,47 @@ delegating node. `tools/two-node/` runs this probe on a node that delegates to a
 second node, once with an honest peer and once with one that overcharges, and
 checks the score from the operator's side.
 
+#### Results on nodo PR #635 (`eda0a9b3`, #538, 2026-11-08)
+
+Packed with `tools/pack/pack.sh amd64` inside a test node installed from the PR branch
+(`nodo pack --local`, workloads named by hash): verifier `956bf5663c90…f306d`, tiny
+`61204a20a75b…ff25`, heavy `05a56abc1b24…4674`, ping `c4d1eb9c08cc…1917`, benchmark
+`e079575737b2…2950`, sharefs `c1e2099d54de…dcb8`, sharefs-denied `0bbb470be6a4…0478`,
+netshare `23b1a76f944c…36e8`, family `2104e6c7458b…bf3b`. The export `956bf5.celaut.bee`
+is 1,408,575,735 B (under 2 GiB, no gzip needed). No run was topped up: the default
+funding of the verifier (`cost` + `children_initial_cost`) covered every startup suite,
+on a node that had never built the children too.
+
+| probe | n538a (packing node) | n538b (peer of n538a) | n538c (fresh install, import only) |
+|---|---|---|---|
+| gateway_reachability … tunnel (the 15 earlier probes) | 15 PASS | 14 PASS, `mu_accounting` INCONCLUSIVE (noise, three suites on one host) → PASS alone | 14 PASS, `network_share` INFRA_ERROR (ConnectTimeout to a member) → PASS alone |
+| balance_statement | PASS | PASS | PASS |
+| children_initial_cost (new) | PASS | PASS | PASS |
+| delegation_pricing | NOT_APPLICABLE | **PASS** in the two-node set-up (n538b delegates `tiny` to n538a: 3939.8 MU/s, n538b's own price) | NOT_APPLICABLE |
+
+`children_initial_cost` (family → tiny): `children_initial_cost` 17,573,564 MU on n538a,
+the same figure as a default start of tiny asked just after; an `initial_mu` half a period
+below the least was refused with `... (children_initial_cost) ... The least initial_mu is
+19,286,561 MU` and nothing was kept; the funded `family` started `tiny` at its one attempt
+in 6–11 s, one `child_start` (−4 %, −8 %, +34 %, −37 %, −41 % of the quote over five runs:
+the start is priced at a later load) and one `child_bound` that names tiny.
+
+`nodo estimate` of the verifier against what its starts charged (the first `child_start` of
+each initial child, netshare ×3, from the verifier's statement):
+
+| run | `children_initial_cost` | sum of the first `child_start`s | `own_initial_mu` vs "To start, with children" |
+|---|---|---|---|
+| n538a, children already built | 141,982,576 | 141,990,676 (+0.006 %) | 204,959,082 vs 184,657,466 |
+| n538a, first run (builds owed) | 175,050,109 | 253,983,109 (+45 %) | 218,680,478 vs 218,680,478 |
+| n538b | 240,082,309 | 280,966,109 (+17 %) | 294,537,145 vs 286,101,475 |
+| n538c (clean) | 163,276,309 | 247,160,784 (+51 %) | 199,596,541 vs 199,596,541 |
+
+At one moment the figure is exact: the verifier's `children_initial_cost` was 101,579,776
+MU while the default starts of its children summed to 100,185,376 MU. The estimate is taken
+on an idle node and the starts are priced at the load of the suite (this verifier and its
+children running), so the default balances can be higher at start time. The verifier
+absorbs that from its own hour of balance.
+
 #### Results on nodo dev `a97148dd` (2026-11-08)
 
 Release `v6` (linux/amd64). Packed from `main` after #17 (the `celaut` children of 11/08,
