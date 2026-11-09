@@ -19,5 +19,5 @@ The ids go to `<stage dir>/ids.env` (`NAME=<id>` lines, `VERIFIER` last) and eac
 to `<stage dir>/pack-*.log`. The copies take each child from the registry by its id, so a
 child is packed once. `workload_children.json` says which dependency each workload is, in
 the order of the clauses, groups and workloads of each `service.json`; keep the two in step
-(`tests/test_children_initial_cost.py` checks it). `nodo pack` packs one service at a time
+(`tests/test_initial_children_cost.py` checks it). `nodo pack` packs one service at a time
 on a node; arm64 needs `packer.ARM_PACKER_SUPPORT: true` (and binfmt on an amd64 host).

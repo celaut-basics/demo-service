@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""children_initial_cost (nodo #538): the probe, the manifests and tools/pack/stamp.py.
+"""initial_children_cost (nodo #538): the probe, the manifests and tools/pack/stamp.py.
 
-The probe is driven against a fake node that keeps the #538 rule, and against ones that
-break it. A node that keeps the rule passes, a node seen keeping MU of a refused start is
-DISHONEST, a node that predates #538 is NOT_APPLICABLE, and a figure that is only off is
-INCONCLUSIVE, never an accusation.
+Since nodo#635 at 8fcaf618 the quote has no separate field for the initial children:
+EstimatedCost.cost holds their starts. The probe is driven against a fake node that keeps
+the #538 rule, and against ones that break it. A node that keeps the rule passes, a node
+seen keeping MU of a refused start is DISHONEST, and a figure that is only off (or a node
+whose cost holds no children) is INCONCLUSIVE, never an accusation.
 
-Run with:  python3 tests/test_children_initial_cost.py
+Run with:  python3 tests/test_initial_children_cost.py
 """
 import json
 import os
@@ -28,18 +29,24 @@ TINY_RESOURCES = {"mem_limit": 50000000, "disk_space": 200000000}
 
 
 class FakeNode538:
-    """A node with #538: it quotes children_initial_cost and refuses a parent below it."""
+    """A node with #538: the cost of a parent holds the starts of its initial children,
+    and it refuses a parent whose initial_mu cannot pay them and one period."""
 
     def __init__(self, *, build_f=10_000_000, balance_f=180_000, tiny_start=180_000,
                  period=500, predates=False, start_underfunded=False, keep_refused=False,
-                 child_starts=1, child_rc="0", charged=None):
+                 refuse_funded=False, child_starts=1, child_rc="0", charged=None,
+                 children_in_cost=None):
         self.build_f, self.balance_f = build_f, balance_f
         self.tiny_start, self.period = tiny_start, period
         self.predates = predates
         self.start_underfunded = start_underfunded
         self.keep_refused = keep_refused
+        self.refuse_funded = refuse_funded
         self.child_starts, self.child_rc = child_starts, child_rc
         self.charged = tiny_start if charged is None else charged
+        if children_in_cost is None:
+            children_in_cost = 0 if predates else tiny_start
+        self.children_in_cost = children_in_cost
         self.account = FakeAccount()
         self.children = {}
         self.stopped = []
@@ -48,30 +55,32 @@ class FakeNode538:
         asked = config["initial_mu"] if config else None
         if packed == "tiny":
             cost = self.tiny_start if asked is None else asked
-            cic = 0
         else:
-            cost = self.build_f + (self.balance_f if asked is None else asked)
-            cic = self.tiny_start
-        q = SimpleNamespace(cost=amount(cost), max_maintenance_cost=amount(self.period),
-                            init_maintenance_cost=amount(self.period), maintenance_seconds_loop=10)
-        if not self.predates:
-            q.children_initial_cost = amount(cic)
-        return q
+            cost = (self.build_f + (self.balance_f if asked is None else asked)
+                    + self.children_in_cost)
+        return SimpleNamespace(cost=amount(cost), max_maintenance_cost=amount(self.period),
+                               init_maintenance_cost=amount(self.period),
+                               maintenance_seconds_loop=10)
+
+    least_children = None  # the children as the check prices them; None: as quoted
 
     @property
     def least(self):
-        return self.build_f + self.tiny_start + self.period
+        children = self.tiny_start if self.least_children is None else self.least_children
+        return self.build_f + (0 if self.predates else children) + self.period
 
     def start(self, label, *, initial_mu, start_ref=None, **kw):
         detail = {"start_ref": start_ref.hex()} if start_ref else None
-        if initial_mu < self.least and not self.start_underfunded:
+        funded = initial_mu >= self.least
+        if (not funded and not self.start_underfunded) or (funded and self.refuse_funded):
             if self.keep_refused:
                 self.account.move("child_start", -initial_mu, detail)
+            children = "" if self.predates else (
+                f"The initial children of the service cost {self.tiny_start} MU and one ")
             raise refusal(
                 f"Unable to launch service x: initial_mu {initial_mu} MU leaves "
-                f"{initial_mu - self.build_f} MU after the build of {self.build_f} MU. The "
-                f"initial children of the service cost {self.tiny_start} MU "
-                f"(children_initial_cost) and one maintenance period costs {self.period} MU. "
+                f"{initial_mu - self.build_f} MU after the build of {self.build_f} MU. "
+                f"{children or 'One '}maintenance period costs {self.period} MU. "
                 f"The least initial_mu is {self.least} MU.")
         start = self.account.move("child_start", -initial_mu, detail)
         token = f"family{len(self.children)}"
@@ -105,114 +114,135 @@ class FakeNode538:
                 mock.patch.object(app, "FAMILY_SETTLE_S", 0)]
 
 
-class ChildrenInitialCostProbeTests(unittest.TestCase):
+class InitialChildrenCostProbeTests(unittest.TestCase):
     def setUp(self):
         del app.FUNDING_FAILURES[:]
 
     def test_a_node_that_keeps_the_rule_passes(self):
         node = FakeNode538()
-        ev = run_with(node, app.probe_children_initial_cost)
+        ev = run_with(node, app.probe_initial_children_cost)
         self.assertEqual(ev["verdict"], app.VERDICT_PASS, ev["reason"])
-        self.assertEqual(ev["quote"]["children_initial_cost_mu"], 180_000)
+        # The cost of family holds the start of tiny: no separate field.
+        self.assertEqual(ev["quote"]["children_in_cost_mu"], 180_000)
+        self.assertEqual(ev["quote"]["cost_mu"], 10_000_000 + 180_000 + 180_000)
         self.assertEqual(ev["underfunded"]["outcome"], "refused")
+        # The build and one period, without the children: below the least.
+        self.assertEqual(ev["underfunded"]["initial_mu"], 10_000_000 + 500)
         self.assertEqual(ev["underfunded"]["named_least_mu"], node.least)
         self.assertEqual(ev["underfunded"]["net_charge_mu"], 0)
         self.assertEqual(ev["funded"]["child_start_mu"], 180_000)
-        # The client formula: cost + maintenance * (periods + 1) + children_initial_cost.
+        # The client formula: cost + maintenance * (periods + 1), nothing for the children.
         self.assertEqual(ev["funded"]["initial_mu"],
-                         10_180_000 + 500 * (app.CHILDREN_COST_PERIODS + 1) + 180_000)
+                         10_360_000 + 500 * (app.CHILDREN_COST_PERIODS + 1))
         self.assertEqual(ev["own_initial_mu"], 123)
         self.assertEqual(sorted(node.stopped), ["family0"])
 
     def test_a_node_that_keeps_mu_of_a_refused_start_is_dishonest(self):
-        ev = run_with(FakeNode538(keep_refused=True), app.probe_children_initial_cost)
+        ev = run_with(FakeNode538(keep_refused=True), app.probe_initial_children_cost)
         self.assertEqual(ev["verdict"], app.VERDICT_DISHONEST, ev["reason"])
 
-    def test_a_node_that_predates_538_is_not_applicable(self):
-        ev = run_with(FakeNode538(predates=True), app.probe_children_initial_cost)
+    def test_a_node_whose_cost_holds_no_children_is_reported(self):
+        ev = run_with(FakeNode538(predates=True), app.probe_initial_children_cost)
+        self.assertEqual(ev["verdict"], app.VERDICT_INCONCLUSIVE, ev["reason"])
+        self.assertIn("predates nodo #538", ev["reason"])
+
+    def test_a_free_node_is_not_applicable(self):
+        node = FakeNode538(build_f=0, balance_f=0, tiny_start=0, period=0)
+        ev = run_with(node, app.probe_initial_children_cost)
         self.assertEqual(ev["verdict"], app.VERDICT_NOT_APPLICABLE, ev["reason"])
 
     def test_an_underfunded_parent_that_starts_is_not_an_accusation(self):
         # ON_UNDERFUNDED=warn is the operator's choice.
         node = FakeNode538(start_underfunded=True)
-        ev = run_with(node, app.probe_children_initial_cost)
+        ev = run_with(node, app.probe_initial_children_cost)
         self.assertEqual(ev["verdict"], app.VERDICT_INCONCLUSIVE, ev["reason"])
         self.assertIn("ON_UNDERFUNDED", ev["reason"])
         self.assertEqual(len(node.stopped), 2)
 
+    def test_a_quote_at_a_higher_load_than_the_check_is_not_under_funded(self):
+        # Seen on n538e: the node's least prices the children at its base load, so the
+        # quote of family for a short balance passed. The probe's under-funded amount
+        # leaves the children out, which no honest node starts.
+        node = FakeNode538(tiny_start=180_000)
+        node.least_children = 120_000  # the base-load figure of the check
+        ev = run_with(node, app.probe_initial_children_cost)
+        self.assertEqual(ev["verdict"], app.VERDICT_PASS, ev["reason"])
+        self.assertLess(ev["underfunded"]["initial_mu"], node.least)
+
+    def test_a_refused_start_funded_by_the_quote_is_reported(self):
+        ev = run_with(FakeNode538(refuse_funded=True), app.probe_initial_children_cost)
+        self.assertEqual(ev["verdict"], app.VERDICT_INCONCLUSIVE, ev["reason"])
+        self.assertIn("funded with the cost of its quote", ev["reason"])
+
     def test_a_retry_of_the_child_is_reported(self):
-        ev = run_with(FakeNode538(child_starts=2), app.probe_children_initial_cost)
+        ev = run_with(FakeNode538(child_starts=2), app.probe_initial_children_cost)
         self.assertEqual(ev["verdict"], app.VERDICT_INCONCLUSIVE, ev["reason"])
         self.assertIn("retry", ev["reason"])
 
     def test_a_child_that_could_not_start_is_reported(self):
-        ev = run_with(FakeNode538(child_starts=0, child_rc="1"), app.probe_children_initial_cost)
+        ev = run_with(FakeNode538(child_starts=0, child_rc="1"), app.probe_initial_children_cost)
         self.assertEqual(ev["verdict"], app.VERDICT_INCONCLUSIVE, ev["reason"])
         self.assertIn("one attempt", ev["reason"])
 
-    def test_a_charge_far_from_the_quote_is_reported(self):
-        ev = run_with(FakeNode538(charged=400_000), app.probe_children_initial_cost)
+    def test_a_charge_that_the_cost_does_not_cover_is_reported(self):
+        ev = run_with(FakeNode538(charged=400_000), app.probe_initial_children_cost)
         self.assertEqual(ev["verdict"], app.VERDICT_INCONCLUSIVE, ev["reason"])
+        self.assertIn("held 180000 MU", ev["reason"])
 
     def test_a_charge_priced_at_a_later_load_passes(self):
         # Seen on nodo #635: the start of the child cost 34 % more than the quote.
-        ev = run_with(FakeNode538(charged=241_200), app.probe_children_initial_cost)
+        ev = run_with(FakeNode538(charged=241_200), app.probe_initial_children_cost)
         self.assertEqual(ev["verdict"], app.VERDICT_PASS, ev["reason"])
         self.assertEqual(ev["funded"]["child_start_vs_quote"], 0.34)
 
-    def test_a_quote_that_is_not_the_start_of_the_child_is_reported(self):
-        node = FakeNode538()
-        real = node.quote
+    def test_a_charge_below_the_quote_passes(self):
+        ev = run_with(FakeNode538(charged=165_600), app.probe_initial_children_cost)
+        self.assertEqual(ev["verdict"], app.VERDICT_PASS, ev["reason"])
+        self.assertEqual(ev["funded"]["child_start_vs_quote"], -0.08)
 
-        def quote(url, packed, config=None, **kw):
-            q = real(url, packed, config=config, **kw)
-            if packed == "family":
-                q.children_initial_cost = amount(1)
-            return q
-        node.quote = quote
-        ev = run_with(node, app.probe_children_initial_cost)
+    def test_a_cost_that_does_not_hold_the_start_of_the_child_is_reported(self):
+        ev = run_with(FakeNode538(children_in_cost=1), app.probe_initial_children_cost)
         self.assertEqual(ev["verdict"], app.VERDICT_INCONCLUSIVE, ev["reason"])
 
     def test_the_probe_runs_in_the_suite(self):
-        self.assertIn("children_initial_cost", dict(app.PROBES))
-        self.assertIn("children_initial_cost", app.GATEWAY_DEPENDENT)
+        self.assertIn("initial_children_cost", dict(app.PROBES))
+        self.assertIn("initial_children_cost", app.GATEWAY_DEPENDENT)
+        self.assertNotIn("children_initial_cost", dict(app.PROBES))
 
 
 class ChildFundingTests(unittest.TestCase):
-    """On a node with #538 a child's runtime is the node's default balance for it."""
+    """A child's runtime is the node's default balance for it."""
 
     def tearDown(self):
         app.FUNDING["default_balance_mu"].clear()
         app.FUNDING["build_quote_mu"].clear()
-        app.FUNDING["node_quotes_children"] = None
 
     def test_the_default_balance_of_the_node_funds_the_child(self):
         def quote(url, packed, config=None, **kw):
             asked = config["initial_mu"] if config else 70_000
-            q = SimpleNamespace(cost=amount(10_000_000 + asked), children_initial_cost=amount(0),
-                                max_maintenance_cost=amount(1), init_maintenance_cost=amount(1),
-                                maintenance_seconds_loop=10)
-            return q
+            return SimpleNamespace(cost=amount(10_000_000 + asked),
+                                   max_maintenance_cost=amount(1), init_maintenance_cost=amount(1),
+                                   maintenance_seconds_loop=10)
         with mock.patch.object(gw, "estimated_cost", side_effect=quote), \
                 mock.patch.object(app, "packed", side_effect=lambda label: label), \
                 mock.patch.object(gw, "configuration", side_effect=lambda **kw: kw):
             app.quote_child_builds()
-        self.assertTrue(app.FUNDING["node_quotes_children"])
         self.assertEqual(app.FUNDING["build_quote_mu"]["tiny"], 10_000_000)
         self.assertEqual(app.FUNDING["default_balance_mu"]["tiny"], 70_000)
         self.assertEqual(app.child_runtime_mu("tiny", 1000.0), 70_000)
         self.assertEqual(app.child_initial_mu("tiny", 1000.0), 10_070_000)
 
-    def test_an_older_node_keeps_the_measured_rate(self):
+    def test_a_node_that_gives_no_default_balance_keeps_the_measured_rate(self):
         def quote(url, packed, config=None, **kw):
-            return SimpleNamespace(cost=amount(10_000_001), max_maintenance_cost=amount(1),
+            # A default start that gives the child nothing above its build.
+            asked = config["initial_mu"] if config else 0
+            return SimpleNamespace(cost=amount(10_000_000 + asked), max_maintenance_cost=amount(1),
                                    init_maintenance_cost=amount(1), maintenance_seconds_loop=10)
         with mock.patch.object(gw, "estimated_cost", side_effect=quote), \
                 mock.patch.object(app, "packed", side_effect=lambda label: label), \
                 mock.patch.object(gw, "configuration", side_effect=lambda **kw: kw):
             app.quote_child_builds()
-        self.assertFalse(app.FUNDING["node_quotes_children"])
-        self.assertEqual(app.FUNDING["default_balance_mu"], {})
+        self.assertFalse(any(app.FUNDING["default_balance_mu"].values()))
         self.assertEqual(app.child_runtime_mu("tiny", 1000.0),
                          max(app.CHILD_MIN_INITIAL_MU, int(
                              1000.0 * app.price_weight(*app.CHILD_DECLARED_RESOURCES["tiny"])
