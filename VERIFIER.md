@@ -74,7 +74,7 @@ Two consequences follow:
 | 7 | `shared_filesystem` | `sharefs`, `sharefs-denied` | the directory this service exports is shared with its child in both directions, a read-only mount refuses a write, and a child asking for a share its parent does not export is refused at launch |
 | 8 | `mu_accounting` | orchestrator (self) | the node spends MUs in line with the resources it provisions |
 | 10 | `build_funding` | `tiny` | nodo #563: a child funded below its build, or below one maintenance period after it, is refused with the node's message and charged nothing; a funded child starts, this account pays exactly its `initial_mu`, and the build is paid from the child's account |
-| 18 | `initial_children_cost` | `family` (→ `tiny`) | nodo #538: the `cost` of a parent's quote holds the starts of its initial children (no separate field since #635 at `8fcaf618`); a parent funded with its build and one period but not its children is refused with the node's message and charged nothing; a parent funded by the client formula (`cost` + periods) starts its initial child at its one attempt, with one `child_start` that the cost covers |
+| 18 | `initial_children_cost` | `family` (→ `tiny`) | nodo #538/#636: the `cost` of a parent's quote holds the builds of its initial children and no balance (#637); a parent funded with its build and one period but not the build of its child is refused with the node's message and charged nothing; a parent funded by the client formula (`cost` + the sum of N periods + a default start of `tiny`) starts its initial child at its one attempt, with one `child_start` |
 | 11 | `idempotent_start` | `tiny` | nodo #578: three StartService requests with one `StartReference` give one instance and one `child_start` charge; the requests after the first send no service and get the same instance |
 | 12 | `block_skip` | `tiny` | nodo #371: a StartService that carries blocks the node holds sends a small part of them (≤ 5%); the bytes and the time to the instance are reported, against this instance's first send of the child |
 | 13 | `env_vars` | `tiny` | nodo #574/#582: the packed spec names the declared env vars; a child started with one value given, one empty and one left out gets exactly those, in `/__config__` and in its process environment |
@@ -463,15 +463,17 @@ Since #563 the caller pays `Configuration.initial_mu` and nothing else. The node
 takes the build from it, and refuses a start when the build does not fit, or when
 what is left does not pay one maintenance period. A refused start charges nothing.
 
-The probe asks the node for its quote (`GetServiceEstimatedCost` asking for a
-balance of 1 MU answers the build plus 1 MU; the build is 0 for a built image) and
-starts `tiny` three times, each with its own `StartReference`:
+The probe asks the node for its quote (`GetServiceEstimatedCost` with no `initial_mu`;
+since nodo #636 its `cost` is the build and holds no balance, and the build is 0 for a
+built image) and starts `tiny` three times, each with its own `StartReference`. One
+period is the funding sum of one period (`nodo_gateway.funding_sum_mu`,
+`init_maintenance_cost × (1 + v)^k(1)`), the least balance that the node accepts:
 
 | start | `initial_mu` | an honest node |
 |---|---|---|
 | `below_build` (only when a build is owed) | build − 1 | refuses: `does not cover the build of the service, <build> MU` |
-| `below_one_period` | build + half a period | refuses: `leaves <x> MU after the build of <build> MU. One maintenance period costs <p> MU` |
-| `funded` | build + the child's usual runtime budget (at least 60 periods) | starts it |
+| `below_one_period` | build + half a period | refuses: `leaves <x> MU after the build of <build> MU. One maintenance period costs <p> MU` (`named_period_mu`, the funding sum of one period at the load of the start) |
+| `funded` | build + the child's usual runtime budget (at least the funding sum of 60 periods) | starts it |
 
 Then it reads this instance's statement and the funded child's statement, and
 finds each start by its reference (`detail.start_ref`).
@@ -488,57 +490,66 @@ It runs first of the probes that start children: on a node that has not built
 `tiny` yet, the funded start is the one that pays the build, so both rules are
 exercised. On later runs the image is built and only the period rule applies.
 
-#### Initial children cost (`family`, nodo #538, PR #635)
+#### Initial children cost (`family`, nodo #538, PR #635; nodo #636, PR #637)
 
 Since #538 a service declares its descendants in conjunctive normal form, in two fields:
 `initial_environment_workload` (the children that it needs to start: admission and cost)
-and `possible_environment_workload` (what it can ask for later: admission only). The
-`cost` of a quote holds the starts of the initial children: for each initial workload,
-`count` times the build of the child plus the node's default balance for it, on top of the
-build and the balance that the quote asks for. There is no separate field (#635 at
-`8fcaf618`: Josemi's review, "the client has nothing to do with that split"; an earlier head
-had `EstimatedCost.children_initial_cost`, field 6, now reserved). A client funds a parent
-with `cost + maintenance × (periods + 1)`. A start whose `initial_mu`, after the build,
-cannot pay the children and one period is refused (`workload_admission.ON_UNDERFUNDED`,
+and `possible_environment_workload` (what it can ask for later: admission only). Since
+nodo #636 (PR #637, decision 9) the `cost` of a quote is what the start spends: the build,
+and the builds of the initial children (for each initial workload, `count` times the build
+of the child). It holds no balance, for the parent or for its children: each child gets
+its balance in its own `StartService` (with no `initial_mu`, the node's default: its
+`cost` plus `deposits.DEFAULT_INITIAL_PERIODS` periods), and the parent pays that start
+out of its own balance. A client funds a start with `cost` plus the funding sum of the
+`N` periods that it chooses:
+
+```
+initial_mu = cost + Σ_{i=1..N} init_maintenance_cost × (1 + price_volatility)^k(i)
+k(i)       = floor(i × maintenance_seconds_loop / volatility_period_seconds) + 1
+```
+
+(`nodo_gateway.funding_sum_mu`). A start whose `initial_mu`, after the build, cannot pay
+the builds of the children and one period is refused (`workload_admission.ON_UNDERFUNDED`,
 `reject` by default) and charges nothing: before #538 such a parent started and then could
 not pay for its children (#628).
 
 The `family` child is such a parent. Its `service.json` declares one `tiny` in
 `initial_environment_workload`, and `family/service/run.sh` starts it once at boot with
-`celaut acquire --new --attempts 1` and no `initial_mu` (the node's default start, which
-is what the quote priced). It serves the result at `/status.txt` and stops its child
-through `/cgi-bin/stop`. The probe:
+`celaut acquire --new --attempts 1` and no `initial_mu` (the node's default start of
+`tiny`). It serves the result at `/status.txt` and stops its child through
+`/cgi-bin/stop`. (The comment at the top of `family/service/run.sh` still describes the
+`#538` cost; it is left as it is, so that the id of `family` does not change.) The probe:
 
-1. quotes `family` with no `initial_mu`, `family` for one period of balance, and a
-   default start of `tiny`;
-2. starts `family` with the build and one period but without the children: the
-   one-period quote less the cost of the default start of `tiny` (refused by an honest
-   node). An amount taken from a quote with the children in it is not used: the node's
-   least prices the children at its base load, which no quote is below, so on a loaded
-   node a quote for half a period still passes (seen on the first run on `8fcaf618`);
-3. starts `family` by the client formula (`cost` + 7 periods), waits for `/status.txt`,
-   waits `FAMILY_SETTLE_S` (20 s) more, and reads `family`'s statement. What the cost
-   holds for the children (`children_in_cost_mu`) is the one-period quote less its
-   balance and less the `build` row of that statement;
+1. quotes `tiny` and `family`, with no `initial_mu`. The build of `family` is its `cost`
+   less the `cost` of `tiny`; a default start of `tiny` is its `cost` plus the funding sum
+   of `CHILD_DEFAULT_PERIODS` (360, the shipped `DEFAULT_INITIAL_PERIODS`);
+2. while the node owes the build of `tiny`: starts `family` with its build and one period
+   but without the build of `tiny` (refused by an honest node). A built `tiny` costs
+   nothing, and then the rule has nothing to check: the start is not tried;
+3. starts `family` by the client formula (`cost` + the sum of 6 periods + a default start
+   of `tiny`, which `family` pays from its balance). The node prices that start at the
+   load of the moment `family` starts `tiny`, with `family` running by then, which no
+   quote knows (on n538e it came to more than the quote, and `family` was refused the
+   start), so `family` carries it with the headroom of `CHILDREN_CHARGE_TOLERANCE`
+   (+100 %); what `tiny` does not spend comes back. It waits for `/status.txt`, waits
+   `FAMILY_SETTLE_S` (20 s) more, and reads `family`'s statement. What the cost holds for
+   the children (`children_in_cost_mu`) is the cost less the `build` row of that statement;
 4. stops `tiny` through `family`, then `family`.
 
 | observation | verdict |
 |---|---|
-| the cost of `family` holds about the cost of a default start of `tiny` (±25 %, `CHILDREN_COST_TOLERANCE`), the under-funded start is refused with the #538 message ("The initial children of the service cost …") and leaves no charge, and the funded `family` starts `tiny` at its one attempt: one `child_start` that the cost covers (at most +100 % of what the cost holds, `CHILDREN_CHARGE_TOLERANCE`), and a `child_bound` that names `tiny` | `PASS` |
+| the cost of `family` holds exactly the build of `tiny` (the cost of a quote of `tiny`), the under-funded start (when tried) is refused with the #538 message ("The builds of the initial children cost …") and leaves no charge, and the funded `family` starts `tiny` at its one attempt: one `child_start` (at most +100 % of a default start of `tiny`, `CHILDREN_CHARGE_TOLERANCE`), and a `child_bound` that names `tiny` | `PASS` |
 | the node refused the under-funded start and kept MU of it | `DISHONEST` |
-| the under-funded `family` was started (the operator may run `ON_UNDERFUNDED=warn`), it was refused with another message, the start funded by the formula was refused, `tiny` could not start, there was more than one `child_start`, the cost holds no children (a node before #538) or a figure is off | `INCONCLUSIVE` |
+| the under-funded `family` was started (the operator may run `ON_UNDERFUNDED=warn`), it was refused with another message, the start funded by the formula was refused, `tiny` could not start, there was more than one `child_start`, the cost holds more than the builds (a node before #636) or a figure is off | `INCONCLUSIVE` |
 | the node is free | `NOT_APPLICABLE` |
 | a quote or a statement failed | `INFRA_ERROR` |
 
-The quotes are asked one after the other, so they price tiny's default balance at almost
-the same load. The `child_start` does not: it is tiny's default balance priced at the load
-when `family` starts it, with `family` itself running by then. On n538a it was −8 % and
-+34 % of the quote in two runs (`child_start_vs_quote` in the evidence). It is the balance
-of the child, not a fee: the child gets it and the rest comes back. So only a charge far
-above what the cost holds is reported, and never as an accusation.
+The `child_start` is tiny's default balance priced at the load when `family` starts it,
+with `family` itself running by then (`child_start_vs_quote` in the evidence). It is the
+balance of the child, not a fee: the child gets it and the rest comes back. So only a
+charge far above the quoted default start is reported, and never as an accusation.
 The evidence also has `own_initial_mu`: what the node funded this verifier with
-(`/__config__`), to compare with "To start" of `nodo estimate` of the verifier (which
-holds the children).
+(`/__config__`), to compare with the "Default funding" line of `nodo estimate`.
 
 #### Idempotent StartService (`tiny`, nodo #578, PR #585)
 
@@ -1001,19 +1012,19 @@ it is stopped. Since nodo #563 the node takes the **build** of a child (`BUILD_M
 child's own `initial_mu`. A start whose `initial_mu` does not cover the build, or
 leaves less than one maintenance period after it, is refused and charges nothing
 (`src/utils/cost_functions/start_funding.py`). The node itself funds this instance
-for `deposits.INITIAL_RUNTIME_HOURS` of its own resources — about 14e6 MU on a
-default node.
+with its `cost` plus `deposits.DEFAULT_INITIAL_PERIODS` periods of its own resources
+(nodo #636: 360 periods of 10 s, one hour, as shipped).
 
-**On a node with #538** (PR #635) the node funds this instance with its own default
-balance plus the starts of its initial children, which the `cost` of its quote holds: for
-each child of `initial_environment_workload`, its build and the node's default balance for
-it (`deposits.INITIAL_RUNTIME_HOURS` of the child's `at_init`). So the verifier funds each of those children with the node's own
-figures instead of its estimate: it asks for a default start of each child
-(`GetServiceEstimatedCost` with no `initial_mu`; its cost is the build plus that balance),
-takes the balance as the runtime of the child, and adds the build as before (the #563 build
-quote, 0 once the node has built the image). The suite then needs no top-up, on a node that
-has never built the children too: the builds were in the quote. When the default start of
-a child gives no balance above its build quote, the rules below still apply.
+**On a node with #636** (PR #637) the `cost` of a quote is the builds (the service and
+its initial children) and holds no balance, for the service or for its children: each
+child gets its balance in its own start, and this instance pays it from its own balance.
+So the verifier funds each child by the client formula: it quotes each child (no
+`initial_mu`), takes the build from the `cost` (0 once the node has built the image), and
+adds the funding sum of the quote (`nodo_gateway.funding_sum_mu`) for
+`CHILD_FUNDED_SECONDS` × `CHILD_BUDGET_MARGIN` of maintenance periods
+(`CHILD_RUNTIME_PERIODS`, 120 at a 10 s period). When a quote gives no maintenance, the
+rules below still apply. (On a node with #538 and before #636, the `cost` held the
+default balance of each initial child, and the verifier used that as the runtime.)
 
 The children used to ask for a flat 2e8-5e8 MU each (`HEAVY_INITIAL_MU` etc.):
 35× what funds this whole instance for an hour. Every launch of a freshly
@@ -1027,9 +1038,8 @@ startup suite reported five `INFRA_ERROR`s, and it never tried again. Now:
    resources, priced from that rate with the node's shipped RAM/vCPU/disk price
    ratios. The largest (`benchmark`, 2 GiB) comes to ~4e6 MU on a default node. To
    that it adds the **build** of the child: the node's own quote
-   (`GetServiceEstimatedCost` asking for a balance of 1 MU answers the build plus 1
-   MU, and the build is 0 for an image the node has built; with no `initial_mu` the
-   node would fill in its default balance). Without a quote, the build is the node's `build_mu`
+   (`GetServiceEstimatedCost` with no `initial_mu`: since nodo #636 its `cost` is the
+   build, 0 for an image the node has built). Without a quote, the build is the node's `build_mu`
    rate from `/__config__` (else `BUILD_MU_ESTIMATE`) until this instance has seen
    the child launch. After a child launches, its next starts are funded without the
    build.
@@ -1262,11 +1272,11 @@ What the node does with it:
 - **Admission** (both fields): at launch it checks that each clause has a group that fits
   now, locally or on a peer, and it refuses the service if one has not
   (`workload_admission.ON_UNSATISFIABLE`, `reject` by default). It reserves no capacity.
-- **Cost** (`initial_environment_workload` only): `EstimatedCost.cost` holds the starts
-  of the initial children: the sum, over the clauses, of `count` × (the build of the child
-  + the node's default balance for it), on top of the build and the balance. A default
-  start (`nodo execute`, no `initial_mu`) pays it. A start whose `initial_mu`, after the
-  build, cannot pay the children and one period is refused
+- **Cost** (`initial_environment_workload` only): `EstimatedCost.cost` holds the builds
+  of the initial children: the sum, over the clauses, of `count` × the build of the child,
+  on top of the build of the service, and no balance (nodo #636). Each child gets its
+  balance in its own start, paid by the parent. A start whose `initial_mu`, after the
+  build, cannot pay the builds of the children and one period is refused
   (`workload_admission.ON_UNDERFUNDED`). The verifier funds each of
   these children with what the node set aside for it (see "Funding the instance").
 

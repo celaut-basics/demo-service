@@ -90,7 +90,8 @@ class FakeNode563:
         self.stopped = []
 
     def quote(self, *a, config=None, **kw):
-        # The cost of a quote is the build plus the balance it asks for (#563).
+        # Before nodo #636 the cost of a quote was the build plus the balance it asked
+        # for (#563); since #636 the probes ask for none, so the cost is the build.
         asked = config["initial_mu"] if config else 0
         return SimpleNamespace(cost=amount(self.build + asked), max_maintenance_cost=amount(self.period),
                                init_maintenance_cost=amount(self.period),
@@ -155,15 +156,14 @@ class BuildFundingTests(unittest.TestCase):
         self.assertEqual(node.stopped, ["child0"], "the funded child must be stopped")
         self.assertEqual(app.FUNDING_FAILURES, [], "asked-for refusals are not a shortage")
 
-    def test_the_build_is_the_cost_less_the_balance_the_quote_asks_for(self):
-        # With no initial_mu the node fills in its default balance, and the cost would be
-        # the build plus that: the quote asks for 1 MU instead.
+    def test_the_build_is_the_cost_and_the_quote_asks_for_no_balance(self):
+        # Since nodo #636 the cost holds no balance, and initial_mu does not change it.
         node = FakeNode563(build=10_000_000, period=200_000)
         with mock.patch.object(gw, "estimated_cost", side_effect=node.quote) as quote, \
              mock.patch.object(gw, "configuration", side_effect=lambda **kw: kw):
             build, _ = app.quote_build("tiny")
         self.assertEqual(build, 10_000_000)
-        self.assertEqual(quote.call_args.kwargs["config"], {"initial_mu": app.BUILD_QUOTE_BALANCE_MU})
+        self.assertIsNone(quote.call_args.kwargs["config"])
 
     def test_a_built_image_exercises_the_period_rule_only(self):
         ev = run_with(FakeNode563(build=0, period=200_000), app.probe_build_funding)

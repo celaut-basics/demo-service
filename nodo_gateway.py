@@ -23,9 +23,12 @@ hashes and ``src/manager/balance_statement.py`` for the digest that is signed.
 """
 import hashlib
 import json
+import math
 import os
 import threading
 import time
+from decimal import Decimal
+from fractions import Fraction
 from types import SimpleNamespace
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -339,6 +342,55 @@ def estimated_cost(node_url, packed, config=None, timeout=120, measure=None):
     if cost is None:
         raise GatewayError("GetServiceEstimatedCost", RuntimeError("no EstimatedCost"))
     return cost
+
+
+def quote_bound(cost):
+    """(v, T) of a bounded quote (nodo #636), read as the node reads a peer's quote:
+    a volatility that is not finite or is negative is 0, a negative period is 0. None
+    when the quote promises no bound (``price_bounded`` false, or a node before #636)."""
+    if not getattr(cost, "price_bounded", False):
+        return None
+    try:
+        v = float(cost.price_volatility)
+    except (TypeError, ValueError):
+        v = 0.0
+    v = float(f"{v:.7g}") if math.isfinite(v) and v >= 0 else 0.0
+    t = int(cost.volatility_period_seconds)
+    return v, max(t, 0)
+
+
+def funding_sum_mu(cost, periods):
+    """The balance that funds ``periods`` maintenance periods (nodo #636, the comment of
+    ``EstimatedCost.cost``): for each period ``i`` from 1 to ``periods``,
+    ``init_maintenance_cost * (1 + v)^k(i)``, ``k(i) = floor(i * loop / T) + 1`` (1 when
+    ``T`` is 0), rounded up to a whole MU. The client funds a start with ``cost`` plus
+    this; ``cost`` is the builds and holds no balance. With no bound, ``init`` per period.
+    """
+    init, periods = mu(cost.init_maintenance_cost), int(periods)
+    if init <= 0 or periods <= 0:
+        return 0
+    bound = quote_bound(cost)
+    if bound is None or bound[0] <= 0:
+        return init * periods
+    v, t = bound
+    loop = max(int(cost.maintenance_seconds_loop), 0)
+    one = 1 + Fraction(Decimal(repr(v)))
+    total = Fraction(0)
+    for i in range(1, periods + 1):
+        k = 1 if t <= 0 else (i * loop) // t + 1
+        total += init * one ** k
+    return math.ceil(total)
+
+
+def quote_view(cost):
+    """The figures of an EstimatedCost, for the evidence of a probe."""
+    bound = quote_bound(cost)
+    return {"cost_mu": mu(cost.cost), "init_maintenance_cost_mu": mu(cost.init_maintenance_cost),
+            "max_maintenance_cost_mu": mu(cost.max_maintenance_cost),
+            "maintenance_seconds_loop": int(cost.maintenance_seconds_loop),
+            "price_bounded": bound is not None,
+            "price_volatility": None if bound is None else bound[0],
+            "volatility_period_seconds": None if bound is None else bound[1]}
 
 
 def metrics_balance(node_url, token, timeout=30):
