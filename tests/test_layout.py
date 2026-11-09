@@ -40,7 +40,8 @@ class PerArchitectureLayoutTests(unittest.TestCase):
     def test_service_dirs_live_only_under_an_architecture(self):
         # A stray .service at the old places would make `nodo pack .` (or
         # `nodo pack tiny`) pack something no one maintains any more.
-        for d in ("", "tiny", "heavy", "ping", "benchmark", "sharefs", "sharefs-denied", "netshare"):
+        for d in ("", "tiny", "heavy", "ping", "benchmark", "sharefs", "sharefs-denied", "netshare",
+                  "family"):
             self.assertFalse(os.path.exists(os.path.join(ROOT, d, ".service")), d or ".")
 
     def test_every_service_file_is_maintained_per_architecture(self):
@@ -70,7 +71,8 @@ class PerArchitectureLayoutTests(unittest.TestCase):
                 for arch in ARCHES}
         self.assertEqual(deps["arm64"], deps["amd64"])
         self.assertEqual(set(deps["arm64"]),
-                         {"TINY", "HEAVY", "PING", "BENCHMARK", "SHAREFS", "SHAREFS_DENIED", "NETSHARE"})
+                         {"TINY", "HEAVY", "PING", "BENCHMARK", "SHAREFS", "SHAREFS_DENIED", "NETSHARE",
+                          "FAMILY"})
 
     def test_dependencies_resolve_inside_the_pack_root(self):
         # nodo resolves a local dependency inside its cache copy of the pack

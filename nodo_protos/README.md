@@ -2,7 +2,12 @@
 
 `celaut.binpb` is a copy of `protos/celaut_doc.binpb` from
 [celaut-project/nodo](https://github.com/celaut-project/nodo) at commit
-`a97148dd` (dev, 2026-11-08). It is a `FileDescriptorSet` of `celaut.proto`.
+`8fcaf618` (branch `feat/538-cnf-workloads`, PR
+[#635](https://github.com/celaut-project/nodo/pull/635), 2026-11-09). It is a
+`FileDescriptorSet` of `celaut.proto`. Since #538 it has `Service.Workload`,
+`Service.Group`, `Service.Clause` and `Service.initial_environment_workload` (6).
+`EstimatedCost` has no `children_initial_cost` any more (field 6 is reserved): `cost`
+includes the starts of the initial children, as `initial_children_cost` checks.
 
 `nodo_gateway.py` loads it into a private descriptor pool, apart from the default pool of
 protobuf. The `celaut` command does not read quotes, statements or tunnels, and the newer

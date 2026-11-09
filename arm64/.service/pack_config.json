@@ -10,7 +10,8 @@
     "BENCHMARK": "benchmark",
     "SHAREFS": "sharefs",
     "SHAREFS_DENIED": "sharefs-denied",
-    "NETSHARE": "netshare"
+    "NETSHARE": "netshare",
+    "FAMILY": "family"
   },
   "dependencies_env": true,
   "include": [
