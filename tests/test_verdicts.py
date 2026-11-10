@@ -435,6 +435,30 @@ class ChildReadinessTests(unittest.TestCase):
             with self.assertRaises(app.ChildNotReadyError):
                 app._spin_child(app.heavy_service, "heavy")
 
+    def test_a_child_that_never_opens_its_port_is_stopped_not_leaked(self):
+        # nodo#534: a host firewall rejected guest to guest, every child timed out,
+        # and the ones the verifier never got back kept billing its balance.
+        FakeServiceInterface.launch_mode = "never_ready"
+        with mock.patch.object(app, "CHILD_READY_TIMEOUT_S", 0), \
+             mock.patch.object(app, "CHILD_READY_POLL_S", 0):
+            with self.assertRaises(app.ChildNotReadyError):
+                app._spin_child(app.heavy_service, "heavy")
+        self.assertEqual(len(FakeServiceInterface.stopped), 1)
+
+    def test_a_gateway_child_that_never_opens_its_port_is_stopped_not_leaked(self):
+        from types import SimpleNamespace as NS
+        result = NS(instance=NS(token="tok-534"), request_bytes=0, uri=None)
+        not_ready = app.ChildNotReadyError("tiny", "192.0.2.1:1", 0, "EHOSTUNREACH")
+        with mock.patch.object(app.gw, "start_service", return_value=result), \
+             mock.patch.object(app.gw, "stop_service", return_value=0) as stop, \
+             mock.patch.object(app, "packed", return_value=b""), \
+             mock.patch.object(app, "_instance_uri", return_value="192.0.2.1:1"), \
+             mock.patch.object(app, "_wait_until_ready", side_effect=not_ready):
+            with self.assertRaises(app.ChildNotReadyError):
+                app._gw_start("tiny", initial_mu=None)
+        stop.assert_called_once()
+        self.assertEqual(stop.call_args.args[1], "tok-534")
+
     def test_a_booting_child_is_not_recorded_as_a_kill(self):
         FakeServiceInterface.launch_mode = "never_ready"
         with mock.patch.object(app, "CHILD_READY_TIMEOUT_S", 0), \

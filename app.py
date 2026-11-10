@@ -938,7 +938,15 @@ def _spin_child(service_iface, label, wait_ready=True):
     logging.info('Spun %s child at %s', label, inst.uri)
     _mark_built(label)
     if wait_ready:
-        _wait_until_ready(inst.uri, label)
+        try:
+            _wait_until_ready(inst.uri, label)
+        except BaseException:
+            # The caller never gets this instance, so it cannot release it: a child
+            # that does not become reachable (a host firewall rejecting guest to
+            # guest, nodo#534) would keep drawing this service's balance for the
+            # rest of the run. Stop it here, then report it as not ready.
+            _release_child(service_iface, inst, label)
+            raise
     return inst
 
 
@@ -1929,7 +1937,13 @@ def _gw_start(label, *, initial_mu="budget", envs=None, start_ref=None, send_ser
     result.uri = _instance_uri(result.instance)
     logging.info("Started %s at %s (%d request bytes)", label, result.uri, result.request_bytes)
     if wait_ready and result.uri:
-        _wait_until_ready(result.uri, label)
+        try:
+            _wait_until_ready(result.uri, label)
+        except BaseException:
+            # Same as _spin_child: the caller never sees the token, so the child
+            # would be left running and billed. Stop it before reporting.
+            _gw_stop(getattr(result.instance, "token", None), label)
+            raise
     return result
 
 
